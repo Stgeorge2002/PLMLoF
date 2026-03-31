@@ -1,0 +1,40 @@
+# Training hyperparameters
+training:
+  # Stage 1: Classification head only (ESM2 frozen)
+  stage1:
+    max_epochs: 20
+    learning_rate: 1.0e-3
+    weight_decay: 0.01
+    batch_size: 16
+    gradient_accumulation_steps: 2
+    warmup_ratio: 0.1
+    scheduler: "cosine"
+
+  # Stage 2: LoRA fine-tuning
+  stage2:
+    max_epochs: 10
+    learning_rate: 1.0e-4
+    weight_decay: 0.01
+    batch_size: 8
+    gradient_accumulation_steps: 4
+    warmup_ratio: 0.05
+    scheduler: "cosine"
+
+  # General
+  early_stopping_patience: 5
+  metric_for_best_model: "macro_f1"
+  mixed_precision: "fp16"  # fp16 | bf16 | no
+  max_seq_length: 1024
+  seed: 42
+
+  # Class weights (auto-computed if null)
+  class_weights: null
+
+  # Logging
+  log_every_n_steps: 50
+  eval_every_n_steps: 500
+  save_every_n_steps: 1000
+
+  # Paths
+  output_dir: "outputs/"
+  checkpoint_dir: "outputs/checkpoints/"

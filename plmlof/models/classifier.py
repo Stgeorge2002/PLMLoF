@@ -1,0 +1,56 @@
+"""Classification head for LoF / WT / GoF prediction."""
+
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+
+
+class ClassifierHead(nn.Module):
+    """MLP classification head.
+
+    Takes concatenated comparison features + nucleotide features
+    and outputs class logits.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_dims: list[int] | None = None,
+        num_classes: int = 3,
+        dropout: float = 0.3,
+    ):
+        """
+        Args:
+            input_size: Size of input feature vector (comparison_size + num_nuc_features).
+            hidden_dims: Hidden layer dimensions. Default: [256, 64].
+            num_classes: Number of output classes (3: LoF, WT, GoF).
+            dropout: Dropout probability.
+        """
+        super().__init__()
+        if hidden_dims is None:
+            hidden_dims = [256, 64]
+
+        layers: list[nn.Module] = []
+        prev_dim = input_size
+        for i, dim in enumerate(hidden_dims):
+            layers.append(nn.Linear(prev_dim, dim))
+            layers.append(nn.ReLU())
+            # Decrease dropout for later layers
+            drop_rate = dropout * (1 - i * 0.3)
+            layers.append(nn.Dropout(max(drop_rate, 0.1)))
+            prev_dim = dim
+
+        layers.append(nn.Linear(prev_dim, num_classes))
+
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            features: Input features [batch, input_size].
+
+        Returns:
+            Logits [batch, num_classes].
+        """
+        return self.mlp(features)

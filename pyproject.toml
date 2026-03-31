@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "plmlof"
+version = "0.1.0"
+description = "PLM-based Loss-of-Function / Gain-of-Function variant classifier for bacterial genomes"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+
+dependencies = [
+    "torch>=2.0",
+    "transformers>=4.30",
+    "peft>=0.7",
+    "datasets>=2.14",
+    "biopython>=1.81",
+    "pysam>=0.22",
+    "PyYAML>=6.0",
+    "scikit-learn>=1.3",
+    "captum>=0.7",
+    "accelerate>=0.24",
+    "pandas>=2.0",
+    "tqdm>=4.65",
+]
+
+[project.optional-dependencies]
+tracking = ["wandb>=0.15"]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+]
+
+[tool.setuptools.packages.find]
+include = ["plmlof*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"

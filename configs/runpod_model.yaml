@@ -1,0 +1,24 @@
+# RunPod production model config — optimized for GPU pods
+# Uses ESM2-650M with larger LoRA rank for better performance
+model:
+  esm2_model_name: "facebook/esm2_t33_650M_UR50D"
+
+  lora:
+    enabled: true
+    rank: 32          # Higher rank for production (more capacity)
+    alpha: 64
+    dropout: 0.05     # Lower dropout for larger dataset
+    target_modules: ["query", "value"]
+
+  comparison:
+    use_cross_attention: false
+    pool_strategy: "mean_max"
+
+  classifier:
+    hidden_dims: [512, 128]   # Larger head for production
+    dropout: 0.2
+    num_classes: 3
+    label_smoothing: 0.05
+
+  nucleotide_features:
+    num_features: 12

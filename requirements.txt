@@ -1,0 +1,16 @@
+# PLMLoF requirements — pinned for RunPod reproducibility
+torch>=2.0,<2.5
+transformers>=4.30,<5.0
+peft>=0.7,<1.0
+datasets>=2.14
+biopython>=1.81
+pysam>=0.22
+PyYAML>=6.0
+scikit-learn>=1.3
+captum>=0.7
+accelerate>=0.24
+pandas>=2.0
+tqdm>=4.65
+wandb>=0.15
+pytest>=7.4
+pytest-cov>=4.1

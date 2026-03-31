@@ -1,0 +1,24 @@
+# Inference configuration
+inference:
+  model_path: "outputs/best_model/"
+  device: "cuda"  # cuda | cpu
+  batch_size: 32
+  max_seq_length: 1024
+
+  # Reference caching
+  cache:
+    enabled: true
+    cache_dir: "outputs/ref_cache/"
+
+  # Attribution
+  attribution:
+    enabled: true
+    method: "integrated_gradients"
+    n_steps: 50  # Integration steps for IG
+    internal_batch_size: 8
+
+  # Output
+  output_format: "tsv"  # tsv | json
+  include_confidence: true
+  include_attribution: true
+  confidence_threshold: 0.5  # Minimum confidence to report non-WT call

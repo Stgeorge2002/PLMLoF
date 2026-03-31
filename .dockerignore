@@ -1,0 +1,31 @@
+# Byte-compiled
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Data (too large for image — download at runtime)
+data/raw/
+data/processed/
+
+# Model outputs & caches
+outputs/
+*.pt
+*.pth
+*.ckpt
+
+# Misc
+.git/
+.gitignore
+*.egg-info/
+dist/
+build/
