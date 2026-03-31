@@ -87,13 +87,6 @@ class ComparisonModule(nn.Module):
         Returns:
             Comparison vector [B, 4*D].
         """
-        ref_pooled = ref_embeddings["pooled"]  # [B, D]
-        var_pooled = var_embeddings["pooled"]  # [B, D]
-
-        # Pooled-level comparisons
-        diff_pooled = ref_pooled - var_pooled  # [B, D]
-        prod_pooled = ref_pooled * var_pooled  # [B, D]
-
         # Per-residue pooling for richer features
         ref_per_res = ref_embeddings["per_residue"]  # [B, L_ref, D]
         var_per_res = var_embeddings["per_residue"]  # [B, L_var, D]

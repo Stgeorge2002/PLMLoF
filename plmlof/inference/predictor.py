@@ -72,21 +72,29 @@ class PLMLoFPredictor:
         """Load model from checkpoint."""
         path = Path(path)
         if path.is_dir():
-            # Look for model file in directory
             candidates = list(path.glob("model_best.pt")) + list(path.glob("*.pt"))
             if not candidates:
                 raise FileNotFoundError(f"No .pt files found in {path}")
             path = candidates[0]
 
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        # Reconstruct model — assumes checkpoint contains model_state_dict
         state_dict = checkpoint.get("model_state_dict", checkpoint)
 
+        # Reconstruct model from saved config if available
+        model_cfg = checkpoint.get("model_config", {})
+        esm2_name = model_cfg.get("esm2_model_name", "facebook/esm2_t33_650M_UR50D")
+        lora_config = model_cfg.get("lora_config", None)
+
         model = PLMLoFModel(
-            esm2_model_name="facebook/esm2_t6_8M_UR50D",  # Will be overridden by state dict
+            esm2_model_name=esm2_name,
             freeze_esm2=True,
+            lora_config=lora_config,
+            classifier_hidden_dims=model_cfg.get("classifier_hidden_dims", [256, 64]),
+            classifier_dropout=model_cfg.get("classifier_dropout", 0.3),
+            pool_strategy=model_cfg.get("pool_strategy", "mean_max"),
         )
         model.load_state_dict(state_dict, strict=False)
+        logger.info(f"Loaded model with ESM2: {esm2_name}")
         return model.to(self.device)
 
     def load_reference(self, fasta_path: str | Path) -> None:

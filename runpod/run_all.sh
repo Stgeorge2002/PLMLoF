@@ -104,7 +104,7 @@ if [[ "$MODE" == "full" || "$MODE" == "train" || "$MODE" == "test" ]]; then
                 --num_processes "$NUM_GPUS" \
                 --mixed_precision fp16 \
                 scripts/train.py \
-                --config configs/training.yaml \
+                --config configs/runpod_training.yaml \
                 --model-config configs/runpod_model.yaml \
                 --train-data data/processed/train.parquet \
                 --val-data data/processed/val.parquet \
@@ -117,6 +117,7 @@ if [[ "$MODE" == "full" || "$MODE" == "train" || "$MODE" == "test" ]]; then
                 --train-data data/processed/train.parquet \
                 --val-data data/processed/val.parquet \
                 --device "$DEVICE" \
+                --mixed-precision fp16 \
                 --output-dir outputs/production/
         fi
     fi

@@ -65,15 +65,25 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     args = parse_args()
 
-    # Determine model size
-    esm2_name = "facebook/esm2_t6_8M_UR50D" if args.tiny else "facebook/esm2_t33_650M_UR50D"
-
-    # Build model
-    model = PLMLoFModel(esm2_model_name=esm2_name, freeze_esm2=True)
-
     # Load checkpoint
     checkpoint = torch.load(args.model, map_location=args.device, weights_only=False)
     state_dict = checkpoint.get("model_state_dict", checkpoint)
+
+    # Reconstruct model from saved config or CLI flags
+    model_cfg = checkpoint.get("model_config", {})
+    if args.tiny:
+        esm2_name = "facebook/esm2_t6_8M_UR50D"
+    else:
+        esm2_name = model_cfg.get("esm2_model_name", "facebook/esm2_t33_650M_UR50D")
+
+    model = PLMLoFModel(
+        esm2_model_name=esm2_name,
+        freeze_esm2=True,
+        lora_config=model_cfg.get("lora_config"),
+        classifier_hidden_dims=model_cfg.get("classifier_hidden_dims", [256, 64]),
+        classifier_dropout=model_cfg.get("classifier_dropout", 0.3),
+        pool_strategy=model_cfg.get("pool_strategy", "mean_max"),
+    )
     model.load_state_dict(state_dict, strict=False)
     model = model.to(args.device)
 

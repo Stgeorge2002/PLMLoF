@@ -121,22 +121,41 @@ def stratified_split(
     # Stratified split on label
     stratify_col = remaining_df["label"]
 
+    # Check if stratification is possible (need ≥2 samples per class per split)
+    min_class_count = stratify_col.value_counts().min()
+    can_stratify = min_class_count >= 3  # Need at least 3 to split into train/val/test
+
     # First split: separate test set
-    train_val_df, test_df = train_test_split(
-        remaining_df,
-        test_size=test_size,
-        stratify=stratify_col,
-        random_state=seed,
-    )
+    try:
+        train_val_df, test_df = train_test_split(
+            remaining_df,
+            test_size=test_size,
+            stratify=stratify_col if can_stratify else None,
+            random_state=seed,
+        )
+    except ValueError:
+        # Fallback: no stratification if classes are too small
+        train_val_df, test_df = train_test_split(
+            remaining_df,
+            test_size=test_size,
+            random_state=seed,
+        )
 
     # Second split: separate validation from training
     val_fraction = val_size / (1 - test_size)
-    train_df, val_df = train_test_split(
-        train_val_df,
-        test_size=val_fraction,
-        stratify=train_val_df["label"],
-        random_state=seed,
-    )
+    try:
+        train_df, val_df = train_test_split(
+            train_val_df,
+            test_size=val_fraction,
+            stratify=train_val_df["label"] if can_stratify else None,
+            random_state=seed,
+        )
+    except ValueError:
+        train_df, val_df = train_test_split(
+            train_val_df,
+            test_size=val_fraction,
+            random_state=seed,
+        )
 
     # Add holdout species to test set
     if not holdout_df.empty:

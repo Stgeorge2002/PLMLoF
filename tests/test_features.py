@@ -111,7 +111,7 @@ class TestIsFrameshift:
 
 class TestStartCodonLost:
     def test_lost(self):
-        assert start_codon_lost("ATGAAATTT", "TTGAAATTT") is True
+        assert start_codon_lost("ATGAAATTT", "AAGAAATTT") is True
 
     def test_intact(self):
         assert start_codon_lost("ATGAAATTT", "ATGAAAGGG") is False

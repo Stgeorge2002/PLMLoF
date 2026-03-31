@@ -23,7 +23,6 @@ from plmlof.models.plmlof_model import PLMLoFModel
 from plmlof.data.dataset import PLMLoFDataset, SyntheticPLMLoFDataset
 from plmlof.data.collator import PLMLoFCollator
 from plmlof.training.trainer import PLMLoFTrainer
-from plmlof.training.metrics import format_classification_report
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +63,7 @@ def main():
     train_cfg = load_config(args.config).get("training", {})
     model_cfg = load_config(args.model_config or "configs/model.yaml").get("model", {})
 
-    # Resolve settings (CLI > config > defaults)
+    # Resolve device
     device = args.device
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -85,18 +84,24 @@ def main():
         esm2_name = "facebook/esm2_t6_8M_UR50D"
         max_epochs_s1 = args.max_epochs or 2
         max_epochs_s2 = 1
-        batch_size = args.batch_size or 4
+        batch_size_s1 = args.batch_size or 4
+        batch_size_s2 = args.batch_size or 4
         lr_s1 = args.lr or 1e-3
         lr_s2 = 1e-4
+        grad_accum_s1 = 1
+        grad_accum_s2 = 1
     else:
         esm2_name = model_cfg.get("esm2_model_name", "facebook/esm2_t33_650M_UR50D")
         s1_cfg = train_cfg.get("stage1", {})
         s2_cfg = train_cfg.get("stage2", {})
         max_epochs_s1 = args.max_epochs or s1_cfg.get("max_epochs", 20)
         max_epochs_s2 = s2_cfg.get("max_epochs", 10)
-        batch_size = args.batch_size or s1_cfg.get("batch_size", 16)
+        batch_size_s1 = args.batch_size or s1_cfg.get("batch_size", 16)
+        batch_size_s2 = args.batch_size or s2_cfg.get("batch_size", 8)
         lr_s1 = args.lr or s1_cfg.get("learning_rate", 1e-3)
         lr_s2 = s2_cfg.get("learning_rate", 1e-4)
+        grad_accum_s1 = s1_cfg.get("gradient_accumulation_steps", 1)
+        grad_accum_s2 = s2_cfg.get("gradient_accumulation_steps", 1)
 
     # LoRA config
     lora_cfg = model_cfg.get("lora", {})
@@ -107,14 +112,18 @@ def main():
         "target_modules": lora_cfg.get("target_modules", ["query", "value"]),
     } if lora_cfg.get("enabled", True) else None
 
-    # Build model
+    # Build model — read pool_strategy from comparison section
+    pool_strategy = model_cfg.get("comparison", {}).get("pool_strategy", "mean_max")
+    classifier_hidden_dims = model_cfg.get("classifier", {}).get("hidden_dims", [256, 64])
+    classifier_dropout = model_cfg.get("classifier", {}).get("dropout", 0.3)
     logger.info(f"Building model with ESM2: {esm2_name}")
     model = PLMLoFModel(
         esm2_model_name=esm2_name,
         freeze_esm2=True,
         lora_config=lora_config,
-        classifier_hidden_dims=model_cfg.get("classifier", {}).get("hidden_dims", [256, 64]),
-        classifier_dropout=model_cfg.get("classifier", {}).get("dropout", 0.3),
+        pool_strategy=pool_strategy,
+        classifier_hidden_dims=classifier_hidden_dims,
+        classifier_dropout=classifier_dropout,
     )
 
     # Build datasets
@@ -130,19 +139,22 @@ def main():
 
     num_workers = args.num_workers
     if num_workers is None:
-        # Auto: use 4 workers on GPU, 0 on CPU
         num_workers = 4 if device == "cuda" else 0
 
-    train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True,
-        collate_fn=collator, num_workers=num_workers,
-        pin_memory=(device == "cuda"),
-    )
-    val_loader = DataLoader(
-        val_dataset, batch_size=batch_size, shuffle=False,
-        collate_fn=collator, num_workers=num_workers,
-        pin_memory=(device == "cuda"),
-    )
+    def _make_loaders(batch_size: int):
+        tl = DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=True,
+            collate_fn=collator, num_workers=num_workers,
+            pin_memory=(device == "cuda"),
+        )
+        vl = DataLoader(
+            val_dataset, batch_size=batch_size, shuffle=False,
+            collate_fn=collator, num_workers=num_workers,
+            pin_memory=(device == "cuda"),
+        )
+        return tl, vl
+
+    train_loader, val_loader = _make_loaders(batch_size_s1)
 
     # Resolve mixed precision
     mixed_precision = args.mixed_precision or train_cfg.get("mixed_precision", "no")
@@ -161,7 +173,16 @@ def main():
         mixed_precision=mixed_precision,
     )
 
-    # Stage 1: Classification head only
+    # Save model config for later reconstruction during inference/eval
+    trainer.model_config = {
+        "esm2_model_name": esm2_name,
+        "classifier_hidden_dims": classifier_hidden_dims,
+        "classifier_dropout": classifier_dropout,
+        "pool_strategy": pool_strategy,
+        "lora_config": lora_config,
+    }
+
+    # Stage 1: Classification head only (ESM2 frozen)
     logger.info("=" * 60)
     logger.info("STAGE 1: Training classification head (ESM2 frozen)")
     logger.info("=" * 60)
@@ -170,10 +191,16 @@ def main():
         max_epochs=max_epochs_s1,
         learning_rate=lr_s1,
         patience=train_cfg.get("early_stopping_patience", 5),
+        grad_accum_steps=grad_accum_s1,
     )
 
     # Stage 2: LoRA fine-tuning (skip in tiny mode or if no LoRA)
     if lora_config and not args.tiny:
+        # Rebuild loaders with stage2 batch size if different
+        if batch_size_s2 != batch_size_s1:
+            train_loader, val_loader = _make_loaders(batch_size_s2)
+            trainer.train_loader = train_loader
+            trainer.val_loader = val_loader
         logger.info("=" * 60)
         logger.info("STAGE 2: Fine-tuning with LoRA")
         logger.info("=" * 60)
@@ -182,6 +209,7 @@ def main():
             max_epochs=max_epochs_s2,
             learning_rate=lr_s2,
             patience=train_cfg.get("early_stopping_patience", 5),
+            grad_accum_steps=grad_accum_s2,
         )
 
     logger.info("Training complete!")

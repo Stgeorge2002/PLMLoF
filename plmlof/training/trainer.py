@@ -162,11 +162,15 @@ class PLMLoFTrainer:
         ckpt_dir = self.output_dir / "checkpoints"
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         path = ckpt_dir / f"model_{tag}.pt"
-        torch.save({
+        save_dict = {
             "epoch": epoch,
             "model_state_dict": self.model.state_dict(),
             "metrics": metrics,
-        }, path)
+        }
+        # Include model config if available (for reconstruction during inference)
+        if hasattr(self, "model_config"):
+            save_dict["model_config"] = self.model_config
+        torch.save(save_dict, path)
         logger.info(f"Saved checkpoint to {path}")
 
     def train(
