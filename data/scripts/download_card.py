@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import tarfile
 from pathlib import Path
 from urllib.request import urlopen, Request
@@ -51,9 +52,13 @@ def download_card(output_dir: Path = OUTPUT_DIR) -> Path:
             with tarfile.open(archive_path, "r:bz2") as tar:
                 tar.extractall(extract_dir, filter="data")
         except TypeError:
-            # Python < 3.12 doesn't have filter param
+            # Python < 3.12 doesn't have filter param — manually filter unsafe paths
             with tarfile.open(archive_path, "r:bz2") as tar:
-                tar.extractall(extract_dir)
+                safe_members = [
+                    m for m in tar.getmembers()
+                    if not m.name.startswith("/") and ".." not in m.name
+                ]
+                tar.extractall(extract_dir, members=safe_members)
 
     return extract_dir
 
@@ -61,8 +66,7 @@ def download_card(output_dir: Path = OUTPUT_DIR) -> Path:
 def _get_reference_sequence(model_sequences: dict) -> tuple[str, str, str]:
     """Extract reference protein, DNA, and species from model_sequences block.
 
-    Handles multiple CARD JSON nesting levels by recursively searching for
-    protein_sequence/dna_sequence/NCBI_taxonomy dicts.
+    CARD structure: model_sequences -> sequence -> {id} -> protein_sequence/dna_sequence/NCBI_taxonomy
 
     Returns (ref_protein, ref_dna, species).
     """
@@ -73,47 +77,65 @@ def _get_reference_sequence(model_sequences: dict) -> tuple[str, str, str]:
     if not isinstance(model_sequences, dict):
         return ref_protein, ref_dna, species
 
-    def _recursive_search(obj: dict, depth: int = 0) -> None:
-        nonlocal ref_protein, ref_dna, species
-        if depth > 5:
-            return
-        if not isinstance(obj, dict):
-            return
+    seq_block = model_sequences.get("sequence", {})
+    if not isinstance(seq_block, dict):
+        return ref_protein, ref_dna, species
 
-        # Check for protein_sequence at this level
-        prot = obj.get("protein_sequence", None)
-        if isinstance(prot, dict):
-            ref_protein = ref_protein or prot.get("sequence", "")
-        elif isinstance(prot, str) and len(prot) > 5:
-            ref_protein = ref_protein or prot
+    for _seq_id, seq_data in seq_block.items():
+        if not isinstance(seq_data, dict):
+            continue
 
-        # Check for dna_sequence at this level
-        dna = obj.get("dna_sequence", None)
-        if isinstance(dna, dict):
-            ref_dna = ref_dna or dna.get("sequence", "")
-        elif isinstance(dna, str) and len(dna) > 5:
-            ref_dna = ref_dna or dna
+        # protein_sequence -> sequence
+        ps = seq_data.get("protein_sequence", {})
+        if isinstance(ps, dict) and ps.get("sequence"):
+            ref_protein = ref_protein or ps["sequence"]
 
-        # Check for taxonomy at this level
-        tax = obj.get("NCBI_taxonomy", None)
-        if isinstance(tax, dict):
-            species = species or tax.get("NCBI_taxonomy_name", "")
+        # dna_sequence -> sequence
+        ds = seq_data.get("dna_sequence", {})
+        if isinstance(ds, dict) and ds.get("sequence"):
+            ref_dna = ref_dna or ds["sequence"]
 
-        # Recurse into dict values
-        for _k, v in obj.items():
-            if isinstance(v, dict) and _k not in ("protein_sequence", "dna_sequence", "NCBI_taxonomy"):
-                _recursive_search(v, depth + 1)
+        # NCBI_taxonomy -> NCBI_taxonomy_name
+        tax = seq_data.get("NCBI_taxonomy", {})
+        if isinstance(tax, dict) and tax.get("NCBI_taxonomy_name"):
+            species = species or tax["NCBI_taxonomy_name"]
 
-    _recursive_search(model_sequences)
     return ref_protein, ref_dna, species
+
+
+# Regex for mutation strings like "L157Q", "H481N", "A42G", etc.
+_MUT_RE = re.compile(r"^([A-Z])(\d+)([A-Z])$")
+
+
+def _parse_mutation_string(mut_str: str, ref_protein: str) -> tuple[str, str] | None:
+    """Parse a CARD mutation string like 'L157Q' and apply it to ref_protein.
+
+    Returns (var_protein, mutation_label) or None if invalid.
+    """
+    mut_str = mut_str.strip()
+    m = _MUT_RE.match(mut_str)
+    if not m:
+        return None
+
+    ref_aa, pos_str, var_aa = m.group(1), m.group(2), m.group(3)
+    pos = int(pos_str) - 1  # 0-based
+
+    if pos < 0 or pos >= len(ref_protein):
+        return None
+
+    # Build variant
+    var_protein = ref_protein[:pos] + var_aa + ref_protein[pos + 1:]
+    mutation = f"{ref_aa}{pos + 1}{var_aa}"
+    return var_protein, mutation
 
 
 def parse_card_variants(card_dir: Path) -> pd.DataFrame:
     """Parse CARD JSON data to extract SNP-mediated resistance mutations (GoF).
 
-    Handles multiple CARD JSON schema versions by looking for SNP data in:
-      1. model_param → snp (current CARD schema)
-      2. model_sequences → ... → snps (older schema)
+    CARD model_param structure:
+        model_param -> snp -> param_value -> {id: "L157Q", ...}
+        model_param -> snp -> Curated-R  -> {id: "L157Q", ...}
+        model_param -> snp -> clinical   -> {id: "L157Q", ...}
 
     Returns:
         DataFrame with columns: gene, species, ref_protein, var_protein,
@@ -131,10 +153,11 @@ def parse_card_variants(card_dir: Path) -> pd.DataFrame:
         card_data = json.load(f)
 
     records = []
-    n_snp_models = 0
     n_entries = 0
-    n_with_param = 0
+    n_variant_models = 0
     n_with_ref = 0
+    n_with_snp = 0
+    n_mutations_parsed = 0
 
     for key, entry in card_data.items():
         if not isinstance(entry, dict) or "ARO_accession" not in entry:
@@ -145,138 +168,73 @@ def parse_card_variants(card_dir: Path) -> pd.DataFrame:
         aro_id = entry.get("ARO_accession", "")
         model_type = entry.get("model_type", "")
 
-        # Only process variant models (protein variant model, protein overexpression model, etc.)
-        is_variant_model = any(kw in model_type.lower() for kw in [
-            "variant", "overexpression", "mutation",
-        ]) if model_type else False
+        # Only process variant models
+        if "variant" not in model_type.lower():
+            continue
+        n_variant_models += 1
 
-        # Get reference sequence from model_sequences
+        # Get reference sequence
         model_sequences = entry.get("model_sequences", {})
-        ref_protein, ref_dna, species_from_seq = _get_reference_sequence(model_sequences)
-        if ref_protein:
-            n_with_ref += 1
+        ref_protein, ref_dna, species = _get_reference_sequence(model_sequences)
+        if not ref_protein:
+            continue
+        n_with_ref += 1
 
-        # ── Path 1: model_param (current CARD schema) ──
-        # CARD model_param has numbered keys, each containing param_type and SNP data.
-        # Structure: model_param → {id} → param_type:"snp", snp → {snp_id} → {original, change, position}
-        # OR older: model_param → snp → {snp_id} → {original, change, position}
+        # Get SNP mutation strings from model_param -> snp -> param_value
         model_param = entry.get("model_param", {})
-        snp_entries = {}
-        if isinstance(model_param, dict):
-            # Direct snp key (older schema)
-            direct_snp = model_param.get("snp", {})
-            if isinstance(direct_snp, dict) and direct_snp:
-                snp_entries = direct_snp
-            else:
-                # Numbered keys schema: model_param → {id} → {param_type, snp: {snp_id: {...}}}
-                for _param_id, param_data in model_param.items():
-                    if not isinstance(param_data, dict):
-                        continue
-                    # Check param_type or look for nested snp data
-                    param_type = str(param_data.get("param_type", "")).lower()
-                    if param_type == "snp" or "snp" in param_data:
-                        nested_snp = param_data.get("snp", {})
-                        if isinstance(nested_snp, dict):
-                            snp_entries.update(nested_snp)
-                        # Also check if SNP data is directly in param_data
-                        if "original" in param_data and "change" in param_data:
-                            snp_entries[_param_id] = param_data
+        if not isinstance(model_param, dict):
+            continue
 
-        if snp_entries and ref_protein:
-            n_snp_models += 1
-            for snp_key, snp_data in snp_entries.items():
-                if not isinstance(snp_data, dict):
-                    continue
+        snp_param = model_param.get("snp", {})
+        if not isinstance(snp_param, dict):
+            continue
 
-                original = snp_data.get("original", "")
-                change = snp_data.get("change", "")
-                pos = snp_data.get("position")
+        # Collect all mutation strings from param_value, Curated-R, clinical
+        mutation_strings = set()
+        for source_key in ("param_value", "Curated-R", "clinical"):
+            source = snp_param.get(source_key, {})
+            if isinstance(source, dict):
+                for _mid, mut_entry in source.items():
+                    if isinstance(mut_entry, str):
+                        mutation_strings.add(mut_entry)
+                    elif isinstance(mut_entry, dict):
+                        # CARD param_value entries are dicts with
+                        # "param_value_name" holding the mutation string
+                        for name_key in ("param_value_name", "param_value_id"):
+                            val = mut_entry.get(name_key, "")
+                            if isinstance(val, str) and _MUT_RE.match(val.strip()):
+                                mutation_strings.add(val.strip())
+                                break
 
-                if not pos or not change or not original:
-                    continue
+        if not mutation_strings:
+            continue
+        n_with_snp += 1
 
-                try:
-                    pos_int = int(pos) - 1  # 0-based
-                except (ValueError, TypeError):
-                    continue
+        for mut_str in mutation_strings:
+            result = _parse_mutation_string(mut_str, ref_protein)
+            if result is None:
+                continue
 
-                if pos_int < 0 or pos_int >= len(ref_protein):
-                    continue
+            var_protein, mutation = result
+            n_mutations_parsed += 1
 
-                # Verify reference AA matches (skip if not)
-                if ref_protein[pos_int] != original and original != "":
-                    # Mismatch — try anyway, the annotation might use 1-based differently
-                    pass
+            records.append({
+                "gene": gene_name,
+                "aro_id": aro_id,
+                "species": species,
+                "ref_protein": ref_protein,
+                "var_protein": var_protein,
+                "ref_dna": ref_dna,
+                "mutation": mutation,
+                "label": 2,  # GoF
+                "source": "CARD",
+            })
 
-                var_protein = ref_protein[:pos_int] + change + ref_protein[pos_int + 1:]
-                mutation = f"{original}{pos_int + 1}{change}"
-
-                records.append({
-                    "gene": gene_name,
-                    "aro_id": aro_id,
-                    "species": species_from_seq,
-                    "ref_protein": ref_protein,
-                    "var_protein": var_protein,
-                    "ref_dna": ref_dna,
-                    "mutation": mutation,
-                    "label": 2,  # GoF
-                    "source": "CARD",
-                })
-
-        # ── Path 2: model_sequences → snps (older schema fallback) ──
-        if not snp_entries:
-            for seq_key, seq_data in model_sequences.items():
-                if not isinstance(seq_data, dict):
-                    continue
-                # Check nested levels
-                for variant_key, variant_data in seq_data.items():
-                    if not isinstance(variant_data, dict):
-                        continue
-
-                    snps = variant_data.get("snps", {})
-                    if not snps:
-                        continue
-
-                    prot = variant_data.get("protein_sequence", {})
-                    inner_ref = prot.get("sequence", "") if isinstance(prot, dict) else ""
-                    inner_ref = inner_ref or ref_protein
-
-                    tax = variant_data.get("NCBI_taxonomy", {})
-                    inner_species = tax.get("NCBI_taxonomy_name", "") if isinstance(tax, dict) else ""
-
-                    for snp_key, snp_data in snps.items():
-                        if not isinstance(snp_data, dict):
-                            continue
-
-                        original = snp_data.get("original", "")
-                        change = snp_data.get("change", "")
-                        pos = snp_data.get("position")
-
-                        if not pos or not change or not inner_ref:
-                            continue
-                        try:
-                            pos_int = int(pos) - 1
-                        except (ValueError, TypeError):
-                            continue
-                        if pos_int < 0 or pos_int >= len(inner_ref):
-                            continue
-
-                        var_protein = inner_ref[:pos_int] + change + inner_ref[pos_int + 1:]
-                        mutation = f"{original}{pos_int + 1}{change}"
-
-                        records.append({
-                            "gene": gene_name,
-                            "aro_id": aro_id,
-                            "species": inner_species or species_from_seq,
-                            "ref_protein": inner_ref,
-                            "var_protein": var_protein,
-                            "ref_dna": ref_dna,
-                            "mutation": mutation,
-                            "label": 2,  # GoF
-                            "source": "CARD",
-                        })
-
-    logger.info(f"CARD entries: {n_entries} total, {n_with_ref} with ref protein, {n_snp_models} with SNP data")
+    logger.info(
+        f"CARD: {n_entries} entries, {n_variant_models} variant models, "
+        f"{n_with_ref} with ref protein, {n_with_snp} with SNP strings, "
+        f"{n_mutations_parsed} mutations parsed"
+    )
 
     df = pd.DataFrame(records)
     if not df.empty:

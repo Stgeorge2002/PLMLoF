@@ -56,8 +56,8 @@ class PLMLoFDataset(Dataset):
     def __getitem__(self, idx: int) -> dict:
         row = self.df.iloc[idx]
 
-        ref_protein = str(row["ref_protein"])[: self.max_seq_length]
-        var_protein = str(row["var_protein"])[: self.max_seq_length]
+        ref_protein = str(row["ref_protein"]).replace("*", "")[: self.max_seq_length]
+        var_protein = str(row["var_protein"]).replace("*", "")[: self.max_seq_length]
         label = int(row["label"])
 
         # Compute nucleotide features if DNA columns available

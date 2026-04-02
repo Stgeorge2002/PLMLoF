@@ -18,3 +18,4 @@ outputs/
 .idea/
 *.log
 wandb/
+aws/

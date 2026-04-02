@@ -66,6 +66,10 @@ def merge_datasets() -> pd.DataFrame:
 
     merged = pd.concat(dfs, ignore_index=True)
 
+    # Strip stop codon '*' characters — ESM2 cannot tokenize them
+    merged["ref_protein"] = merged["ref_protein"].str.replace("*", "", regex=False)
+    merged["var_protein"] = merged["var_protein"].str.replace("*", "", regex=False)
+
     # Drop rows with empty proteins
     merged = merged[merged["ref_protein"].str.len() > 0]
     merged = merged[merged["var_protein"].str.len() > 0]

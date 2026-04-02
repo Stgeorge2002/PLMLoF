@@ -5,80 +5,70 @@ Disrupting these genes leads to loss of function (LoF).
 We generate synthetic LoF variants by introducing disruptive mutations.
 
 Source: https://tubic.org/deg/
+Download page: https://tubic.org/deg/public/index.php/download
 Fallback: hardcoded curated set of well-characterized bacterial essential genes.
 """
 
 from __future__ import annotations
 
+import gzip
+import io
 import logging
 import random
+import zipfile
 from pathlib import Path
 from urllib.request import urlopen, Request
 
 import pandas as pd
 from Bio import SeqIO
-from io import StringIO
 
 from plmlof.utils.sequence_utils import translate_dna
 from plmlof.data.preprocessing import introduce_premature_stop, introduce_frameshift
 
 logger = logging.getLogger(__name__)
 
-# Multiple potential URLs for DEG (site has moved over the years)
-DEG_URLS = [
-    # Current tubic.org paths
-    ("https://tubic.org/deg/public/download/deg-p-e.dat", "protein"),
-    ("https://tubic.org/deg/public/download/deg-n-e.dat", "nucleotide"),
-    # Alternative paths seen in mirrors
-    ("https://tubic.tju.edu.cn/deg/public/download/deg-p-e.dat", "protein"),
-    ("https://tubic.tju.edu.cn/deg/public/download/deg-n-e.dat", "nucleotide"),
-    # Older URL patterns
-    ("http://tubic.org/deg/download/deg-p-e.dat", "protein"),
-    ("http://tubic.org/deg/download/deg-n-e.dat", "nucleotide"),
+# Current DEG download URLs
+DEG_PROTEIN_URLS = [
+    "http://tubic.org/deg/public/download/DEG10.aa.gz",
+    "https://tubic.org/deg/public/download/DEG10.aa.gz",
+]
+DEG_NUCLEOTIDE_URLS = [
+    "http://tubic.org/deg/public/download/DEG10.nt.gz",
+    "https://tubic.org/deg/public/download/DEG10.nt.gz",
+]
+DEG_ANNOTATION_URLS = [
+    "http://tubic.org/deg/public/download/deg_annotation_p.csv.zip",
+    "https://tubic.org/deg/public/download/deg_annotation_p.csv.zip",
 ]
 
 OUTPUT_DIR = Path("data/raw/deg/")
 
 # ── Curated bacterial essential gene proteins (fallback when DEG is unreachable) ──
-# Each entry: (gene_name, species, protein_sequence, dna_cds)
-# Sourced from UniProt/NCBI for well-characterized essential genes
 ESSENTIAL_GENES_FALLBACK = [
-    # DNA replication / repair
     ("dnaA", "Escherichia coli", "MSLSLWQQCLARLQDELPATEFSMWIRPLQAELSDNTLALYAPNRFVLDWVRDKYLNNINGLLTSFCGADAPQLRFEVGTKPVTQTPQAAVTSNVAAPAQVAQTQPQRAAPSTRSGWDNVPAPAEFTDSVTDSAFRREVDFVHDPTKQESRKAHLDALRSMIEHVRREQKFGEDSIQFVLKSTDWSEQKLNDSRGKIVTDSTSAIATEVEEQKFGEDSIQFVLKSTDDWSEQKLNDSRGKIVTD", ""),
     ("dnaB", "Escherichia coli", "MLTAFDYQSAIYDAAQAALAAEGYQLHQSVNFEARGKAKEYGQATKKAGRGSADYAVQRAFYQNLFIKQILGKPSMKDGRQAAHLAGFHSNRELYINAIYQVASQDSIHKLAEAQALCAMYREHKNTQEAIRALTSMAQRLGPNPVLRDMRIQHFASRNMDVKDLAFIMAAQTLEKWYAEEGGFQ", ""),
     ("dnaN", "Escherichia coli", "MKFTVEREHLLKPLQQVSGPLGGRPTLPILGNLLLQVADGTLSLTGTDLEMEMVARVALVQPHEPGATTVPARKFFDICRGLPEGAEIAVQLEGERMLVRSGRSRFSLSTLPAADFPNLDDWQSAGDSIRDNLPFVSAETFMAGRSGAKEGDAVNALKRLAQISQARLQEALTEYAKKLHDLKLARGLKVNPAILSQLKGNRINSLQKEELANLPFQRVDALCQEKSLALLNTLHPAYRQVLKQHVTESSSRLSHIQFSDVEQEAVAESLAQ", ""),
-    # Transcription
-    ("rpoB", "Escherichia coli", "MFEPMTVRQVCERIGPITRDITKETVSKVLAEAGFEVIQHGRSTLCAHMNNGLSIIEKVLDYTEGDNFDRHLLEKINEHLKQHPEDLLTFAKREKDFFAALRAHKVSVGELKSSFKRLIEFIGDEAITMEYVKQHIGEELTTAGEKKVSTKRKLKKAQEAAIAAAKGNEEKAKEIVDEATKKALSAALKEMNPDEISARSGLSILRDLTFNSPKAGEPIISGAKPEYYRELVAKAMFDIYGYR", ""),
+    ("rpoB", "Escherichia coli", "MFEPMTVRQVCERIGPITRDITKETVSKVLAEAGFEVIQHGRSTLCAHMNNGLSIIEKVLDYTEGDNFDRHLLEKINEHLKQHPEDLLTFAKREKDFFAALRAHKVSVGELKSSFRLIEFIGDEAITMEYVKQHIGEELTTAGEKKVSTKRKLKKAQEAAIAAAKGNEEKAKEIVDEATKKALSAALKEMNPDEISARSGLSILRDLTFNSPKAGEPIISGAKPEYYRELVAKAMFDIYGYR", ""),
     ("rpoC", "Escherichia coli", "MKDLLKFLKAQTKTEEFDAIKIALASPDMIRSWSFGEVKKPETINYRTFKPERDGLFCARIFGPVKDYECLCGKYKRLKHRGVICEKCGVEVTQTKVRRERMGHIELASPTAHIWFLKSLPSRIGLLLDMPLRDIERVLYFESYVVIEGGMTQAALGRVFKDLNQQPIFELTDELVREKFKKENTQLLAAALEKNAASYPQILEAMYGSVHELIKEIIKAKPANGSASKSKEVL", ""),
     ("rpoD", "Escherichia coli", "MEQNPQSQLKLLEKAGYKPLSDALREGQRILAEKEAILAEVAVAGAGVEDALKNVPAPQVLDAIREGEIERLISQRPGKLPKETDELVRLFAETHGIALAQALNQYVFERLIRQIREAGAYSNLLESIKRQSGYSDREQLLRTVYNALEKRGDDAVNAMLALKEEKFDDTPMVLNRAGFEREGLIAHSIDFSAEQRVTRLLFQQLENQFVQEETYSDFGEALKGVAAELNQKLHEDLSKSIFQESFDYDREALTE", ""),
-    # Translation
     ("infB", "Escherichia coli", "MATQTFADNHISDDLQERVTDILAQTHKPAQNQHIFRPLFLGEPDQENAEEVVLELNLKDIDVTITEVTGQEVIAHVVAGELKMPHAVFIIDPSPFEKIDQCTQIELEDATMVNEQLVMHVTGAEITSYFEVKDKELLAKVEELEKEELDEFEEQIQGTAQLAALEREFRAISDSSFRGRGKISRSVVK", ""),
-    ("fusA", "Escherichia coli", "MAKEKFDRSKPHINIGTIGHVDHGKTTLTAAITMTLAALGAEAKNFSIRERAISEQIGQGLVKDLPGHEKDSFRVELIRESGQITTRQHIEYCTRHHILQADMPFFIRGPQSYDAIVTLNMEQPIYATIVNLGEAITDIVVLCTLINKMDPPERVKIEDVMVELSQLEMDKIKRGANFVAIRTKDAAGQHTVRAAFIGALQRGRVKPTKEARQKIMSIAKKIEGALTSAFDVF", ""),
+    ("fusA", "Escherichia coli", "MAKEKFDRSKPHINIGTIGHVDHGKTTLTAAITMTLAALGAEAKNFSIRERAISEQIGQGLVKDLPGHEKDSFRVELIRESGQITTRQHIEYCTRHHILQADMPFFIRWGPQSYDAIVTLNMEQPIYATIVNLGEAITDIVVLCTLINKMDPPERVKIEDVMVELSQLEMDKIKRGANFVAIRTKDAAGQHTVRAAFIGALQRGRVKPTKEARQKIMSIAKKIEGALTSAFDVF", ""),
     ("tufA", "Escherichia coli", "MSKEKFERTKPHVNVGTIGHVDHGKTTLTAAITTVLAKTYGGAARAFDQIDNAPEEKARGITINTSHVEYDTPTRHYAHVDCPGHADYVKNMITGAAQMDGAILVVSAADGPMPQTREHILLGRQVGVPYIIVFLNKCDMVDDEELLELVEMEVRELLSQYDFPGDDTPIVRGSALKALEGEDAEWEAKILELAGFLDSYIPEPERAIDKPFLLPIEDVFSISGRGTVVTGRVERGIIKVGEE", ""),
-    # Cell division
     ("ftsZ", "Escherichia coli", "MFEPMELTNDAVIKVIGVGGGGGNAVEHMVRERIGENHALAGANDFIISNDLLQYASKDGDLDTLVNFVAQLNENHPDYMFITSGDTGTQAPGTEVEKVFHPTGILELEFSDVVAILSGIGDLSSAVGKGAGNAAGATVFAVENTDPFIATGALRMKEAVDDAYDIANDADHYYRVIGLKGVQDLTKFISAKK", ""),
     ("ftsA", "Escherichia coli", "MISVIIATDNKQTYLDLEQLCKTYFDSDTPEVKKFIAGRVLDSLDTEIATLVKETLVEMDSMQAQFNELNERIVVRSAAHEGTNVTGKIVQGAETVIRGFQAPVAGMVLSKHVVKAAKQVGDVILDIGNDSKTTPDILREMQSMRLATQLNIESLVITKQGIGEQLQDTLKNLKVQDEDVRRMLSTFKE", ""),
-    # Lipid biosynthesis
     ("accA", "Escherichia coli", "MQTFDFQYKNEKADLIKEHLHQISGDTPMEEIITPQHQILQRVSAQEMKNLHYKPPVGEIYGMFGFDIINKQNELTRQEFSENQKIIFIGPPGSAMELAVTALKIAQEAGIPVIYSTGDSFAATFIDKLHAGNVSFYQTKLALPTPKDLARLQKLIAEGHNITVNATNHGNAYYLADKEGTMPHSGAIQALIDAGVVSQLEQNDKSLSRELTEKLAAWEKQFREAIKNPNISTPI", ""),
     ("accD", "Escherichia coli", "MSTKPVIITDVSRFDAQNLIREIKEKFPQSRLTGESSVEINFLTTLPTMAEEVLEKYGYLPEEVLDDLNEQLKQVSDMHAKYGNSLDPQTREASALMSQAEMIENANFPALAVQPKQIVEVTAKQAGKSSEQKAAELIAAGADIIGISNHGNSYIYAARNLASKGLPTLITFDID", ""),
-    # Amino acid biosynthesis  
     ("glyA", "Escherichia coli", "MKLYNLKDHNEQVSFAQAVTQGLGKNQGLFFPHDLPEFSLTEIDEMLKLDFVTRSAKILSAFIGDEIPQEILEERVRAAFAFPAPVANVESDVGCLELFHGPTLAFKDFGGRFMAQMLTHIAGDKPVTILIGHSERRHYFESEAEKAAERVTRLAKENLKAFGAKRFEVHEIISDEEVQRGAKALMMKLATQFSDMEFQDWAAKKLHEIQADFNWTLPYEGFKISKRY", ""),
     ("serA", "Escherichia coli", "MKLYNLKDHNEQVSFAQAVTQGLGKNQGLFFPHDLPEFSLTEIDEMLKLDFVTRSAKILSAFIGDEIPQEILEERVRAAFAFPAPVANVESDVGCLELFHGPTLAFKDFGGRFMAQMLTHIAGDKPVTILIGHSERRHYFESEAEKAAERVTRLAKENLKAFGAKRFEVHEIISDEEVQRGAKALMMKLATQFSDMEFQDWAAKKLHEIQADFNW", ""),
-    # Cell wall
     ("murA", "Escherichia coli", "MARVTITLGAEKRQITDALDAGLARGDLNVIVENGIHFSAQPIDAAQVAAAIQSKINPMGKFKDTNIVYASASSGKYITPAIMTVVPFIRDLPNITYLTKFVGEAMQRVGAPLNQALVKEMKPFYGLKSLHVADIEAERLTKFEAERKKLVDSLNWANRDISTWLGKQFHPEVTHTTPHTQMLEFLAQKPQRLKAIFEDAKKYV", ""),
     ("murB", "Escherichia coli", "MAIIIGAGNAGSCYAANQLGAKLILTDQNAEKHFPQYRSGLAHKQIDYVQNGLRRMSVSLEQAEKAKASQVSHDAFADSSYTTKYAAEFAVPEFKAYQNFCLAGDTGEKINRGDDVYIHRTDEDSDVYRPGARLLFAGIAAGMSSHMGLDYAVMKHYGGLDRLNRFGGEKFAAPYEDAKIV", ""),
-    # Protein folding/secretion
     ("groEL", "Escherichia coli", "MAAKDVKFGNDARVKMLRGVNVLADAVKVTLGPKGRNVVLDKSFGAPTITKDGVSVAREIELEDKFENMGAQMVKEVASKANDAAGDGTTTATVLAQAIITEGLKAVAAGMNPMDLKRGIDKAVTAAVEELKALSVPCSDSKAIAQVGTISANSDETVGKLIAEAMDKVGKEGVITVEDGTGLQDELDVVEGMQFDRGYLSPYFINKPETGA", ""),
     ("secA", "Escherichia coli", "MLIKLLTKVFGSRNDRTLRRLSEKFGKPFCAAGVHLEEVIMPIRYQKRGKRDFTRLKLILKQFHEDIKPMPLSFAGEALKHFDDDSYKELFDFDLKWQAKYQAMFHKEEIENALLSWAEDHQKIFEANQKVEQFYNELKNELGVGEVIEFYRKLKEPKSLDNMTAETLAEWFDAHQKKGQSKPEVFNDFENQRFLA", ""),
-    # Nucleotide biosynthesis
     ("pyrG", "Escherichia coli", "MLTRVKLITGGVVSAQVANALKEAGFSCIMIDSTPREHVLSGAAHKAGVPVIHTSTAQRLAQEFARKDGVKIFVDSEYFDTMMTPTGEVSKKEVAVKLANHHGMNIIGTDINEDPFAKALFEGFEERYGFNLAKMKRDMDRFNHVDEFLLDNFAPDCRIAPVTANLRALLAGGYKVNPCGVLAQTAWALGIPYELINAFRQAGIFAGRCVDLMIHRD", ""),
     ("pyrH", "Escherichia coli", "MKVAVLSGGSQGLRNALDAVSPTITQVVKASGKDLIVVLAAGVQKQNALAQSLGFNIDLVSLNIQAEPDDGSEEDYDADPFNKRKEMLAFIQQHLETEEFLGNAVQVLALNPFDTNTKDIQNWLKYGGDIILTADPFYSKPKQTEYSPFLNQMKAAGAKLV", ""),
-    # Fatty acid biosynthesis
     ("fabI", "Escherichia coli", "MGFLSGKRILVTGVASKLSIAYGIAQAMHREGAELAFTYQNDKLKGRVEEFAAQLGSDIVLQCDVAEDASIDTMFAELGKVWPKFDGFVHSIGFAPGDQLDGDYVNAVTREGFKIAHDISSYSSFVAMAKACRSMLNPGSALLTLSYLGAERAIPNYNVMGLARTSLSAAMTAQY", ""),
     ("fabD", "Escherichia coli", "MTQFAFVFPGQGSQTVGMLADMAASYPIVEETFAEASRILSEQGRPSYIFENSYLRPQLDQDCAKTLEHTLLFQPALHAFEHSLLESWGIEPDFVVGHSFGELVAAHFAGIFSLEDGLKLISRSRAILPNSGATMAASLRIMEEEVEQFVLQVLGRACGFKVAVVAGHNEERAQMLQEVTGSKLKQMSSGQPMQKAVFADYASVAG", ""),
-    # Chaperones
     ("dnaK", "Escherichia coli", "MGKIIGIDLGTTNSCVAIMDGTTPRVLENAEGDRTTPSIIAYTQDGETLVGQPAKRQAVTNPQNTLFAIKRLIGRRFQDEEVQRDVSIMPFKIIAADNGDAWVEVKGQKMAPPQISAEVLKKMKKTAEDYLGEPVTEAVITVPAYFNDAQRQATKDAGRIAGLEVKRIINEPTAAALAYGLDKGTGNRTIAVYDLGGGTFDISIIEIDEVDGEKTFEVLATNGDTHLGGEDFDNRMVNHFV", ""),
-    # More essential genes from S. aureus, M. tuberculosis, P. aeruginosa
     ("pbp2", "Staphylococcus aureus", "MKKWIKFLTLALVFSVQVTKEEVAFRKEKYVPKSTEPFDLSDMMDQFPQNTIQVTDFPGKYYITMKFDEKVDLSSGFTEYVYTRGDLYVPAINLSDGIDYTNPQFLE", ""),
     ("inhA", "Mycobacterium tuberculosis", "MTGLLDGKRILVSGIITDSSIAFHIARVAQEQGAQLVLTGFDRLRLIQRITDITAESAAKLKGNTLGSGISSNFPALKEAVDDVILGRFTATLRDVRQPEKIVDAVTGGFDITRQELGLSGYRSGKIAGQVYRSGGMTSYMAKSTLFDTFANYRLLMSQRFARNFGLITG", ""),
     ("gyrB", "Pseudomonas aeruginosa", "MSNSQDTIKAAKVYITDQHEGPDYLDIYQSPHGERAVSQEVRENLTVAGFDIEKHIPKSTRLENLEIRVNKDKWVIKDGRGRVRVHKDNNIDPDGSYETFTRFHTSVDAIN", ""),
@@ -88,61 +78,121 @@ ESSENTIAL_GENES_FALLBACK = [
 ]
 
 
-def download_deg(output_dir: Path = OUTPUT_DIR) -> tuple[Path, Path]:
-    """Download DEG protein and nucleotide files from multiple URLs.
+def _download_first_success(urls: list[str], dest_path: Path, is_gzipped: bool = False, is_zip: bool = False) -> bool:
+    """Try downloading from multiple URLs. Returns True on first success."""
+    for url in urls:
+        logger.info(f"Trying: {url}")
+        try:
+            req = Request(url, headers={"User-Agent": "PLMLoF/1.0"})
+            response = urlopen(req, timeout=60)  # noqa: S310
+            raw = response.read()
+            if len(raw) < 100:
+                logger.warning(f"Empty response from {url}")
+                continue
+
+            if is_gzipped:
+                try:
+                    data = gzip.decompress(raw)
+                except gzip.BadGzipFile:
+                    data = raw
+            elif is_zip:
+                # Extract first non-MACOSX file from ZIP
+                with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                    for name in zf.namelist():
+                        if not name.startswith("__"):
+                            data = zf.read(name)
+                            break
+                    else:
+                        logger.warning(f"No valid files in ZIP from {url}")
+                        continue
+            else:
+                data = raw
+
+            # Try to decode as text
+            text = None
+            for enc in ("utf-8", "latin-1"):
+                try:
+                    text = data.decode(enc)
+                    break
+                except (UnicodeDecodeError, ValueError):
+                    continue
+            if text is None:
+                text = data.decode("utf-8", errors="replace")
+
+            dest_path.write_text(text, encoding="utf-8")
+            logger.info(f"Downloaded {len(data) / 1e6:.1f} MB from {url}")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed: {e}")
+    return False
+
+
+def download_deg(output_dir: Path = OUTPUT_DIR) -> tuple[Path, Path, Path]:
+    """Download DEG protein, nucleotide, and annotation files.
 
     Returns:
-        Tuple of (protein_path, dna_path).
+        Tuple of (protein_path, dna_path, annotation_path).
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    protein_path = output_dir / "deg_proteins.dat"
-    dna_path = output_dir / "deg_dna.dat"
+    protein_path = output_dir / "deg_proteins.fasta"
+    dna_path = output_dir / "deg_dna.fasta"
+    annotation_path = output_dir / "deg_annotation.csv"
 
-    # Try all URLs for each type
-    for url, dtype in DEG_URLS:
-        target = protein_path if dtype == "protein" else dna_path
-        if target.exists() and target.stat().st_size > 100:
-            continue
-        logger.info(f"Trying DEG {dtype} from {url}...")
-        try:
-            req = Request(url, headers={"User-Agent": "PLMLoF/1.0"})
-            response = urlopen(req, timeout=30)  # noqa: S310
-            data = response.read()
-            if len(data) > 100:
-                target.write_bytes(data)
-                logger.info(f"Downloaded {len(data) / 1e6:.1f} MB ({dtype})")
-            else:
-                logger.warning(f"Empty response from {url}")
-        except Exception as e:
-            logger.warning(f"Could not download DEG {dtype} from {url}: {e}")
+    if not (protein_path.exists() and protein_path.stat().st_size > 100):
+        _download_first_success(DEG_PROTEIN_URLS, protein_path, is_gzipped=True)
 
-    # Create empty files if nothing downloaded
-    if not protein_path.exists():
-        protein_path.write_text("")
-    if not dna_path.exists():
-        dna_path.write_text("")
+    if not (dna_path.exists() and dna_path.stat().st_size > 100):
+        _download_first_success(DEG_NUCLEOTIDE_URLS, dna_path, is_gzipped=True)
 
-    return protein_path, dna_path
+    if not (annotation_path.exists() and annotation_path.stat().st_size > 100):
+        _download_first_success(DEG_ANNOTATION_URLS, annotation_path, is_zip=True)
+
+    return protein_path, dna_path, annotation_path
 
 
-def parse_deg_sequences(protein_path: Path, dna_path: Path) -> pd.DataFrame:
-    """Parse DEG FASTA files and extract bacterial essential gene sequences.
+def _parse_annotation(annotation_path: Path) -> dict[str, tuple[str, str]]:
+    """Parse DEG annotation CSV to map gene_id -> (gene_name, species).
+
+    DEG annotation format (semicolon-separated, double-quoted):
+    "DEG_org_id";"DEG_gene_id";"gene_name";"GI";"COG";"function";"description";"organism";...
+    """
+    mapping = {}
+    if not annotation_path.exists() or annotation_path.stat().st_size < 100:
+        return mapping
+
+    try:
+        text = annotation_path.read_text(encoding="utf-8")
+        for line in text.strip().split("\n"):
+            fields = [f.strip().strip('"') for f in line.split(";")]
+            if len(fields) < 8:
+                continue
+            gene_id = fields[1]    # e.g. DEG10010001
+            gene_name = fields[2]  # e.g. dnaA
+            species = fields[7]    # e.g. Bacillus subtilis 168
+            mapping[gene_id] = (gene_name, species)
+    except Exception as e:
+        logger.warning(f"Error parsing DEG annotation: {e}")
+
+    return mapping
+
+
+def parse_deg_sequences(protein_path: Path, dna_path: Path, annotation_path: Path) -> pd.DataFrame:
+    """Parse DEG FASTA files and annotation to build essential gene dataset.
 
     Returns:
         DataFrame with columns: gene_id, gene, species, ref_protein, ref_dna
     """
-    records = []
+    # Load annotation for gene names and species
+    annotation = _parse_annotation(annotation_path)
+    logger.info(f"Loaded {len(annotation)} gene annotations from DEG")
 
     # Parse protein sequences
     proteins = {}
     if protein_path.exists() and protein_path.stat().st_size > 100:
         try:
             for record in SeqIO.parse(str(protein_path), "fasta"):
-                proteins[record.id] = {
-                    "protein": str(record.seq),
-                    "description": record.description,
-                }
+                proteins[record.id] = str(record.seq)
         except Exception as e:
             logger.warning(f"Error parsing DEG proteins: {e}")
 
@@ -155,36 +205,42 @@ def parse_deg_sequences(protein_path: Path, dna_path: Path) -> pd.DataFrame:
         except Exception as e:
             logger.warning(f"Error parsing DEG DNA: {e}")
 
-    # Merge
+    logger.info(f"Parsed {len(proteins)} proteins, {len(dna_seqs)} DNA sequences from DEG")
+
+    # Build records
+    records = []
     all_ids = set(proteins.keys()) | set(dna_seqs.keys())
+
     for gid in all_ids:
-        protein = proteins.get(gid, {}).get("protein", "")
-        desc = proteins.get(gid, {}).get("description", "")
+        protein = proteins.get(gid, "")
         dna = dna_seqs.get(gid, "")
 
-        # If we have DNA but no protein, translate
+        # Translate DNA if no protein available
         if dna and not protein:
             protein = translate_dna(dna, to_stop=True)
 
-        # Extract species from description (DEG format: "DEG_ID gene_name - Species")
-        species = ""
-        if " - " in desc:
-            species = desc.split(" - ")[-1].strip()
+        # Strip stop codon characters — ESM2 cannot tokenize '*'
+        protein = protein.replace("*", "")
 
-        # Filter for bacterial species (heuristic: exclude human, mouse, yeast, etc.)
+        if not protein or len(protein) < 10:
+            continue
+
+        # Get gene name and species from annotation
+        gene_name, species = annotation.get(gid, (gid, ""))
+
+        # Filter out non-bacterial species
         skip_species = {"homo sapiens", "mus musculus", "saccharomyces", "drosophila",
                         "caenorhabditis", "arabidopsis", "danio rerio"}
         if any(s in species.lower() for s in skip_species):
             continue
 
-        if protein:
-            records.append({
-                "gene_id": gid,
-                "gene": desc.split()[1] if len(desc.split()) > 1 else gid,
-                "species": species,
-                "ref_protein": protein,
-                "ref_dna": dna,
-            })
+        records.append({
+            "gene_id": gid,
+            "gene": gene_name,
+            "species": species,
+            "ref_protein": protein,
+            "ref_dna": dna,
+        })
 
     df = pd.DataFrame(records)
     logger.info(f"Parsed {len(df)} bacterial essential genes from DEG")
@@ -227,7 +283,7 @@ def generate_lof_variants(
 
     for _, row in essential_genes.iterrows():
         ref_protein = row["ref_protein"]
-        ref_dna = row["ref_dna"]
+        ref_dna = row.get("ref_dna", "") or ""
         gene = row["gene"]
         species = row.get("species", "")
 
@@ -240,7 +296,6 @@ def generate_lof_variants(
             mutation_type = ""
 
             if v == 0 and ref_dna and len(ref_dna) >= 30:
-                # Premature stop at random position (first 80% of gene)
                 max_codon = int(len(ref_protein) * 0.8)
                 if max_codon < 2:
                     continue
@@ -251,13 +306,11 @@ def generate_lof_variants(
                     mutation_type = f"premature_stop_at_codon_{codon_pos}"
                 except (ValueError, IndexError):
                     var_protein = None
-            elif v == 0 and (not ref_dna or len(ref_dna) < 30):
-                # No DNA: simulate premature stop by truncation + "*"
+            elif v == 0:
                 stop_pos = rng.randint(1, int(len(ref_protein) * 0.8))
-                var_protein = ref_protein[:stop_pos] + "*"
+                var_protein = ref_protein[:stop_pos]
                 mutation_type = f"premature_stop_at_{stop_pos}"
             elif v == 1 and ref_dna and len(ref_dna) >= 30:
-                # Frameshift in first half
                 pos = rng.randint(3, len(ref_dna) // 2)
                 try:
                     var_dna = introduce_frameshift(ref_dna, pos, insert=True)
@@ -265,15 +318,13 @@ def generate_lof_variants(
                     mutation_type = f"frameshift_insert_at_{pos}"
                 except (ValueError, IndexError):
                     var_protein = None
-            elif v == 1 and (not ref_dna or len(ref_dna) < 30):
-                # No DNA: simulate scrambled N-terminal region
+            elif v == 1:
                 scramble_len = max(len(ref_protein) // 4, 3)
                 scrambled = list(ref_protein[:scramble_len])
                 rng.shuffle(scrambled)
-                var_protein = "".join(scrambled) + ref_protein[scramble_len:][:5] + "*"
+                var_protein = "".join(scrambled) + ref_protein[scramble_len:][:5]
                 mutation_type = f"scrambled_nterm_{scramble_len}"
             else:
-                # Large truncation (keep only 10-50% of protein)
                 keep_frac = rng.uniform(0.1, 0.5)
                 keep_len = max(int(len(ref_protein) * keep_frac), 1)
                 var_protein = ref_protein[:keep_len]
@@ -281,6 +332,11 @@ def generate_lof_variants(
                 mutation_type = f"truncation_{keep_frac:.0%}"
 
             if not var_protein:
+                continue
+
+            # Strip stop codon characters — ESM2 cannot tokenize '*'
+            var_protein = var_protein.replace("*", "")
+            if not var_protein or len(var_protein) < 3:
                 continue
 
             records.append({
@@ -303,8 +359,8 @@ def generate_lof_variants(
 def main():
     logging.basicConfig(level=logging.INFO)
 
-    protein_path, dna_path = download_deg()
-    essential = parse_deg_sequences(protein_path, dna_path)
+    protein_path, dna_path, annotation_path = download_deg()
+    essential = parse_deg_sequences(protein_path, dna_path, annotation_path)
 
     if essential.empty:
         logger.warning("DEG download/parse failed. Using curated essential genes fallback.")

@@ -22,15 +22,15 @@ logger = logging.getLogger(__name__)
 
 # ProteinGym reference file (try multiple known paths)
 PROTEINGYM_REFERENCE_URLS = [
-    "https://huggingface.co/datasets/OATML-Markslab/ProteinGym/resolve/main/reference_files/DMS_substitutions.csv",
-    "https://huggingface.co/datasets/OATML-Markslab/ProteinGym/resolve/main/DMS_substitutions.csv",
+    "https://marks.hms.harvard.edu/proteingym/ProteinGym_v1.3/DMS_substitutions.csv",
+    "https://huggingface.co/datasets/OATML-Markslab/ProteinGym_v0.1/resolve/main/ProteinGym_reference_file_substitutions.csv",
     "https://raw.githubusercontent.com/OATML-Markslab/ProteinGym/main/reference_files/DMS_substitutions.csv",
 ]
 
 # ProteinGym substitution scores ZIP (try multiple paths)
 PROTEINGYM_SUBS_URLS = [
-    "https://huggingface.co/datasets/OATML-Markslab/ProteinGym/resolve/main/DMS_ProteinGym_substitutions.zip",
-    "https://huggingface.co/datasets/OATML-Markslab/ProteinGym/resolve/main/substitutions/DMS_ProteinGym_substitutions.zip",
+    "https://marks.hms.harvard.edu/proteingym/ProteinGym_v1.3/DMS_ProteinGym_substitutions.zip",
+    "https://huggingface.co/datasets/OATML-Markslab/ProteinGym_v0.1/resolve/main/ProteinGym_substitutions/DMS_ProteinGym_substitutions.zip",
 ]
 
 OUTPUT_DIR = Path("data/raw/proteingym/")
@@ -131,7 +131,7 @@ def download_proteingym_scores(output_dir: Path = OUTPUT_DIR) -> Path:
     zip_path = output_dir / "DMS_ProteinGym_substitutions.zip"
     extract_dir = output_dir / "substitutions"
 
-    if extract_dir.exists() and any(extract_dir.glob("*.csv")):
+    if extract_dir.exists() and any(extract_dir.rglob("*.csv")):
         logger.info("ProteinGym scores already downloaded and extracted")
         return extract_dir
 
@@ -346,6 +346,10 @@ def _apply_mutation_string(ref_protein: str, mutation: str) -> str:
         except ValueError:
             continue
         if 0 <= pos < len(var):
+            # Validate that the reference amino acid matches
+            if var[pos] != ref_aa:
+                logger.debug(f"Mutation {mut}: expected {ref_aa} at pos {pos+1}, found {var[pos]}")
+                continue
             var[pos] = var_aa
 
     return "".join(var)
