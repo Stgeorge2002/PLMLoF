@@ -159,7 +159,7 @@ def main():
         # Build lightweight model (comparison + classifier only)
         hidden_size = train_dataset.ref_mean.shape[1]
         from plmlof.models.comparison import ComparisonModule
-        from plmlof.models.classifier import ClassifierHead
+        from plmlof.models.classifier import ClassifierHead, RegressionHead
         from plmlof.data.features import NUM_NUCLEOTIDE_FEATURES
 
         comparison = ComparisonModule(hidden_size=hidden_size, pool_strategy=pool_strategy)
@@ -171,6 +171,11 @@ def main():
             dropout=classifier_dropout,
         )
 
+        # Multi-task regression head for DMS z-score prediction
+        regression_weight = train_cfg.get("regression_weight", 0.5)
+        regressor = RegressionHead(input_size=classifier_input)
+        logger.info(f"Multi-task: classification + regression (weight={regression_weight})")
+
         cached_trainer = CachedTrainer(
             comparison=comparison,
             classifier=classifier,
@@ -180,6 +185,8 @@ def main():
             output_dir=output_dir,
             label_smoothing=model_cfg.get("classifier", {}).get("label_smoothing", 0.05),
             mixed_precision=mixed_precision,
+            regressor=regressor,
+            regression_weight=regression_weight,
             esm2_model_name=esm2_name,
             pool_strategy=pool_strategy,
             classifier_hidden_dims=classifier_hidden_dims,

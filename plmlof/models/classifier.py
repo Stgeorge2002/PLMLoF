@@ -1,4 +1,4 @@
-"""Classification head for LoF / WT / GoF prediction."""
+"""Classification and regression heads for PLMLoF."""
 
 from __future__ import annotations
 
@@ -54,3 +54,37 @@ class ClassifierHead(nn.Module):
             Logits [batch, num_classes].
         """
         return self.mlp(features)
+
+
+class RegressionHead(nn.Module):
+    """MLP regression head for predicting continuous DMS fitness z-scores.
+
+    Shares the same input features as ClassifierHead but outputs a scalar.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_dim: int = 128,
+        dropout: float = 0.2,
+    ):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(input_size, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            features: Input features [batch, input_size].
+
+        Returns:
+            Predicted z-scores [batch].
+        """
+        return self.mlp(features).squeeze(-1)

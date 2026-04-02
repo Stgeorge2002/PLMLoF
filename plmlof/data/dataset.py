@@ -79,6 +79,7 @@ class PLMLoFDataset(Dataset):
             "var_protein": var_protein,
             "nucleotide_features": nuc_features,
             "label": label,
+            "dms_score": float(row["dms_zscore"]) if "dms_zscore" in self.df.columns and pd.notna(row.get("dms_zscore")) else 0.0,
             "gene": str(row.get("gene", "")),
             "species": str(row.get("species", "")),
         }
@@ -142,6 +143,7 @@ class CachedEmbeddingDataset(Dataset):
         self.var_max = data["var_max"]
         self.nuc_features = data["nucleotide_features"]
         self.labels = data["labels"]
+        self.dms_scores = data.get("dms_scores", torch.zeros(len(self.labels)))
 
     def __len__(self) -> int:
         return len(self.labels)
@@ -154,4 +156,5 @@ class CachedEmbeddingDataset(Dataset):
             "var_max": self.var_max[idx],
             "nucleotide_features": self.nuc_features[idx],
             "labels": self.labels[idx],
+            "dms_scores": self.dms_scores[idx],
         }

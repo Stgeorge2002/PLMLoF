@@ -21,6 +21,7 @@ OUTPUT_DIR = Path("data/processed/")
 
 REQUIRED_COLUMNS = [
     "ref_protein", "var_protein", "label", "gene", "species", "source",
+    "dms_score", "dms_zscore",
 ]
 
 
@@ -52,7 +53,10 @@ def merge_datasets() -> pd.DataFrame:
     # Ensure required columns exist
     for col in REQUIRED_COLUMNS:
         if col not in df.columns:
-            df[col] = ""
+            if col in ("dms_score", "dms_zscore"):
+                df[col] = float("nan")
+            else:
+                df[col] = ""
     if "label" in df.columns:
         df["label"] = df["label"].astype(int)
 

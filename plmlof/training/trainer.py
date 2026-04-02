@@ -244,8 +244,10 @@ class PLMLoFTrainer:
 class CachedTrainer:
     """Fast trainer using pre-computed ESM2 embeddings.
 
-    Trains only the ComparisonModule + ClassifierHead on cached pooled
-    embeddings — no ESM2 forward passes needed.
+    Trains only the ComparisonModule + ClassifierHead + optional RegressionHead
+    on cached pooled embeddings — no ESM2 forward passes needed.
+
+    Multi-task loss: L = CE_classification + regression_weight * MSE_regression
     """
 
     def __init__(
@@ -258,6 +260,9 @@ class CachedTrainer:
         output_dir: str = "outputs/",
         label_smoothing: float = 0.0,
         mixed_precision: str = "no",
+        # Multi-task regression
+        regressor: nn.Module | None = None,
+        regression_weight: float = 0.5,
         # Model config for saving a reconstructable checkpoint
         esm2_model_name: str = "facebook/esm2_t33_650M_UR50D",
         pool_strategy: str = "mean_max",
@@ -268,12 +273,15 @@ class CachedTrainer:
         self.device = torch.device(device)
         self.comparison = comparison.to(self.device)
         self.classifier = classifier.to(self.device)
+        self.regressor = regressor.to(self.device) if regressor is not None else None
+        self.regression_weight = regression_weight
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+        self.reg_criterion = nn.MSELoss()
         self.best_metric = 0.0
         self.best_epoch = -1
 
@@ -288,10 +296,16 @@ class CachedTrainer:
             "classifier_dropout": classifier_dropout,
             "pool_strategy": pool_strategy,
             "lora_config": lora_config,
+            "has_regressor": regressor is not None,
+            "regression_weight": regression_weight,
         }
 
-    def _forward(self, batch: dict) -> torch.Tensor:
-        """Reconstruct comparison features from cached pooled embeddings and classify."""
+    def _forward(self, batch: dict) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Reconstruct comparison features from cached pooled embeddings and classify.
+
+        Returns:
+            Tuple of (logits [batch, num_classes], regression_pred [batch] or None).
+        """
         # Reconstruct pooled ref/var as [mean, max] concatenation
         ref_pool = torch.cat([batch["ref_mean"], batch["ref_max"]], dim=-1)
         var_pool = torch.cat([batch["var_mean"], batch["var_max"]], dim=-1)
@@ -302,7 +316,13 @@ class CachedTrainer:
         comparison = self.comparison._proj(comparison)
 
         features = torch.cat([comparison, batch["nucleotide_features"]], dim=-1)
-        return self.classifier(features)
+        logits = self.classifier(features)
+
+        reg_pred = None
+        if self.regressor is not None:
+            reg_pred = self.regressor(features)
+
+        return logits, reg_pred
 
     def _collate(self, batch: list[dict]) -> dict:
         return {
@@ -312,13 +332,29 @@ class CachedTrainer:
             "var_max": torch.stack([b["var_max"] for b in batch]).to(self.device),
             "nucleotide_features": torch.stack([b["nucleotide_features"] for b in batch]).to(self.device),
             "labels": torch.tensor([b["label"] for b in batch], dtype=torch.long, device=self.device),
+            "dms_scores": torch.stack([b["dms_scores"] for b in batch]).to(self.device) if "dms_scores" in batch[0] else torch.zeros(len(batch), device=self.device),
         }
+
+    def _compute_loss(self, logits, reg_pred, batch):
+        """Compute combined classification + regression loss."""
+        cls_loss = self.criterion(logits, batch["labels"])
+        if reg_pred is not None and self.regressor is not None:
+            dms_targets = batch["dms_scores"]
+            reg_loss = self.reg_criterion(reg_pred, dms_targets)
+            total_loss = cls_loss + self.regression_weight * reg_loss
+            return total_loss, cls_loss.item(), reg_loss.item()
+        return cls_loss, cls_loss.item(), 0.0
 
     def _train_epoch(self, optimizer, grad_accum_steps: int = 1) -> dict[str, float]:
         self.comparison.train()
         self.classifier.train()
+        if self.regressor is not None:
+            self.regressor.train()
         total_loss = 0.0
+        total_cls_loss = 0.0
+        total_reg_loss = 0.0
         all_preds, all_labels = [], []
+        all_reg_preds, all_dms_targets = [], []
         optimizer.zero_grad()
 
         pbar = tqdm(self.train_loader, desc="Training", leave=False)
@@ -327,8 +363,9 @@ class CachedTrainer:
                      for k, v in batch.items()}
 
             with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
-                logits = self._forward(batch)
-                loss = self.criterion(logits, batch["labels"]) / grad_accum_steps
+                logits, reg_pred = self._forward(batch)
+                loss, cls_l, reg_l = self._compute_loss(logits, reg_pred, batch)
+                loss = loss / grad_accum_steps
 
             self.scaler.scale(loss).backward()
 
@@ -338,33 +375,63 @@ class CachedTrainer:
                 optimizer.zero_grad()
 
             total_loss += loss.item() * grad_accum_steps
+            total_cls_loss += cls_l
+            total_reg_loss += reg_l
             all_preds.extend(logits.argmax(dim=-1).cpu().numpy())
             all_labels.extend(batch["labels"].cpu().numpy())
+            if reg_pred is not None:
+                all_reg_preds.extend(reg_pred.detach().cpu().numpy())
+                all_dms_targets.extend(batch["dms_scores"].cpu().numpy())
             pbar.set_postfix({"loss": f"{loss.item() * grad_accum_steps:.4f}"})
 
+        n_batches = max(len(self.train_loader), 1)
         metrics = compute_metrics(np.array(all_preds), np.array(all_labels))
-        metrics["loss"] = total_loss / max(len(self.train_loader), 1)
+        metrics["loss"] = total_loss / n_batches
+        metrics["cls_loss"] = total_cls_loss / n_batches
+        metrics["reg_loss"] = total_reg_loss / n_batches
+        if all_reg_preds:
+            from scipy.stats import spearmanr
+            rho, _ = spearmanr(all_dms_targets, all_reg_preds)
+            metrics["spearman"] = float(rho) if not np.isnan(rho) else 0.0
         return metrics
 
     @torch.no_grad()
     def _eval_epoch(self) -> dict[str, float]:
         self.comparison.eval()
         self.classifier.eval()
+        if self.regressor is not None:
+            self.regressor.eval()
         total_loss = 0.0
+        total_cls_loss = 0.0
+        total_reg_loss = 0.0
         all_preds, all_labels, all_probs = [], [], []
+        all_reg_preds, all_dms_targets = [], []
 
         for batch in tqdm(self.val_loader, desc="Evaluating", leave=False):
             batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
                      for k, v in batch.items()}
-            logits = self._forward(batch)
-            loss = self.criterion(logits, batch["labels"])
+            logits, reg_pred = self._forward(batch)
+            loss, cls_l, reg_l = self._compute_loss(logits, reg_pred, batch)
             total_loss += loss.item()
+            total_cls_loss += cls_l
+            total_reg_loss += reg_l
             all_preds.extend(logits.argmax(dim=-1).cpu().numpy())
             all_labels.extend(batch["labels"].cpu().numpy())
             all_probs.extend(torch.softmax(logits, dim=-1).cpu().numpy())
+            if reg_pred is not None:
+                all_reg_preds.extend(reg_pred.cpu().numpy())
+                all_dms_targets.extend(batch["dms_scores"].cpu().numpy())
 
+        n_batches = max(len(self.val_loader), 1)
         metrics = compute_metrics(np.array(all_preds), np.array(all_labels), np.array(all_probs))
-        metrics["loss"] = total_loss / max(len(self.val_loader), 1)
+        metrics["loss"] = total_loss / n_batches
+        metrics["cls_loss"] = total_cls_loss / n_batches
+        metrics["reg_loss"] = total_reg_loss / n_batches
+        if all_reg_preds:
+            from scipy.stats import spearmanr
+            rho, _ = spearmanr(all_dms_targets, all_reg_preds)
+            metrics["spearman"] = float(rho) if not np.isnan(rho) else 0.0
+            metrics["mae"] = float(np.mean(np.abs(np.array(all_dms_targets) - np.array(all_reg_preds))))
         return metrics
 
     def _save_checkpoint(self, epoch: int, metrics: dict) -> None:
@@ -373,7 +440,7 @@ class CachedTrainer:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         path = ckpt_dir / "model_best.pt"
 
-        # Save comparison + classifier state, plus model config for reconstruction
+        # Save comparison + classifier + regressor state, plus model config for reconstruction
         save_dict = {
             "epoch": epoch,
             "comparison_state_dict": self.comparison.state_dict(),
@@ -382,6 +449,8 @@ class CachedTrainer:
             "metrics": metrics,
             "cached_training": True,  # Flag indicating this needs assembly
         }
+        if self.regressor is not None:
+            save_dict["regressor_state_dict"] = self.regressor.state_dict()
         torch.save(save_dict, path)
         logger.info(f"Saved checkpoint to {path}")
 
@@ -401,12 +470,16 @@ class CachedTrainer:
             if ckpt.get("cached_training"):
                 self.comparison.load_state_dict(ckpt["comparison_state_dict"])
                 self.classifier.load_state_dict(ckpt["classifier_state_dict"])
+                if self.regressor is not None and "regressor_state_dict" in ckpt:
+                    self.regressor.load_state_dict(ckpt["regressor_state_dict"])
                 start_epoch = ckpt.get("epoch", 0) + 1
                 self.best_metric = ckpt.get("metrics", {}).get("macro_f1", 0.0)
                 self.best_epoch = ckpt.get("epoch", 0)
                 logger.info(f"Resumed from epoch {ckpt.get('epoch')}, best macro_f1={self.best_metric:.4f}")
 
         params = list(self.comparison.parameters()) + list(self.classifier.parameters())
+        if self.regressor is not None:
+            params += list(self.regressor.parameters())
         optimizer = AdamW(params, lr=learning_rate, weight_decay=weight_decay)
         scheduler = CosineAnnealingLR(optimizer, T_max=max_epochs)
 
@@ -421,8 +494,10 @@ class CachedTrainer:
             val_m = self._eval_epoch()
             scheduler.step()
 
-            logger.info(f"  Train loss={train_m['loss']:.4f}, macro_f1={train_m['macro_f1']:.4f}")
-            logger.info(f"  Val   loss={val_m['loss']:.4f}, macro_f1={val_m['macro_f1']:.4f}")
+            logger.info(f"  Train loss={train_m['loss']:.4f}, macro_f1={train_m['macro_f1']:.4f}" +
+                        (f", spearman={train_m.get('spearman', 0):.4f}" if self.regressor else ""))
+            logger.info(f"  Val   loss={val_m['loss']:.4f}, macro_f1={val_m['macro_f1']:.4f}" +
+                        (f", spearman={val_m.get('spearman', 0):.4f}" if self.regressor else ""))
 
             if val_m["macro_f1"] > self.best_metric:
                 self.best_metric = val_m["macro_f1"]

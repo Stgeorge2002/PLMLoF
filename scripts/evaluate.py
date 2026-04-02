@@ -79,7 +79,7 @@ def main():
         pool_strategy = model_cfg.get("pool_strategy", "mean_max")
 
         from plmlof.models.comparison import ComparisonModule
-        from plmlof.models.classifier import ClassifierHead
+        from plmlof.models.classifier import ClassifierHead, RegressionHead
         from plmlof.data.features import NUM_NUCLEOTIDE_FEATURES
         from transformers import AutoTokenizer, AutoModel
 
@@ -97,9 +97,18 @@ def main():
         )
         classifier.load_state_dict(checkpoint["classifier_state_dict"])
 
+        # Load regression head if present
+        regressor = None
+        if model_cfg.get("has_regressor") and "regressor_state_dict" in checkpoint:
+            regressor = RegressionHead(input_size=classifier_input)
+            regressor.load_state_dict(checkpoint["regressor_state_dict"])
+            logger.info("Loaded regression head for DMS score prediction")
+
         device = torch.device(args.device)
         comparison = comparison.to(device).eval()
         classifier = classifier.to(device).eval()
+        if regressor is not None:
+            regressor = regressor.to(device).eval()
 
         # Load ESM2 for embedding the test set
         logger.info(f"Loading ESM2: {esm2_name}")
@@ -125,18 +134,21 @@ def main():
                             max_length=max_len, return_tensors="pt")
             nuc = torch.stack([s["nucleotide_features"] for s in batch])
             labels = torch.tensor([s["label"] for s in batch], dtype=torch.long)
+            dms_scores = torch.tensor([s.get("dms_score", 0.0) for s in batch], dtype=torch.float32)
             return {
                 "input_ids": enc["input_ids"],
                 "attention_mask": enc["attention_mask"],
                 "n_ref": len(ref_seqs),
                 "nucleotide_features": nuc,
                 "labels": labels,
+                "dms_scores": dms_scores,
             }
 
         loader = DataLoader(dataset, batch_size=args.batch_size, collate_fn=_collate_eval,
                             num_workers=4, pin_memory=True)
 
         all_preds, all_labels, all_probs = [], [], []
+        all_reg_preds, all_dms_targets = [], []
 
         @torch.no_grad()
         def _pool(emb, mask):
@@ -178,9 +190,16 @@ def main():
                 all_labels.extend(batch["labels"].numpy())
                 all_probs.extend(probs)
 
+                if regressor is not None:
+                    reg_pred = regressor(features)
+                    all_reg_preds.extend(reg_pred.cpu().numpy())
+                    all_dms_targets.extend(batch["dms_scores"].numpy())
+
         preds = np.array(all_preds)
         labels = np.array(all_labels)
         probs = np.array(all_probs)
+        reg_preds = np.array(all_reg_preds) if all_reg_preds else None
+        dms_targets = np.array(all_dms_targets) if all_dms_targets else None
 
     else:
         # ── Full-model checkpoint ─────────────────────────────────────────
@@ -211,6 +230,8 @@ def main():
         loader = DataLoader(dataset, batch_size=args.batch_size, collate_fn=collator)
 
         preds, labels, probs = evaluate(model, loader, args.device)
+        reg_preds = None
+        dms_targets = None
 
     metrics = compute_metrics(preds, labels, probs)
     cm = compute_confusion_matrix(preds, labels)
@@ -227,6 +248,21 @@ def main():
     for i, row in enumerate(cm):
         print(f"{'True '+LABEL_MAP[i]:>10} {row[0]:>10} {row[1]:>10} {row[2]:>10}")
     print(f"\nClassification Report:\n{report}")
+
+    # Regression metrics
+    if reg_preds is not None and len(reg_preds) > 0:
+        from scipy.stats import spearmanr, pearsonr
+        rho, rho_p = spearmanr(dms_targets, reg_preds)
+        r, r_p = pearsonr(dms_targets, reg_preds)
+        mae = float(np.mean(np.abs(dms_targets - reg_preds)))
+        mse = float(np.mean((dms_targets - reg_preds) ** 2))
+        print("=" * 60)
+        print("REGRESSION RESULTS (DMS z-score prediction)")
+        print("=" * 60)
+        print(f"  Spearman ρ:   {rho:.4f} (p={rho_p:.2e})")
+        print(f"  Pearson r:    {r:.4f} (p={r_p:.2e})")
+        print(f"  MAE:          {mae:.4f}")
+        print(f"  MSE:          {mse:.4f}")
 
 
 if __name__ == "__main__":

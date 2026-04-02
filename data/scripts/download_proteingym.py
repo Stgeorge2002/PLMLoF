@@ -296,6 +296,8 @@ def process_dms_scores(
                     "ref_dna": "",
                     "var_dna": "",
                     "label": label,
+                    "dms_score": float(score),
+                    "dms_zscore": float(z),
                     "source": "ProteinGym",
                 })
 

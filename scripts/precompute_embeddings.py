@@ -82,6 +82,7 @@ def _collate_for_embedding(batch: list[dict], tokenizer, max_length: int) -> dic
 
     nuc_features = torch.stack([s["nucleotide_features"] for s in batch])
     labels = torch.tensor([s["label"] for s in batch], dtype=torch.long)
+    dms_scores = torch.tensor([s.get("dms_score", 0.0) for s in batch], dtype=torch.float32)
 
     return {
         "input_ids": enc["input_ids"],
@@ -89,6 +90,7 @@ def _collate_for_embedding(batch: list[dict], tokenizer, max_length: int) -> dic
         "n_ref": len(ref_seqs),          # first n_ref rows are ref, rest are var
         "nucleotide_features": nuc_features,
         "labels": labels,
+        "dms_scores": dms_scores,
     }
 
 
@@ -120,6 +122,7 @@ def precompute_split(
     all_var_max = []
     all_nuc = []
     all_labels = []
+    all_dms = []
 
     model.eval()
     for batch in tqdm(loader, desc=f"Encoding {output_path.stem}"):
@@ -153,6 +156,7 @@ def precompute_split(
         all_var_max.append(var_max)
         all_nuc.append(batch["nucleotide_features"])
         all_labels.append(batch["labels"])
+        all_dms.append(batch["dms_scores"])
 
     # Save as single tensor file
     data = {
@@ -162,6 +166,7 @@ def precompute_split(
         "var_max": torch.cat(all_var_max),
         "nucleotide_features": torch.cat(all_nuc),
         "labels": torch.cat(all_labels),
+        "dms_scores": torch.cat(all_dms),
     }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)

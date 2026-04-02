@@ -116,14 +116,17 @@ Reference protein ──► ┌────────────────�
 Variant protein  ──►  │   (+ LoRA        │    Module         │  Classifier │──► LoF / WT / GoF
                       │    adapters)      │    diff/product   │  Head (MLP) │
                       └──────────────────┘    mean+max pool  │             │
-                                                             │             │
-                              12-dim engineered ────────────►│             │
-                              nucleotide features            └─────────────┘
-                              (frameshift, premature stop,
-                               start codon loss, truncation...)
+                                                             │  Regression │──► DMS z-score
+                              12-dim engineered ────────────►│  Head (MLP) │    (multi-task)
+                              features                       └─────────────┘
+                              (length change, premature stop,
+                               met-start lost, missense density,
+                               truncation, region, sequence identity...)
 ```
 
-**Pre-compute workflow:** ESM2 runs once to save pooled `[mean, max]` embeddings per sequence. The `CachedTrainer` then trains only the Comparison projection + Classifier MLP using those cached tensors — no ESM2 forward pass per epoch.
+**Pre-compute workflow:** ESM2 runs once to save pooled `[mean, max]` embeddings per sequence. The `CachedTrainer` then trains only the Comparison projection + Classifier MLP + Regression MLP using those cached tensors — no ESM2 forward pass per epoch.
+
+**Multi-task training:** Classification loss (cross-entropy) + regression loss (MSE on DMS fitness z-scores) are jointly optimised. The regression head predicts the continuous fitness effect; weight is configurable via `regression_weight` in the training config.
 
 ---
 

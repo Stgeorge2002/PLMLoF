@@ -27,6 +27,9 @@ training:
   max_seq_length: 1024
   seed: 42
 
+  # Multi-task regression (DMS z-score prediction)
+  regression_weight: 0.5       # Weight of MSE regression loss vs CE classification loss
+
   # Class weights (auto-computed if null)
   class_weights: null
 
