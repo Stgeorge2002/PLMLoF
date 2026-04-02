@@ -153,5 +153,5 @@ class CachedEmbeddingDataset(Dataset):
             "var_mean": self.var_mean[idx],
             "var_max": self.var_max[idx],
             "nucleotide_features": self.nuc_features[idx],
-            "label": self.labels[idx].item(),
+            "labels": self.labels[idx],
         }
