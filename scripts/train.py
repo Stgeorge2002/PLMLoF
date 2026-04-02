@@ -119,6 +119,13 @@ def main():
     pool_strategy = model_cfg.get("comparison", {}).get("pool_strategy", "mean_max")
     classifier_hidden_dims = model_cfg.get("classifier", {}).get("hidden_dims", [256, 64])
     classifier_dropout = model_cfg.get("classifier", {}).get("dropout", 0.3)
+
+    # Resolve mixed precision early (needed by both cached and standard paths)
+    mixed_precision = args.mixed_precision or train_cfg.get("mixed_precision", "no")
+    if mixed_precision != "no" and device != "cuda":
+        logger.warning(f"Mixed precision '{mixed_precision}' requires CUDA. Falling back to 'no'.")
+        mixed_precision = "no"
+
     logger.info(f"Building model with ESM2: {esm2_name}")
     model = PLMLoFModel(
         esm2_model_name=esm2_name,
@@ -223,12 +230,6 @@ def main():
         return tl, vl
 
     train_loader, val_loader = _make_loaders(batch_size_s1)
-
-    # Resolve mixed precision
-    mixed_precision = args.mixed_precision or train_cfg.get("mixed_precision", "no")
-    if mixed_precision != "no" and device != "cuda":
-        logger.warning(f"Mixed precision '{mixed_precision}' requires CUDA. Falling back to 'no'.")
-        mixed_precision = "no"
 
     # Build trainer
     trainer = PLMLoFTrainer(
