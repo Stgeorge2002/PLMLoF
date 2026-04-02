@@ -3,6 +3,8 @@
 Usage:
     python scripts/evaluate.py --model outputs/checkpoints/model_best.pt --test-data data/processed/test.parquet
     python scripts/evaluate.py --model outputs/checkpoints/model_best.pt --tiny
+
+Supports both full-model and cached-training checkpoints automatically.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ import logging
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from plmlof.models.plmlof_model import PLMLoFModel
 from plmlof.data.dataset import PLMLoFDataset, SyntheticPLMLoFDataset
@@ -67,37 +70,148 @@ def main():
 
     # Load checkpoint
     checkpoint = torch.load(args.model, map_location=args.device, weights_only=False)
-    state_dict = checkpoint.get("model_state_dict", checkpoint)
 
-    # Reconstruct model from saved config or CLI flags
-    model_cfg = checkpoint.get("model_config", {})
-    if args.tiny:
-        esm2_name = "facebook/esm2_t6_8M_UR50D"
-    else:
+    # ── Cached-training checkpoint ────────────────────────────────────────
+    if checkpoint.get("cached_training"):
+        logger.info("Detected cached-training checkpoint — using embedding-based evaluation")
+        model_cfg = checkpoint.get("model_config", {})
         esm2_name = model_cfg.get("esm2_model_name", "facebook/esm2_t33_650M_UR50D")
+        pool_strategy = model_cfg.get("pool_strategy", "mean_max")
 
-    model = PLMLoFModel(
-        esm2_model_name=esm2_name,
-        freeze_esm2=True,
-        lora_config=model_cfg.get("lora_config"),
-        classifier_hidden_dims=model_cfg.get("classifier_hidden_dims", [256, 64]),
-        classifier_dropout=model_cfg.get("classifier_dropout", 0.3),
-        pool_strategy=model_cfg.get("pool_strategy", "mean_max"),
-    )
-    model.load_state_dict(state_dict, strict=False)
-    model = model.to(args.device)
+        from plmlof.models.comparison import ComparisonModule
+        from plmlof.models.classifier import ClassifierHead
+        from plmlof.data.features import NUM_NUCLEOTIDE_FEATURES
+        from transformers import AutoTokenizer, AutoModel
 
-    # Dataset
-    if args.tiny or args.test_data is None:
-        dataset = SyntheticPLMLoFDataset(num_samples=30)
+        # Load comparison + classifier
+        hidden_size = 1280  # ESM2-650M
+        comparison = ComparisonModule(hidden_size=hidden_size, pool_strategy=pool_strategy)
+        comparison.load_state_dict(checkpoint["comparison_state_dict"])
+
+        classifier_input = comparison.output_size + NUM_NUCLEOTIDE_FEATURES
+        classifier = ClassifierHead(
+            input_size=classifier_input,
+            hidden_dims=model_cfg.get("classifier_hidden_dims", [512, 128]),
+            num_classes=3,
+            dropout=model_cfg.get("classifier_dropout", 0.3),
+        )
+        classifier.load_state_dict(checkpoint["classifier_state_dict"])
+
+        device = torch.device(args.device)
+        comparison = comparison.to(device).eval()
+        classifier = classifier.to(device).eval()
+
+        # Load ESM2 for embedding the test set
+        logger.info(f"Loading ESM2: {esm2_name}")
+        tokenizer = AutoTokenizer.from_pretrained(esm2_name)
+        esm2 = AutoModel.from_pretrained(esm2_name).to(device)
+        esm2.eval()
+        for p in esm2.parameters():
+            p.requires_grad = False
+
+        # Dataset
+        if args.tiny or args.test_data is None:
+            dataset = SyntheticPLMLoFDataset(num_samples=30)
+        else:
+            dataset = PLMLoFDataset(args.test_data)
+
+        max_len = 1024
+
+        def _collate_eval(batch):
+            ref_seqs = [s["ref_protein"] for s in batch]
+            var_seqs = [s["var_protein"] for s in batch]
+            all_seqs = ref_seqs + var_seqs
+            enc = tokenizer(all_seqs, padding=True, truncation=True,
+                            max_length=max_len, return_tensors="pt")
+            nuc = torch.stack([s["nucleotide_features"] for s in batch])
+            labels = torch.tensor([s["label"] for s in batch], dtype=torch.long)
+            return {
+                "input_ids": enc["input_ids"],
+                "attention_mask": enc["attention_mask"],
+                "n_ref": len(ref_seqs),
+                "nucleotide_features": nuc,
+                "labels": labels,
+            }
+
+        loader = DataLoader(dataset, batch_size=args.batch_size, collate_fn=_collate_eval,
+                            num_workers=4, pin_memory=True)
+
+        all_preds, all_labels, all_probs = [], [], []
+
+        @torch.no_grad()
+        def _pool(emb, mask):
+            m_f = mask.unsqueeze(-1).float()
+            mean_p = (emb * m_f).sum(1) / m_f.sum(1).clamp(min=1)
+            emb_masked = emb.masked_fill(~mask.unsqueeze(-1).bool(), float("-inf"))
+            max_p = emb_masked.max(dim=1).values
+            max_p = max_p.masked_fill(max_p == float("-inf"), 0.0)
+            return mean_p, max_p
+
+        with torch.no_grad():
+            for batch in tqdm(loader, desc="Evaluating"):
+                ids = batch["input_ids"].to(device, non_blocking=True)
+                mask = batch["attention_mask"].to(device, non_blocking=True)
+                n_ref = batch["n_ref"]
+                nuc = batch["nucleotide_features"].to(device, non_blocking=True)
+
+                with torch.amp.autocast("cuda", dtype=torch.float16, enabled=device.type == "cuda"):
+                    out = esm2(ids, attention_mask=mask).last_hidden_state
+
+                ref_out, var_out = out[:n_ref], out[n_ref:]
+                ref_mask, var_mask = mask[:n_ref], mask[n_ref:]
+
+                ref_mean, ref_max = _pool(ref_out, ref_mask)
+                var_mean, var_max = _pool(var_out, var_mask)
+
+                ref_pool = torch.cat([ref_mean, ref_max], dim=-1)
+                var_pool = torch.cat([var_mean, var_max], dim=-1)
+                diff_pool = ref_pool - var_pool
+                prod_pool = ref_pool * var_pool
+                comp = torch.cat([diff_pool, prod_pool, ref_pool, var_pool], dim=-1)
+                comp = comparison._proj(comp)
+                features = torch.cat([comp, nuc], dim=-1)
+                logits = classifier(features)
+
+                probs = torch.softmax(logits, dim=-1).cpu().numpy()
+                preds_batch = logits.argmax(dim=-1).cpu().numpy()
+                all_preds.extend(preds_batch)
+                all_labels.extend(batch["labels"].numpy())
+                all_probs.extend(probs)
+
+        preds = np.array(all_preds)
+        labels = np.array(all_labels)
+        probs = np.array(all_probs)
+
     else:
-        dataset = PLMLoFDataset(args.test_data)
+        # ── Full-model checkpoint ─────────────────────────────────────────
+        state_dict = checkpoint.get("model_state_dict", checkpoint)
+        model_cfg = checkpoint.get("model_config", {})
+        if args.tiny:
+            esm2_name = "facebook/esm2_t6_8M_UR50D"
+        else:
+            esm2_name = model_cfg.get("esm2_model_name", "facebook/esm2_t33_650M_UR50D")
 
-    collator = PLMLoFCollator(tokenizer_name=esm2_name)
-    loader = DataLoader(dataset, batch_size=args.batch_size, collate_fn=collator)
+        model = PLMLoFModel(
+            esm2_model_name=esm2_name,
+            freeze_esm2=True,
+            lora_config=model_cfg.get("lora_config"),
+            classifier_hidden_dims=model_cfg.get("classifier_hidden_dims", [256, 64]),
+            classifier_dropout=model_cfg.get("classifier_dropout", 0.3),
+            pool_strategy=model_cfg.get("pool_strategy", "mean_max"),
+        )
+        model.load_state_dict(state_dict, strict=False)
+        model = model.to(args.device)
 
-    # Evaluate
-    preds, labels, probs = evaluate(model, loader, args.device)
+        if args.tiny or args.test_data is None:
+            dataset = SyntheticPLMLoFDataset(num_samples=30)
+        else:
+            dataset = PLMLoFDataset(args.test_data)
+
+        collator = PLMLoFCollator(tokenizer_name=esm2_name)
+        loader = DataLoader(dataset, batch_size=args.batch_size, collate_fn=collator)
+
+        preds, labels, probs = evaluate(model, loader, args.device)
+
     metrics = compute_metrics(preds, labels, probs)
     cm = compute_confusion_matrix(preds, labels)
     report = format_classification_report(preds, labels)
