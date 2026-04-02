@@ -20,9 +20,9 @@ import yaml
 from torch.utils.data import DataLoader
 
 from plmlof.models.plmlof_model import PLMLoFModel
-from plmlof.data.dataset import PLMLoFDataset, SyntheticPLMLoFDataset
+from plmlof.data.dataset import PLMLoFDataset, SyntheticPLMLoFDataset, CachedEmbeddingDataset
 from plmlof.data.collator import PLMLoFCollator
-from plmlof.training.trainer import PLMLoFTrainer
+from plmlof.training.trainer import PLMLoFTrainer, CachedTrainer
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +42,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--mixed-precision", type=str, default=None, choices=["fp16", "bf16", "no"], help="Mixed precision mode")
     parser.add_argument("--num-workers", type=int, default=None, help="DataLoader workers (default: auto)")
+    parser.add_argument("--precomputed", type=str, default=None,
+                        help="Path to pre-computed embeddings dir (from precompute_embeddings.py). "
+                             "Trains comparison+classifier only — no ESM2 forward passes.")
     return parser.parse_args()
 
 
@@ -126,6 +129,71 @@ def main():
         classifier_dropout=classifier_dropout,
     )
 
+    # ── Pre-computed embedding mode (fast Stage 1 only) ──────────────────
+    if args.precomputed:
+        emb_dir = Path(args.precomputed)
+        train_cache = emb_dir / "train_embeddings.pt"
+        val_cache = emb_dir / "val_embeddings.pt"
+
+        logger.info(f"Using pre-computed embeddings from {emb_dir}")
+        train_dataset = CachedEmbeddingDataset(train_cache)
+        val_dataset = CachedEmbeddingDataset(val_cache) if val_cache.exists() else train_dataset
+        logger.info(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
+
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size_s1 * 4, shuffle=True,
+            num_workers=4, pin_memory=(device == "cuda"),
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=batch_size_s1 * 4, shuffle=False,
+            num_workers=4, pin_memory=(device == "cuda"),
+        )
+
+        # Build lightweight model (comparison + classifier only)
+        hidden_size = train_dataset.ref_mean.shape[1]
+        from plmlof.models.comparison import ComparisonModule
+        from plmlof.models.classifier import ClassifierHead
+        from plmlof.data.features import NUM_NUCLEOTIDE_FEATURES
+
+        comparison = ComparisonModule(hidden_size=hidden_size, pool_strategy=pool_strategy)
+        classifier_input = comparison.output_size + NUM_NUCLEOTIDE_FEATURES
+        classifier = ClassifierHead(
+            input_size=classifier_input,
+            hidden_dims=classifier_hidden_dims,
+            num_classes=3,
+            dropout=classifier_dropout,
+        )
+
+        cached_trainer = CachedTrainer(
+            comparison=comparison,
+            classifier=classifier,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            device=device,
+            output_dir=output_dir,
+            label_smoothing=model_cfg.get("classifier", {}).get("label_smoothing", 0.05),
+            mixed_precision=mixed_precision,
+            esm2_model_name=esm2_name,
+            pool_strategy=pool_strategy,
+            classifier_hidden_dims=classifier_hidden_dims,
+            classifier_dropout=classifier_dropout,
+            lora_config=lora_config,
+        )
+
+        logger.info("=" * 60)
+        logger.info("STAGE 1 (CACHED): Training comparison + classifier head")
+        logger.info("=" * 60)
+        cached_trainer.train(
+            max_epochs=max_epochs_s1,
+            learning_rate=lr_s1,
+            patience=train_cfg.get("early_stopping_patience", 5),
+            grad_accum_steps=grad_accum_s1,
+        )
+        logger.info("Training complete!")
+        logger.info(f"Best model saved to {output_dir}/checkpoints/model_best.pt")
+        return
+
+    # ── Standard mode (ESM2 forward passes each batch) ────────────────────
     # Build datasets
     if args.tiny or (args.train_data is None):
         logger.info("Using synthetic dataset for testing")

@@ -119,3 +119,39 @@ class SyntheticPLMLoFDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         return self.samples[idx]
+
+
+class CachedEmbeddingDataset(Dataset):
+    """Dataset using pre-computed ESM2 embeddings (no ESM2 forward passes).
+
+    Loads a .pt file created by scripts/precompute_embeddings.py containing
+    pre-pooled ref/var mean+max embeddings, nucleotide features, and labels.
+    """
+
+    def __init__(self, cache_path: str | Path):
+        path = Path(cache_path)
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Cached embeddings not found: {path}. "
+                "Run scripts/precompute_embeddings.py first."
+            )
+        data = torch.load(path, weights_only=True)
+        self.ref_mean = data["ref_mean"]
+        self.ref_max = data["ref_max"]
+        self.var_mean = data["var_mean"]
+        self.var_max = data["var_max"]
+        self.nuc_features = data["nucleotide_features"]
+        self.labels = data["labels"]
+
+    def __len__(self) -> int:
+        return len(self.labels)
+
+    def __getitem__(self, idx: int) -> dict:
+        return {
+            "ref_mean": self.ref_mean[idx],
+            "ref_max": self.ref_max[idx],
+            "var_mean": self.var_mean[idx],
+            "var_max": self.var_max[idx],
+            "nucleotide_features": self.nuc_features[idx],
+            "label": self.labels[idx].item(),
+        }
