@@ -1,10 +1,7 @@
-"""Curate and merge all data sources into a unified training dataset.
+"""Curate ProteinGym DMS data into a balanced training dataset.
 
-Merges:
-1. CARD GoF variants (download_card.py)
-2. DEG LoF variants (download_deg.py)
-3. ProteinGym DMS bacterial variants (download_proteingym.py)
-4. Synthetic variants (generate_synthetic.py)
+Loads ProteinGym bacterial variants and subsamples to 50K total records
+with equal class balance (~16,666 each for LoF, WT, GoF).
 
 Produces stratified train/val/test splits.
 """
@@ -38,46 +35,54 @@ def load_source(path: Path, source_name: str) -> pd.DataFrame:
     return df
 
 
+# Total samples and per-class target for balanced subsampling
+TOTAL_SAMPLES = 50_000
+SAMPLES_PER_CLASS = TOTAL_SAMPLES // 3  # ~16,666 each
+
+
 def merge_datasets() -> pd.DataFrame:
-    """Load and merge all data sources into a unified dataset."""
-    sources = {
-        "CARD GoF": PROCESSED_DIR / "card_gof.parquet",
-        "DEG LoF": PROCESSED_DIR / "deg_lof.parquet",
-        "ProteinGym": PROCESSED_DIR / "proteingym_bacterial.parquet",
-        "Synthetic": PROCESSED_DIR / "synthetic_variants.parquet",
-    }
+    """Load ProteinGym data and subsample to a balanced dataset."""
+    path = PROCESSED_DIR / "proteingym_bacterial.parquet"
+    df = load_source(path, "ProteinGym")
 
-    dfs = []
-    for name, path in sources.items():
-        df = load_source(path, name)
-        if not df.empty:
-            # Ensure required columns exist
-            for col in REQUIRED_COLUMNS:
-                if col not in df.columns:
-                    df[col] = ""
-            # Ensure label is int
-            if "label" in df.columns:
-                df["label"] = df["label"].astype(int)
-            dfs.append(df[REQUIRED_COLUMNS + [c for c in df.columns if c not in REQUIRED_COLUMNS]])
+    if df.empty:
+        logger.error("ProteinGym data not found. Run download_proteingym.py first.")
+        raise RuntimeError("No data source found")
 
-    if not dfs:
-        logger.error("No data sources available. Run download scripts first.")
-        raise RuntimeError("No data sources found")
-
-    merged = pd.concat(dfs, ignore_index=True)
+    # Ensure required columns exist
+    for col in REQUIRED_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+    if "label" in df.columns:
+        df["label"] = df["label"].astype(int)
 
     # Strip stop codon '*' characters — ESM2 cannot tokenize them
-    merged["ref_protein"] = merged["ref_protein"].str.replace("*", "", regex=False)
-    merged["var_protein"] = merged["var_protein"].str.replace("*", "", regex=False)
+    df["ref_protein"] = df["ref_protein"].str.replace("*", "", regex=False)
+    df["var_protein"] = df["var_protein"].str.replace("*", "", regex=False)
 
     # Drop rows with empty proteins
-    merged = merged[merged["ref_protein"].str.len() > 0]
-    merged = merged[merged["var_protein"].str.len() > 0]
+    df = df[df["ref_protein"].str.len() > 0]
+    df = df[df["var_protein"].str.len() > 0]
 
     # Drop exact duplicates
-    merged = merged.drop_duplicates(subset=["ref_protein", "var_protein", "label"])
+    df = df.drop_duplicates(subset=["ref_protein", "var_protein", "label"])
 
-    logger.info(f"Merged dataset: {len(merged)} records")
+    logger.info(f"ProteinGym after dedup: {len(df)} records")
+    label_counts = df["label"].value_counts()
+    logger.info(f"Full label distribution: LoF={label_counts.get(0, 0)}, WT={label_counts.get(1, 0)}, GoF={label_counts.get(2, 0)}")
+
+    # Balanced subsample: equal thirds per class
+    balanced_dfs = []
+    for label in [0, 1, 2]:
+        class_df = df[df["label"] == label]
+        n = min(len(class_df), SAMPLES_PER_CLASS)
+        balanced_dfs.append(class_df.sample(n=n, random_state=42))
+        logger.info(f"  Label {label}: sampled {n} / {len(class_df)} available")
+
+    merged = pd.concat(balanced_dfs, ignore_index=True)
+    merged = merged.sample(frac=1, random_state=42).reset_index(drop=True)  # shuffle
+
+    logger.info(f"Balanced dataset: {len(merged)} records")
     label_counts = merged["label"].value_counts()
     logger.info(f"Label distribution: LoF={label_counts.get(0, 0)}, WT={label_counts.get(1, 0)}, GoF={label_counts.get(2, 0)}")
 

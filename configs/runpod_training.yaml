@@ -2,7 +2,7 @@
 training:
   # Stage 1: Classification head only (ESM2 frozen)
   stage1:
-    max_epochs: 30
+    max_epochs: 5
     learning_rate: 5.0e-4
     weight_decay: 0.01
     batch_size: 32          # Larger batch on GPU
@@ -12,7 +12,7 @@ training:
 
   # Stage 2: LoRA fine-tuning
   stage2:
-    max_epochs: 15
+    max_epochs: 5
     learning_rate: 5.0e-5
     weight_decay: 0.01
     batch_size: 16
