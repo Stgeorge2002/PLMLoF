@@ -71,7 +71,7 @@ DEVICE="cpu"
 if python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
     DEVICE="cuda"
     GPU_NAME=$(python -c "import torch; print(torch.cuda.get_device_name(0))")
-    GPU_MEM=$(python -c "import torch; print(f'{torch.cuda.get_device_properties(0).total_mem / 1e9:.0f}')")
+    GPU_MEM=$(python -c "import torch; print(f'{torch.cuda.get_device_properties(0).total_memory / 1e9:.0f}')")
     echo "GPU: $GPU_NAME (${GPU_MEM} GB) — device=cuda"
 else
     echo "No GPU detected, using CPU (will be slow)"
