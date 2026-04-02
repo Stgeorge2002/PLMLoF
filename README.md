@@ -130,7 +130,7 @@ Variant protein  ──►  │   (+ LoRA        │    Module         │  Clas
 
 **Pre-compute workflow:** ESM2 runs once to save pooled `[mean, max]` embeddings per sequence. The `CachedTrainer` then trains only the Comparison projection + Classifier MLP + Regression MLP using those cached tensors — no ESM2 forward pass per epoch.
 
-**Multi-task training:** Classification loss (cross-entropy) + regression loss (MSE on DMS fitness z-scores) are jointly optimised. The regression head predicts the continuous fitness effect; weight is configurable via `regression_weight` in the training config.
+**Multi-task training:** Classification loss (cross-entropy) + regression loss (Huber/SmoothL1 on DMS fitness z-scores) are jointly optimised with linear warmup. The regression head predicts the continuous fitness effect; weight is configurable via `regression_weight` in the training config.
 
 ---
 
