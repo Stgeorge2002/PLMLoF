@@ -11,7 +11,7 @@ model:
     target_modules: ["query", "value"]
 
   comparison:
-    use_cross_attention: false
+    use_cross_attention: true
     pool_strategy: "mean_max"
 
   classifier:

@@ -188,6 +188,8 @@ def main():
             regressor=regressor,
             regression_weight=regression_weight,
             regression_warmup_epochs=train_cfg.get("regression_warmup_epochs", 3),
+            focal_gamma=train_cfg.get("focal_gamma", 2.0),
+            use_cross_attention=model_cfg.get("comparison", {}).get("use_cross_attention", False),
             esm2_model_name=esm2_name,
             pool_strategy=pool_strategy,
             classifier_hidden_dims=classifier_hidden_dims,

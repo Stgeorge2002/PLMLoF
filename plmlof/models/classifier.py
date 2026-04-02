@@ -4,6 +4,37 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+
+class FocalLoss(nn.Module):
+    """Focal loss for multi-class classification.
+
+    Down-weights easy examples so the model focuses on hard ones (e.g. WT
+    variants near the LoF/GoF boundary).
+
+    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+    """
+
+    def __init__(
+        self,
+        gamma: float = 2.0,
+        label_smoothing: float = 0.0,
+        weight: torch.Tensor | None = None,
+    ):
+        super().__init__()
+        self.gamma = gamma
+        self.label_smoothing = label_smoothing
+        self.register_buffer("weight", weight)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce_loss = F.cross_entropy(
+            logits, targets, weight=self.weight,
+            label_smoothing=self.label_smoothing, reduction="none",
+        )
+        pt = torch.exp(-ce_loss)  # p_t = probability of correct class
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        return focal_loss.mean()
 
 
 class ClassifierHead(nn.Module):

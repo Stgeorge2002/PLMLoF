@@ -9,7 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -271,6 +271,10 @@ class CachedTrainer:
         classifier_hidden_dims: list[int] | None = None,
         classifier_dropout: float = 0.3,
         lora_config: dict | None = None,
+        focal_gamma: float = 2.0,
+        use_cross_attention: bool = False,
+        cross_attn_heads: int = 4,
+        cross_attn_dropout: float = 0.1,
     ):
         self.device = torch.device(device)
         self.comparison = comparison.to(self.device)
@@ -284,7 +288,25 @@ class CachedTrainer:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        self.criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+        # BatchNorm for the 12-dim engineered features (different scales)
+        from plmlof.data.features import NUM_NUCLEOTIDE_FEATURES
+        self.feature_norm = nn.BatchNorm1d(NUM_NUCLEOTIDE_FEATURES).to(self.device)
+
+        # Optional pooled cross-attention between ref/var embeddings
+        self.use_cross_attention = use_cross_attention
+        self.cross_attn = None
+        if use_cross_attention:
+            from plmlof.models.comparison import PooledCrossAttention
+            # hidden_size = dim of each pooled vector (1280 for ESM2-650M)
+            hidden_size = comparison._proj.in_features // 8  # in_features = 8*D for mean_max
+            self.cross_attn = PooledCrossAttention(
+                hidden_size=hidden_size, num_heads=cross_attn_heads,
+                dropout=cross_attn_dropout,
+            ).to(self.device)
+
+        # Focal loss for better handling of hard examples (e.g. WT confusion)
+        from plmlof.models.classifier import FocalLoss
+        self.criterion = FocalLoss(gamma=focal_gamma, label_smoothing=label_smoothing)
         self.reg_criterion = nn.SmoothL1Loss()
         self.best_metric = 0.0
         self.best_epoch = -1
@@ -303,6 +325,10 @@ class CachedTrainer:
             "has_regressor": regressor is not None,
             "regression_weight": regression_weight,
             "regression_warmup_epochs": regression_warmup_epochs,
+            "focal_gamma": focal_gamma,
+            "use_cross_attention": use_cross_attention,
+            "cross_attn_heads": cross_attn_heads,
+            "cross_attn_dropout": cross_attn_dropout,
         }
 
     def _forward(self, batch: dict) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -312,15 +338,26 @@ class CachedTrainer:
             Tuple of (logits [batch, num_classes], regression_pred [batch] or None).
         """
         # Reconstruct pooled ref/var as [mean, max] concatenation
-        ref_pool = torch.cat([batch["ref_mean"], batch["ref_max"]], dim=-1)
-        var_pool = torch.cat([batch["var_mean"], batch["var_max"]], dim=-1)
+        ref_mean, ref_max = batch["ref_mean"], batch["ref_max"]
+        var_mean, var_max = batch["var_mean"], batch["var_max"]
+
+        # Optional cross-attention between the 4 pooled vectors
+        if self.cross_attn is not None:
+            # Stack as [B, 4, D] sequence: ref_mean, ref_max, var_mean, var_max
+            tokens = torch.stack([ref_mean, ref_max, var_mean, var_max], dim=1)
+            tokens = self.cross_attn(tokens)  # [B, 4, D]
+            ref_mean, ref_max, var_mean, var_max = tokens[:, 0], tokens[:, 1], tokens[:, 2], tokens[:, 3]
+
+        ref_pool = torch.cat([ref_mean, ref_max], dim=-1)
+        var_pool = torch.cat([var_mean, var_max], dim=-1)
 
         diff_pool = ref_pool - var_pool
         prod_pool = ref_pool * var_pool
         comparison = torch.cat([diff_pool, prod_pool, ref_pool, var_pool], dim=-1)
         comparison = self.comparison._proj(comparison)
 
-        features = torch.cat([comparison, batch["nucleotide_features"]], dim=-1)
+        nuc_features = self.feature_norm(batch["nucleotide_features"])
+        features = torch.cat([comparison, nuc_features], dim=-1)
         logits = self.classifier(features)
 
         reg_pred = None
@@ -344,6 +381,9 @@ class CachedTrainer:
     def _train_epoch(self, optimizer, grad_accum_steps: int = 1) -> dict[str, float]:
         self.comparison.train()
         self.classifier.train()
+        self.feature_norm.train()
+        if self.cross_attn is not None:
+            self.cross_attn.train()
         if self.regressor is not None:
             self.regressor.train()
         total_loss = 0.0
@@ -370,6 +410,8 @@ class CachedTrainer:
                 params = (
                     list(self.comparison.parameters())
                     + list(self.classifier.parameters())
+                    + list(self.feature_norm.parameters())
+                    + (list(self.cross_attn.parameters()) if self.cross_attn else [])
                     + (list(self.regressor.parameters()) if self.regressor else [])
                 )
                 torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
@@ -406,6 +448,9 @@ class CachedTrainer:
     def _eval_epoch(self) -> dict[str, float]:
         self.comparison.eval()
         self.classifier.eval()
+        self.feature_norm.eval()
+        if self.cross_attn is not None:
+            self.cross_attn.eval()
         if self.regressor is not None:
             self.regressor.eval()
         total_loss = 0.0
@@ -456,10 +501,13 @@ class CachedTrainer:
             "epoch": epoch,
             "comparison_state_dict": self.comparison.state_dict(),
             "classifier_state_dict": self.classifier.state_dict(),
+            "feature_norm_state_dict": self.feature_norm.state_dict(),
             "model_config": self.model_config,
             "metrics": metrics,
             "cached_training": True,  # Flag indicating this needs assembly
         }
+        if self.cross_attn is not None:
+            save_dict["cross_attn_state_dict"] = self.cross_attn.state_dict()
         if self.regressor is not None:
             save_dict["regressor_state_dict"] = self.regressor.state_dict()
         torch.save(save_dict, path)
@@ -481,6 +529,10 @@ class CachedTrainer:
             if ckpt.get("cached_training"):
                 self.comparison.load_state_dict(ckpt["comparison_state_dict"])
                 self.classifier.load_state_dict(ckpt["classifier_state_dict"])
+                if "feature_norm_state_dict" in ckpt:
+                    self.feature_norm.load_state_dict(ckpt["feature_norm_state_dict"])
+                if self.cross_attn is not None and "cross_attn_state_dict" in ckpt:
+                    self.cross_attn.load_state_dict(ckpt["cross_attn_state_dict"])
                 if self.regressor is not None and "regressor_state_dict" in ckpt:
                     self.regressor.load_state_dict(ckpt["regressor_state_dict"])
                 start_epoch = ckpt.get("epoch", 0) + 1
@@ -488,11 +540,13 @@ class CachedTrainer:
                 self.best_epoch = ckpt.get("epoch", 0)
                 logger.info(f"Resumed from epoch {ckpt.get('epoch')}, best macro_f1={self.best_metric:.4f}")
 
-        params = list(self.comparison.parameters()) + list(self.classifier.parameters())
+        params = list(self.comparison.parameters()) + list(self.classifier.parameters()) + list(self.feature_norm.parameters())
+        if self.cross_attn is not None:
+            params += list(self.cross_attn.parameters())
         if self.regressor is not None:
             params += list(self.regressor.parameters())
         optimizer = AdamW(params, lr=learning_rate, weight_decay=weight_decay)
-        scheduler = CosineAnnealingLR(optimizer, T_max=max_epochs)
+        scheduler = ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3, min_lr=1e-6)
 
         epochs_without_improvement = 0
         best_val_metrics = {}
@@ -504,12 +558,14 @@ class CachedTrainer:
             logger.info(f"Epoch {epoch}/{max_epochs}")
             train_m = self._train_epoch(optimizer, grad_accum_steps)
             val_m = self._eval_epoch()
-            scheduler.step()
+            scheduler.step(val_m["macro_f1"])
 
             logger.info(f"  Train loss={train_m['loss']:.4f}, macro_f1={train_m['macro_f1']:.4f}" +
                         (f", spearman={train_m.get('spearman', 0):.4f}" if self.regressor else ""))
+            current_lr = optimizer.param_groups[0]["lr"]
             logger.info(f"  Val   loss={val_m['loss']:.4f}, macro_f1={val_m['macro_f1']:.4f}" +
-                        (f", spearman={val_m.get('spearman', 0):.4f}" if self.regressor else ""))
+                        (f", spearman={val_m.get('spearman', 0):.4f}" if self.regressor else "") +
+                        f", lr={current_lr:.2e}")
 
             if val_m["macro_f1"] > self.best_metric:
                 self.best_metric = val_m["macro_f1"]

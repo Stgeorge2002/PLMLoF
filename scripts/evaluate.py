@@ -14,6 +14,7 @@ import logging
 
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -104,9 +105,30 @@ def main():
             regressor.load_state_dict(checkpoint["regressor_state_dict"])
             logger.info("Loaded regression head for DMS score prediction")
 
+        # Load feature normalization (BatchNorm for engineered features)
+        feature_norm = nn.BatchNorm1d(NUM_NUCLEOTIDE_FEATURES)
+        if "feature_norm_state_dict" in checkpoint:
+            feature_norm.load_state_dict(checkpoint["feature_norm_state_dict"])
+            logger.info("Loaded feature normalization")
+
+        # Load cross-attention if used
+        cross_attn = None
+        if model_cfg.get("use_cross_attention") and "cross_attn_state_dict" in checkpoint:
+            from plmlof.models.comparison import PooledCrossAttention
+            ca_heads = model_cfg.get("cross_attn_heads", 4)
+            ca_dropout = model_cfg.get("cross_attn_dropout", 0.1)
+            cross_attn = PooledCrossAttention(
+                hidden_size=hidden_size, num_heads=ca_heads, dropout=ca_dropout,
+            )
+            cross_attn.load_state_dict(checkpoint["cross_attn_state_dict"])
+            logger.info("Loaded cross-attention module")
+
         device = torch.device(args.device)
         comparison = comparison.to(device).eval()
         classifier = classifier.to(device).eval()
+        feature_norm = feature_norm.to(device).eval()
+        if cross_attn is not None:
+            cross_attn = cross_attn.to(device).eval()
         if regressor is not None:
             regressor = regressor.to(device).eval()
 
@@ -175,13 +197,20 @@ def main():
                 ref_mean, ref_max = _pool(ref_out, ref_mask)
                 var_mean, var_max = _pool(var_out, var_mask)
 
+                # Optional cross-attention between pooled vectors
+                if cross_attn is not None:
+                    tokens = torch.stack([ref_mean, ref_max, var_mean, var_max], dim=1)
+                    tokens = cross_attn(tokens)
+                    ref_mean, ref_max, var_mean, var_max = tokens[:, 0], tokens[:, 1], tokens[:, 2], tokens[:, 3]
+
                 ref_pool = torch.cat([ref_mean, ref_max], dim=-1)
                 var_pool = torch.cat([var_mean, var_max], dim=-1)
                 diff_pool = ref_pool - var_pool
                 prod_pool = ref_pool * var_pool
                 comp = torch.cat([diff_pool, prod_pool, ref_pool, var_pool], dim=-1)
                 comp = comparison._proj(comp)
-                features = torch.cat([comp, nuc], dim=-1)
+                nuc_normed = feature_norm(nuc)
+                features = torch.cat([comp, nuc_normed], dim=-1)
                 logits = classifier(features)
 
                 probs = torch.softmax(logits, dim=-1).cpu().numpy()

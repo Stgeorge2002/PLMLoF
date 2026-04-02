@@ -30,6 +30,7 @@ training:
   # Multi-task regression (DMS z-score prediction)
   regression_weight: 0.1       # Weight of SmoothL1 regression loss vs CE classification loss
   regression_warmup_epochs: 3  # Linearly ramp regression weight over first N epochs
+  focal_gamma: 2.0             # Focal loss gamma (0=CE, 2=focus on hard examples)
 
   # Class weights (auto-computed if null)
   class_weights: null

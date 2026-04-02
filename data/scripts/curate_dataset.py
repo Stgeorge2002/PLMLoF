@@ -1,7 +1,7 @@
 """Curate ProteinGym DMS data into a balanced training dataset.
 
-Loads ProteinGym bacterial variants and subsamples to 50K total records
-with equal class balance (~16,666 each for LoF, WT, GoF).
+Loads ProteinGym bacterial variants and subsamples to 150K total records
+with equal class balance (50,000 each for LoF, WT, GoF).
 
 Produces stratified train/val/test splits.
 """
@@ -37,8 +37,8 @@ def load_source(path: Path, source_name: str) -> pd.DataFrame:
 
 
 # Total samples and per-class target for balanced subsampling
-TOTAL_SAMPLES = 50_000
-SAMPLES_PER_CLASS = TOTAL_SAMPLES // 3  # ~16,666 each
+TOTAL_SAMPLES = 150_000
+SAMPLES_PER_CLASS = TOTAL_SAMPLES // 3  # 50,000 each
 
 
 def merge_datasets() -> pd.DataFrame:

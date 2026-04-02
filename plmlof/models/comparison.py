@@ -7,6 +7,36 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class PooledCrossAttention(nn.Module):
+    """Lightweight cross-attention between pooled ref and var embeddings.
+
+    Takes 4 pooled vectors (ref_mean, ref_max, var_mean, var_max) as a
+    sequence of 4 "tokens" and applies multi-head self-attention to learn
+    interactions between pooling strategies and ref/var sides.
+
+    Compatible with the cached training path (no per-residue tokens needed).
+    """
+
+    def __init__(self, hidden_size: int, num_heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(
+            embed_dim=hidden_size, num_heads=num_heads,
+            dropout=dropout, batch_first=True,
+        )
+        self.norm = nn.LayerNorm(hidden_size)
+
+    def forward(self, pooled_tokens: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pooled_tokens: [B, 4, D] — ref_mean, ref_max, var_mean, var_max
+
+        Returns:
+            Attended tokens [B, 4, D] (residual connection).
+        """
+        attn_out, _ = self.attn(pooled_tokens, pooled_tokens, pooled_tokens)
+        return self.norm(pooled_tokens + attn_out)
+
+
 class ComparisonModule(nn.Module):
     """Compares reference and variant protein embeddings using multiple strategies.
 
