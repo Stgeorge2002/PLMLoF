@@ -15,7 +15,7 @@ class TestSyntheticDataset:
 
     def test_sample_keys(self, synthetic_dataset):
         sample = synthetic_dataset[0]
-        expected_keys = {"ref_protein", "var_protein", "nucleotide_features", "label", "gene", "species"}
+        expected_keys = {"ref_protein", "var_protein", "nucleotide_features", "label", "dms_score", "gene", "species"}
         assert expected_keys == set(sample.keys())
 
     def test_feature_shape(self, synthetic_dataset):

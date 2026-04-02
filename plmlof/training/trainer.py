@@ -247,7 +247,8 @@ class CachedTrainer:
     Trains only the ComparisonModule + ClassifierHead + optional RegressionHead
     on cached pooled embeddings — no ESM2 forward passes needed.
 
-    Multi-task loss: L = CE_classification + regression_weight * MSE_regression
+    Multi-task loss: L = CE_classification + α·SmoothL1_regression
+    (α warms up linearly over the first few epochs)
     """
 
     def __init__(
@@ -262,7 +263,8 @@ class CachedTrainer:
         mixed_precision: str = "no",
         # Multi-task regression
         regressor: nn.Module | None = None,
-        regression_weight: float = 0.5,
+        regression_weight: float = 0.1,
+        regression_warmup_epochs: int = 3,
         # Model config for saving a reconstructable checkpoint
         esm2_model_name: str = "facebook/esm2_t33_650M_UR50D",
         pool_strategy: str = "mean_max",
@@ -275,13 +277,15 @@ class CachedTrainer:
         self.classifier = classifier.to(self.device)
         self.regressor = regressor.to(self.device) if regressor is not None else None
         self.regression_weight = regression_weight
+        self.regression_warmup_epochs = regression_warmup_epochs
+        self._current_epoch = 1
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-        self.reg_criterion = nn.MSELoss()
+        self.reg_criterion = nn.SmoothL1Loss()
         self.best_metric = 0.0
         self.best_epoch = -1
 
@@ -298,6 +302,7 @@ class CachedTrainer:
             "lora_config": lora_config,
             "has_regressor": regressor is not None,
             "regression_weight": regression_weight,
+            "regression_warmup_epochs": regression_warmup_epochs,
         }
 
     def _forward(self, batch: dict) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -324,24 +329,15 @@ class CachedTrainer:
 
         return logits, reg_pred
 
-    def _collate(self, batch: list[dict]) -> dict:
-        return {
-            "ref_mean": torch.stack([b["ref_mean"] for b in batch]).to(self.device),
-            "ref_max": torch.stack([b["ref_max"] for b in batch]).to(self.device),
-            "var_mean": torch.stack([b["var_mean"] for b in batch]).to(self.device),
-            "var_max": torch.stack([b["var_max"] for b in batch]).to(self.device),
-            "nucleotide_features": torch.stack([b["nucleotide_features"] for b in batch]).to(self.device),
-            "labels": torch.tensor([b["label"] for b in batch], dtype=torch.long, device=self.device),
-            "dms_scores": torch.stack([b["dms_scores"] for b in batch]).to(self.device) if "dms_scores" in batch[0] else torch.zeros(len(batch), device=self.device),
-        }
-
     def _compute_loss(self, logits, reg_pred, batch):
         """Compute combined classification + regression loss."""
         cls_loss = self.criterion(logits, batch["labels"])
         if reg_pred is not None and self.regressor is not None:
             dms_targets = batch["dms_scores"]
             reg_loss = self.reg_criterion(reg_pred, dms_targets)
-            total_loss = cls_loss + self.regression_weight * reg_loss
+            warmup_scale = min(1.0, self._current_epoch / max(self.regression_warmup_epochs, 1))
+            effective_weight = self.regression_weight * warmup_scale
+            total_loss = cls_loss + effective_weight * reg_loss
             return total_loss, cls_loss.item(), reg_loss.item()
         return cls_loss, cls_loss.item(), 0.0
 
@@ -370,6 +366,13 @@ class CachedTrainer:
             self.scaler.scale(loss).backward()
 
             if (step + 1) % grad_accum_steps == 0:
+                self.scaler.unscale_(optimizer)
+                params = (
+                    list(self.comparison.parameters())
+                    + list(self.classifier.parameters())
+                    + (list(self.regressor.parameters()) if self.regressor else [])
+                )
+                torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
                 self.scaler.step(optimizer)
                 self.scaler.update()
                 optimizer.zero_grad()
@@ -391,8 +394,12 @@ class CachedTrainer:
         metrics["reg_loss"] = total_reg_loss / n_batches
         if all_reg_preds:
             from scipy.stats import spearmanr
-            rho, _ = spearmanr(all_dms_targets, all_reg_preds)
-            metrics["spearman"] = float(rho) if not np.isnan(rho) else 0.0
+            arr_t, arr_p = np.array(all_dms_targets), np.array(all_reg_preds)
+            if arr_t.std() > 0 and arr_p.std() > 0:
+                rho, _ = spearmanr(arr_t, arr_p)
+                metrics["spearman"] = float(rho) if not np.isnan(rho) else 0.0
+            else:
+                metrics["spearman"] = 0.0
         return metrics
 
     @torch.no_grad()
@@ -429,9 +436,13 @@ class CachedTrainer:
         metrics["reg_loss"] = total_reg_loss / n_batches
         if all_reg_preds:
             from scipy.stats import spearmanr
-            rho, _ = spearmanr(all_dms_targets, all_reg_preds)
-            metrics["spearman"] = float(rho) if not np.isnan(rho) else 0.0
-            metrics["mae"] = float(np.mean(np.abs(np.array(all_dms_targets) - np.array(all_reg_preds))))
+            arr_t, arr_p = np.array(all_dms_targets), np.array(all_reg_preds)
+            if arr_t.std() > 0 and arr_p.std() > 0:
+                rho, _ = spearmanr(arr_t, arr_p)
+                metrics["spearman"] = float(rho) if not np.isnan(rho) else 0.0
+            else:
+                metrics["spearman"] = 0.0
+            metrics["mae"] = float(np.mean(np.abs(arr_t - arr_p)))
         return metrics
 
     def _save_checkpoint(self, epoch: int, metrics: dict) -> None:
@@ -489,6 +500,7 @@ class CachedTrainer:
         logger.info(f"Starting cached training (lr={learning_rate}, epochs={start_epoch}-{max_epochs})")
 
         for epoch in range(start_epoch, max_epochs + 1):
+            self._current_epoch = epoch
             logger.info(f"Epoch {epoch}/{max_epochs}")
             train_m = self._train_epoch(optimizer, grad_accum_steps)
             val_m = self._eval_epoch()

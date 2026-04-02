@@ -172,7 +172,7 @@ def main():
         )
 
         # Multi-task regression head for DMS z-score prediction
-        regression_weight = train_cfg.get("regression_weight", 0.5)
+        regression_weight = train_cfg.get("regression_weight", 0.1)
         regressor = RegressionHead(input_size=classifier_input)
         logger.info(f"Multi-task: classification + regression (weight={regression_weight})")
 
@@ -187,6 +187,7 @@ def main():
             mixed_precision=mixed_precision,
             regressor=regressor,
             regression_weight=regression_weight,
+            regression_warmup_epochs=train_cfg.get("regression_warmup_epochs", 3),
             esm2_model_name=esm2_name,
             pool_strategy=pool_strategy,
             classifier_hidden_dims=classifier_hidden_dims,

@@ -252,8 +252,10 @@ def main():
     # Regression metrics
     if reg_preds is not None and len(reg_preds) > 0:
         from scipy.stats import spearmanr, pearsonr
-        rho, rho_p = spearmanr(dms_targets, reg_preds)
-        r, r_p = pearsonr(dms_targets, reg_preds)
+        rho, rho_p, r, r_p = 0.0, 1.0, 0.0, 1.0
+        if dms_targets.std() > 0 and reg_preds.std() > 0:
+            rho, rho_p = spearmanr(dms_targets, reg_preds)
+            r, r_p = pearsonr(dms_targets, reg_preds)
         mae = float(np.mean(np.abs(dms_targets - reg_preds)))
         mse = float(np.mean((dms_targets - reg_preds) ** 2))
         print("=" * 60)

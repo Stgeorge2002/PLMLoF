@@ -40,13 +40,17 @@ Outputs: `data/processed/train.parquet`, `val.parquet`, `test.parquet` (~50K bal
 
 This runs ESM2-650M over all data once and saves pooled embeddings to disk. Training then becomes MLP-only — minutes instead of hours.
 
+> **Takes ~40 min on A40.** Use `nohup` so it survives SSH disconnections. Reconnect and run `tail -f precompute.log` to check progress.
+
 ```bash
-python scripts/precompute_embeddings.py \
+nohup python scripts/precompute_embeddings.py \
   --train-data data/processed/train.parquet \
   --val-data data/processed/val.parquet \
   --output-dir data/embeddings/ \
   --batch-size 128 \
-  --device cuda
+  --device cuda > precompute.log 2>&1 &
+
+tail -f precompute.log
 ```
 
 Outputs: `data/embeddings/train_embeddings.pt` and `val_embeddings.pt`.

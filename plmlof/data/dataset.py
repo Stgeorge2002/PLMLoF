@@ -111,6 +111,7 @@ class SyntheticPLMLoFDataset(Dataset):
                 "var_protein": var,
                 "nucleotide_features": torch.randn(12, generator=rng),
                 "label": label,
+                "dms_score": 0.0,
                 "gene": f"test_gene_{i}",
                 "species": "test_species",
             })
