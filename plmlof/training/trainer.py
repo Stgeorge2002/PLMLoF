@@ -393,6 +393,19 @@ class CachedTrainer:
         patience: int = 5,
         grad_accum_steps: int = 1,
     ) -> dict[str, float]:
+        # Resume from checkpoint if it exists
+        ckpt_path = self.output_dir / "checkpoints" / "model_best.pt"
+        start_epoch = 1
+        if ckpt_path.exists():
+            ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=True)
+            if ckpt.get("cached_training"):
+                self.comparison.load_state_dict(ckpt["comparison_state_dict"])
+                self.classifier.load_state_dict(ckpt["classifier_state_dict"])
+                start_epoch = ckpt.get("epoch", 0) + 1
+                self.best_metric = ckpt.get("metrics", {}).get("macro_f1", 0.0)
+                self.best_epoch = ckpt.get("epoch", 0)
+                logger.info(f"Resumed from epoch {ckpt.get('epoch')}, best macro_f1={self.best_metric:.4f}")
+
         params = list(self.comparison.parameters()) + list(self.classifier.parameters())
         optimizer = AdamW(params, lr=learning_rate, weight_decay=weight_decay)
         scheduler = CosineAnnealingLR(optimizer, T_max=max_epochs)
@@ -400,9 +413,9 @@ class CachedTrainer:
         epochs_without_improvement = 0
         best_val_metrics = {}
 
-        logger.info(f"Starting cached training (lr={learning_rate}, epochs={max_epochs})")
+        logger.info(f"Starting cached training (lr={learning_rate}, epochs={start_epoch}-{max_epochs})")
 
-        for epoch in range(1, max_epochs + 1):
+        for epoch in range(start_epoch, max_epochs + 1):
             logger.info(f"Epoch {epoch}/{max_epochs}")
             train_m = self._train_epoch(optimizer, grad_accum_steps)
             val_m = self._eval_epoch()
