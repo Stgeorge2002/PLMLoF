@@ -31,14 +31,20 @@ logger = logging.getLogger(__name__)
 DEG_PROTEIN_URLS = [
     "http://tubic.org/deg/public/download/DEG10.aa.gz",
     "https://tubic.org/deg/public/download/DEG10.aa.gz",
+    "http://tubic.tju.edu.cn/deg/public/download/DEG10.aa.gz",
+    "https://tubic.tju.edu.cn/deg/public/download/DEG10.aa.gz",
 ]
 DEG_NUCLEOTIDE_URLS = [
     "http://tubic.org/deg/public/download/DEG10.nt.gz",
     "https://tubic.org/deg/public/download/DEG10.nt.gz",
+    "http://tubic.tju.edu.cn/deg/public/download/DEG10.nt.gz",
+    "https://tubic.tju.edu.cn/deg/public/download/DEG10.nt.gz",
 ]
 DEG_ANNOTATION_URLS = [
     "http://tubic.org/deg/public/download/deg_annotation_p.csv.zip",
     "https://tubic.org/deg/public/download/deg_annotation_p.csv.zip",
+    "http://tubic.tju.edu.cn/deg/public/download/deg_annotation_p.csv.zip",
+    "https://tubic.tju.edu.cn/deg/public/download/deg_annotation_p.csv.zip",
 ]
 
 OUTPUT_DIR = Path("data/raw/deg/")
@@ -191,8 +197,10 @@ def parse_deg_sequences(protein_path: Path, dna_path: Path, annotation_path: Pat
     proteins = {}
     if protein_path.exists() and protein_path.stat().st_size > 100:
         try:
-            for record in SeqIO.parse(str(protein_path), "fasta"):
-                proteins[record.id] = str(record.seq)
+            # Open with errors='replace' to handle non-UTF-8 bytes from DEG
+            with open(protein_path, "r", encoding="utf-8", errors="replace") as fh:
+                for record in SeqIO.parse(fh, "fasta"):
+                    proteins[record.id] = str(record.seq)
         except Exception as e:
             logger.warning(f"Error parsing DEG proteins: {e}")
 
@@ -200,8 +208,9 @@ def parse_deg_sequences(protein_path: Path, dna_path: Path, annotation_path: Pat
     dna_seqs = {}
     if dna_path.exists() and dna_path.stat().st_size > 100:
         try:
-            for record in SeqIO.parse(str(dna_path), "fasta"):
-                dna_seqs[record.id] = str(record.seq).upper()
+            with open(dna_path, "r", encoding="utf-8", errors="replace") as fh:
+                for record in SeqIO.parse(fh, "fasta"):
+                    dna_seqs[record.id] = str(record.seq).upper()
         except Exception as e:
             logger.warning(f"Error parsing DEG DNA: {e}")
 
