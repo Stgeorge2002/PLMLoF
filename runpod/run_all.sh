@@ -155,12 +155,19 @@ if [[ "$MODE" == "full" || "$MODE" == "train" || "$MODE" == "test" ]]; then
         echo "Test training already done in step 2."
     else
         echo "Training with cached embeddings (CE loss, cross-attn, LayerNorm)..."
+        # Use bf16 on A100/H100 (larger dynamic range, no overflow spikes)
+        # Use fp16 on older GPUs (V100, A40, T4)
+        PRECISION="fp16"
+        if python -c "import torch; cap = torch.cuda.get_device_capability(); exit(0 if cap >= (8,0) else 1)" 2>/dev/null; then
+            PRECISION="bf16"
+            echo "  A100/H100 detected — using bf16"
+        fi
         python scripts/train.py \
             --config "$TRAIN_CFG" \
             --model-config "$MODEL_CFG" \
             --precomputed "$EMB_DIR" \
             --device "$DEVICE" \
-            --mixed-precision fp16 \
+            --mixed-precision "$PRECISION" \
             --output-dir "$OUTPUT_DIR"
     fi
     echo ""
