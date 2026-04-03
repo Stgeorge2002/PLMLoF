@@ -22,6 +22,7 @@ ESM2-based classifier for bacterial gene variants: **Loss-of-Function (LoF)**, *
 cd /workspace
 git clone https://github.com/Stgeorge2002/PLMLoF.git
 cd PLMLoF
+bash runpod/run_all.sh
 bash runpod/setup.sh
 ```
 

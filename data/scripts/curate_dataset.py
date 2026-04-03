@@ -37,8 +37,8 @@ def load_source(path: Path, source_name: str) -> pd.DataFrame:
 
 
 # Total samples and per-class target for balanced subsampling
-TOTAL_SAMPLES = 150_000
-SAMPLES_PER_CLASS = TOTAL_SAMPLES // 3  # 50,000 each
+TOTAL_SAMPLES = 300_000
+SAMPLES_PER_CLASS = TOTAL_SAMPLES // 3  # 100,000 each
 
 
 def merge_datasets() -> pd.DataFrame:
