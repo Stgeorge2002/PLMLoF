@@ -27,8 +27,6 @@ class AttributionResult:
 def compute_rule_based_attribution(
     ref_protein: str,
     var_protein: str,
-    ref_dna: str = "",
-    var_dna: str = "",
 ) -> list[dict]:
     """Compute rule-based attribution by identifying mutation positions.
 
@@ -63,18 +61,6 @@ def compute_rule_based_attribution(
             "impact": impact,
         })
 
-    # Check frameshift from DNA if available
-    if ref_dna and var_dna:
-        len_diff = abs(len(var_dna) - len(ref_dna))
-        if len_diff % 3 != 0 and len_diff > 0:
-            annotated.append({
-                "position": 0,
-                "ref_aa": "-",
-                "var_aa": "-",
-                "type": "frameshift",
-                "impact": "high",
-            })
-
     return annotated
 
 
@@ -84,8 +70,6 @@ def generate_attribution(
     confidence: float,
     ref_protein: str,
     var_protein: str,
-    ref_dna: str = "",
-    var_dna: str = "",
     gradient_scores: torch.Tensor | None = None,
 ) -> AttributionResult:
     """Generate a complete attribution result combining gradient and rule-based evidence.
@@ -96,15 +80,13 @@ def generate_attribution(
         confidence: Prediction confidence.
         ref_protein: Reference protein sequence.
         var_protein: Variant protein sequence.
-        ref_dna: Reference DNA sequence (optional).
-        var_dna: Variant DNA sequence (optional).
         gradient_scores: Per-position gradient attribution scores (optional).
 
     Returns:
         AttributionResult with explanation.
     """
     # Rule-based mutation detection
-    mutations = compute_rule_based_attribution(ref_protein, var_protein, ref_dna, var_dna)
+    mutations = compute_rule_based_attribution(ref_protein, var_protein)
 
     # Position scores: use gradient if available, otherwise uniform
     max_len = max(len(ref_protein), len(var_protein), 1)

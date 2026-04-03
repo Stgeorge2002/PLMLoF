@@ -162,9 +162,7 @@ class PLMLoFPredictor:
 
             # Nucleotide features
             nuc_features = torch.stack([
-                extract_nucleotide_features(
-                    r.ref_dna, r.var_dna, r.ref_protein, r.var_protein
-                )
+                extract_nucleotide_features(r.ref_protein, r.var_protein)
                 for r in batch_records
             ])
 
@@ -204,8 +202,6 @@ class PLMLoFPredictor:
                         confidence=confidence,
                         ref_protein=record.ref_protein,
                         var_protein=record.var_protein,
-                        ref_dna=record.ref_dna,
-                        var_dna=record.var_dna,
                     )
                     result["attribution"] = {
                         "summary": attr.summary,

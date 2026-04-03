@@ -58,14 +58,11 @@ configs/
 
 ### 1. Download & prepare data
 ```bash
-# Download all datasets (CARD, DEG, ProteinGym) + generate synthetic
+# Download and curate ProteinGym data
 bash runpod/run_all.sh --data-only
 
-# Or run individual download scripts
-python data/scripts/download_card.py
-python data/scripts/download_deg.py
+# Or run individual scripts
 python data/scripts/download_proteingym.py
-python data/scripts/generate_synthetic.py
 python data/scripts/curate_dataset.py
 ```
 

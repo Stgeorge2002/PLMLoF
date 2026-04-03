@@ -33,11 +33,6 @@ def translate_dna(dna_seq: str, to_stop: bool = False) -> str:
     return protein
 
 
-def reverse_complement(dna_seq: str) -> str:
-    """Return the reverse complement of a DNA sequence."""
-    return str(Seq(dna_seq.upper()).reverse_complement())
-
-
 def find_mutations(ref_protein: str, var_protein: str) -> list[dict]:
     """Compare two aligned protein sequences and return a list of mutations.
 
@@ -93,19 +88,6 @@ def has_premature_stop(ref_protein: str, var_protein: str) -> bool:
     if ref_stop == -1:
         return True
     return var_stop < ref_stop
-
-
-def is_frameshift(ref_dna: str, var_dna: str) -> bool:
-    """Heuristic: detect if variant DNA length differs from reference by a non-multiple-of-3."""
-    length_diff = abs(len(var_dna) - len(ref_dna))
-    return length_diff % 3 != 0 and length_diff > 0
-
-
-def start_codon_lost(ref_dna: str, var_dna: str) -> bool:
-    """Check if the start codon (ATG) is disrupted in the variant."""
-    ref_start = ref_dna[:3].upper()
-    var_start = var_dna[:3].upper()
-    return ref_start in ("ATG", "GTG", "TTG") and var_start not in ("ATG", "GTG", "TTG")
 
 
 def compute_truncation_fraction(ref_protein: str, var_protein: str) -> float:

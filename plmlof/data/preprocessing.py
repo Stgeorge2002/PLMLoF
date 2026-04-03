@@ -70,35 +70,3 @@ def apply_deletion(ref_dna: str, start: int, length: int) -> str:
     end = min(start + length, len(ref_dna))
     return ref_dna[:start] + ref_dna[end:]
 
-
-def introduce_premature_stop(dna_seq: str, codon_position: int) -> str:
-    """Replace a codon with a stop codon (TAA) at the given codon position.
-
-    Args:
-        dna_seq: DNA sequence.
-        codon_position: 0-based codon index (not nucleotide position).
-
-    Returns:
-        DNA with premature stop codon.
-    """
-    nuc_pos = codon_position * 3
-    if nuc_pos + 3 > len(dna_seq):
-        raise ValueError(f"Codon position {codon_position} out of range")
-    return dna_seq[:nuc_pos] + "TAA" + dna_seq[nuc_pos + 3 :]
-
-
-def introduce_frameshift(dna_seq: str, position: int, insert: bool = True) -> str:
-    """Introduce a frameshift mutation by inserting or deleting 1 base.
-
-    Args:
-        dna_seq: DNA sequence.
-        position: 0-based nucleotide position.
-        insert: If True, insert a base; if False, delete a base.
-
-    Returns:
-        DNA with frameshift.
-    """
-    if insert:
-        return apply_insertion(dna_seq, position, "A")
-    else:
-        return apply_deletion(dna_seq, position, 1)

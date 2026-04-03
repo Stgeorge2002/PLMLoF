@@ -58,9 +58,6 @@ print('  Models cached successfully.')
 "
 echo ""
 
-# ── 4. Generate synthetic data (no network needed) ──
-echo "Generating synthetic training data..."
-python data/scripts/generate_synthetic.py
 echo ""
 
 # ── 5. GPU smoke test ──

@@ -15,6 +15,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
+# ── Logging setup ──
+LOG_DIR="$PROJECT_DIR/outputs/logs"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/pipeline_$(date +%Y%m%d_%H%M%S).log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "Logging to: $LOG_FILE"
+
 # ── Parse arguments ──
 MODE="full"
 SKIP_SETUP=false
@@ -83,8 +90,7 @@ if [[ "$MODE" == "full" || "$MODE" == "data" || "$MODE" == "test" ]]; then
     echo "──────── Step 1: Data Preparation ────────"
 
     if [[ "$MODE" == "test" ]]; then
-        echo "Generating synthetic data (test mode)..."
-        python data/scripts/generate_synthetic.py
+        echo "Test mode: synthetic data generated inline by train.py --tiny"
     else
         echo "Downloading ProteinGym data..."
         python data/scripts/download_proteingym.py || echo "  ProteinGym download failed, continuing..."
@@ -196,6 +202,7 @@ fi
 echo "=============================================="
 echo " Pipeline complete!"
 echo ""
+echo " Log:          $LOG_FILE"
 echo " Checkpoint:   $CHECKPOINT"
 echo " Predict:      python scripts/predict.py --model $CHECKPOINT --reference <ref.fasta> --variants <var.fasta> --device $DEVICE"
 echo "==============================================" 

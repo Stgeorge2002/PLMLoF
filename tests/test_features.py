@@ -8,11 +8,8 @@ import pytest
 from plmlof.data.features import extract_nucleotide_features, NUM_NUCLEOTIDE_FEATURES
 from plmlof.utils.sequence_utils import (
     translate_dna,
-    reverse_complement,
     find_mutations,
     has_premature_stop,
-    is_frameshift,
-    start_codon_lost,
     compute_truncation_fraction,
 )
 
@@ -43,14 +40,6 @@ class TestTranslateDna:
         # Extra bases beyond a codon boundary are ignored
         result = translate_dna("ATGA")  # Only ATG translates
         assert result == "M"
-
-
-class TestReverseComplement:
-    def test_basic(self):
-        assert reverse_complement("ATGC") == "GCAT"
-
-    def test_palindrome(self):
-        assert reverse_complement("ATAT") == "ATAT"
 
 
 class TestFindMutations:
@@ -93,30 +82,6 @@ class TestHasPrematureStop:
         assert has_premature_stop("MK*LV", "MK*LV") is False
 
 
-class TestIsFrameshift:
-    def test_frameshift(self):
-        ref = "ATGAAATTTGGG"  # 12 nt
-        var = "ATGAAATTTGG"  # 11 nt (1-base del)
-        assert is_frameshift(ref, var) is True
-
-    def test_no_frameshift(self):
-        ref = "ATGAAATTTGGG"  # 12 nt
-        var = "ATGAAATTT"  # 9 nt (3-base del)
-        assert is_frameshift(ref, var) is False
-
-    def test_identical(self):
-        ref = "ATGAAATTT"
-        assert is_frameshift(ref, ref) is False
-
-
-class TestStartCodonLost:
-    def test_lost(self):
-        assert start_codon_lost("ATGAAATTT", "AAGAAATTT") is True
-
-    def test_intact(self):
-        assert start_codon_lost("ATGAAATTT", "ATGAAAGGG") is False
-
-
 class TestComputeTruncationFraction:
     def test_half_truncated(self):
         frac = compute_truncation_fraction("MKTLVVVV", "MKTL")
@@ -137,39 +102,39 @@ class TestComputeTruncationFraction:
 
 class TestExtractNucleotideFeatures:
     def test_shape(self):
-        feat = extract_nucleotide_features("ATGAAATTT", "ATGAAATTT")
+        feat = extract_nucleotide_features("MKTL", "MKTL")
         assert isinstance(feat, torch.Tensor)
         assert feat.shape == (NUM_NUCLEOTIDE_FEATURES,)
 
     def test_identical_sequences(self):
-        feat = extract_nucleotide_features("ATGAAATTT", "ATGAAATTT")
-        # No frameshift, no premature stop, nothing
-        assert feat[0].item() == 0.0  # is_frameshift
+        feat = extract_nucleotide_features("MKTL", "MKTL")
+        # No length change, no premature stop, no start codon lost
+        assert feat[0].item() == 0.0  # is_length_change
         assert feat[1].item() == 0.0  # has_premature_stop
-        assert feat[2].item() == 0.0  # start_codon_lost
-
-    def test_frameshift_detected(self):
-        ref = "ATGAAATTTGGG"
-        var = "ATGAAATTTGG"  # 1-base deletion → frameshift
-        feat = extract_nucleotide_features(ref, var)
-        assert feat[0].item() == 1.0  # is_frameshift
+        assert feat[2].item() == 0.0  # met_start_lost
 
     def test_premature_stop_detected(self):
-        ref = "ATGAAATTTGGG"  # M K F G
-        var = "ATGTAATTTGGG"  # M * F G
-        feat = extract_nucleotide_features(ref, var)
+        feat = extract_nucleotide_features("MKTL", "MK*L")
         assert feat[1].item() == 1.0  # has_premature_stop
 
-    def test_protein_only_fallback(self):
-        # When DNA is empty, should still work from protein-level features
-        feat = extract_nucleotide_features("", "", "MKTL", "MK*L")
-        assert feat.shape == (NUM_NUCLEOTIDE_FEATURES,)
-        # Should detect premature stop from protein
-        assert feat[1].item() == 1.0
+    def test_truncation_detected(self):
+        feat = extract_nucleotide_features("MKTLVVVV", "MKTL")
+        assert feat[6].item() > 0.0  # truncation_fraction
+
+    def test_length_change_detected(self):
+        feat = extract_nucleotide_features("MKTL", "MK")
+        assert feat[0].item() == 1.0  # is_length_change
+
+    def test_met_start_lost(self):
+        feat = extract_nucleotide_features("MKTL", "RKTL")
+        assert feat[2].item() == 1.0  # met_start_lost
 
     def test_length_ratio(self):
-        ref = "ATGAAATTT"  # 9 nt
-        var = "ATGAAATTTGGG"  # 12 nt
-        feat = extract_nucleotide_features(ref, var)
-        # length_ratio = len(var_prot) / len(ref_prot)
-        assert feat[11].item() > 0.0  # length_ratio should be positive
+        feat = extract_nucleotide_features("MKTL", "MKTLVVVV")
+        # length_ratio = len(var_prot) / len(ref_prot) = 8/4 = 2.0
+        assert feat[11].item() == pytest.approx(2.0)
+
+    def test_missense_count(self):
+        feat = extract_nucleotide_features("MKTL", "MRTL")
+        # 1 missense / 4 residues = 0.25
+        assert feat[3].item() == pytest.approx(0.25)

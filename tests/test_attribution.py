@@ -30,14 +30,6 @@ class TestRuleBasedAttribution:
         assert len(missense) == 1
         assert missense[0]["impact"] == "moderate"
 
-    def test_frameshift_from_dna(self):
-        ref_dna = "ATGAAATTTGGG"  # 12 nt
-        var_dna = "ATGAAATTTGG"   # 11 nt
-        result = compute_rule_based_attribution("MKTL", "MKTL", ref_dna, var_dna)
-        frameshift = [r for r in result if r["type"] == "frameshift"]
-        assert len(frameshift) == 1
-        assert frameshift[0]["impact"] == "high"
-
     def test_truncation(self):
         result = compute_rule_based_attribution("MKTLVV", "MKT")
         trunc = [r for r in result if r["type"] == "truncation"]

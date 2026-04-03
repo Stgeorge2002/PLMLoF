@@ -5,9 +5,10 @@ time from hours to minutes. Each sample's ref and var protein are
 encoded once and saved to disk as tensors.
 
 Optimisations:
-  - Ref + var concatenated into a single ESM2 forward pass per batch
-  - Samples sorted by sequence length to minimise padding waste
+  - Sequence-level deduplication: each unique protein is embedded once
+  - Length-sorted batching on unique sequences minimises padding waste
   - fp16 autocast, pinned memory, prefetched DataLoader
+  - Optional torch.compile for ESM2 forward pass
 
 Usage:
     python scripts/precompute_embeddings.py \
@@ -15,7 +16,7 @@ Usage:
         --val-data data/processed/val.parquet \
         --output-dir data/embeddings/ \
         --device cuda \
-        --batch-size 128
+        --batch-size 256
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ import logging
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader, Sampler
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModel
 
@@ -35,27 +36,20 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Length-sorted sampler — groups similar-length sequences so padding is minimal
+# Lightweight dataset over unique sequences (for DataLoader compatibility)
 # ---------------------------------------------------------------------------
-class LengthSortedSampler(Sampler):
-    """Yields indices sorted by max(ref_len, var_len) so batches have
-    minimal padding.  No randomness needed for embedding extraction."""
+class _UniqueSeqDataset(Dataset):
+    """Thin wrapper: stores unique sequences sorted by length for batching."""
 
-    def __init__(self, dataset: PLMLoFDataset):
-        super().__init__()
-        lengths = []
-        for i in range(len(dataset)):
-            row = dataset.df.iloc[i]
-            ref_len = len(str(row.get("ref_protein", "")))
-            var_len = len(str(row.get("var_protein", "")))
-            lengths.append(max(ref_len, var_len))
-        self.sorted_indices = sorted(range(len(dataset)), key=lambda i: lengths[i])
-
-    def __iter__(self):
-        return iter(self.sorted_indices)
+    def __init__(self, sequences: list[str]):
+        # Sort by length so consecutive batches have similar-length seqs
+        self.sequences = sorted(sequences, key=len)
 
     def __len__(self):
-        return len(self.sorted_indices)
+        return len(self.sequences)
+
+    def __getitem__(self, idx: int) -> str:
+        return self.sequences[idx]
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,34 +58,77 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-data", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default="data/embeddings/")
     parser.add_argument("--esm2-model", type=str, default="facebook/esm2_t33_650M_UR50D")
-    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--max-seq-length", type=int, default=1024)
+    parser.add_argument("--compile", action="store_true",
+                        help="Use torch.compile on ESM2 (requires PyTorch 2.0+, ~30%% faster)")
     return parser.parse_args()
 
 
-def _collate_for_embedding(batch: list[dict], tokenizer, max_length: int) -> dict:
-    """Collate ref + var into a single tokenised batch for one ESM2 pass."""
-    ref_seqs = [s["ref_protein"] for s in batch]
-    var_seqs = [s["var_protein"] for s in batch]
-
-    # Tokenise ref and var together — one ESM2 forward instead of two
-    all_seqs = ref_seqs + var_seqs
-    enc = tokenizer(all_seqs, padding=True, truncation=True,
+def _collate_strings(batch: list[str], tokenizer, max_length: int) -> dict:
+    """Tokenize a batch of raw protein strings."""
+    enc = tokenizer(batch, padding=True, truncation=True,
                     max_length=max_length, return_tensors="pt")
+    return {"input_ids": enc["input_ids"], "attention_mask": enc["attention_mask"],
+            "sequences": batch}
 
-    nuc_features = torch.stack([s["nucleotide_features"] for s in batch])
-    labels = torch.tensor([s["label"] for s in batch], dtype=torch.long)
-    dms_scores = torch.tensor([s.get("dms_score", 0.0) for s in batch], dtype=torch.float32)
 
-    return {
-        "input_ids": enc["input_ids"],
-        "attention_mask": enc["attention_mask"],
-        "n_ref": len(ref_seqs),          # first n_ref rows are ref, rest are var
-        "nucleotide_features": nuc_features,
-        "labels": labels,
-        "dms_scores": dms_scores,
-    }
+def _pool(emb: torch.Tensor, mask: torch.Tensor):
+    """Mean + max pool, matching ComparisonModule._pool."""
+    m_f = mask.unsqueeze(-1).float()
+    mean_p = (emb * m_f).sum(1) / m_f.sum(1).clamp(min=1)
+    emb_masked = emb.masked_fill(~mask.unsqueeze(-1).bool(), float("-inf"))
+    max_p = emb_masked.max(dim=1).values
+    max_p = max_p.masked_fill(max_p == float("-inf"), 0.0)
+    return mean_p.float(), max_p.float()
+
+
+@torch.no_grad()
+def _embed_unique_sequences(
+    sequences: list[str],
+    model: AutoModel,
+    tokenizer: AutoTokenizer,
+    device: torch.device,
+    batch_size: int,
+    max_seq_length: int,
+    desc: str = "Embedding",
+) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    """Embed a list of unique sequences and return a lookup dict.
+
+    Returns:
+        Dict mapping sequence → (mean_pooled [D], max_pooled [D]) on CPU.
+    """
+    ds = _UniqueSeqDataset(sequences)
+    loader = DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=lambda b: _collate_strings(b, tokenizer, max_seq_length),
+        num_workers=4,
+        pin_memory=True,
+        prefetch_factor=2,
+    )
+
+    lookup: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    model.eval()
+
+    for batch in tqdm(loader, desc=desc):
+        ids = batch["input_ids"].to(device, non_blocking=True)
+        mask = batch["attention_mask"].to(device, non_blocking=True)
+        seqs = batch["sequences"]
+
+        with torch.amp.autocast("cuda", dtype=torch.float16, enabled=device.type == "cuda"):
+            out = model(ids, attention_mask=mask).last_hidden_state
+
+        mean_p, max_p = _pool(out, mask)
+        mean_cpu = mean_p.cpu()
+        max_cpu = max_p.cpu()
+
+        for j, seq in enumerate(seqs):
+            lookup[seq] = (mean_cpu[j], max_cpu[j])
+
+    return lookup
 
 
 @torch.no_grad()
@@ -101,81 +138,69 @@ def precompute_split(
     tokenizer: AutoTokenizer,
     output_path: Path,
     device: torch.device,
-    batch_size: int = 128,
+    batch_size: int = 256,
     max_seq_length: int = 1024,
 ) -> None:
-    """Pre-compute and save pooled embeddings for a dataset split."""
-    sampler = LengthSortedSampler(dataset)
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        sampler=sampler,
-        collate_fn=lambda b: _collate_for_embedding(b, tokenizer, max_seq_length),
-        num_workers=4,
-        pin_memory=True,
-        prefetch_factor=2,
+    """Pre-compute and save pooled embeddings for a dataset split.
+
+    Deduplicates all protein sequences (ref ∪ var), embeds each unique
+    sequence exactly once, then scatters results back per sample.
+    """
+    n_samples = len(dataset)
+
+    # Collect all ref/var protein strings and deduplicate
+    ref_seqs = [dataset[i]["ref_protein"] for i in range(n_samples)]
+    var_seqs = [dataset[i]["var_protein"] for i in range(n_samples)]
+    unique_seqs = list(set(ref_seqs) | set(var_seqs))
+
+    logger.info(
+        f"  {n_samples} samples → {n_samples * 2} total sequences, "
+        f"{len(unique_seqs)} unique ({(1 - len(unique_seqs) / (n_samples * 2)) * 100:.0f}% dedup)"
     )
 
-    all_ref_mean = []
-    all_ref_max = []
-    all_var_mean = []
-    all_var_max = []
-    all_nuc = []
-    all_labels = []
-    all_dms = []
+    # Embed unique sequences
+    lookup = _embed_unique_sequences(
+        unique_seqs, model, tokenizer, device, batch_size, max_seq_length,
+        desc=f"Encoding {output_path.stem}",
+    )
 
-    model.eval()
-    for batch in tqdm(loader, desc=f"Encoding {output_path.stem}"):
-        ids = batch["input_ids"].to(device, non_blocking=True)
-        mask = batch["attention_mask"].to(device, non_blocking=True)
-        n_ref = batch["n_ref"]
+    # Scatter back to per-sample tensors
+    hidden = next(iter(lookup.values()))[0].shape[0]
+    all_ref_mean = torch.empty(n_samples, hidden)
+    all_ref_max = torch.empty(n_samples, hidden)
+    all_var_mean = torch.empty(n_samples, hidden)
+    all_var_max = torch.empty(n_samples, hidden)
+    all_nuc = torch.empty(n_samples, dataset[0]["nucleotide_features"].shape[0])
+    all_labels = torch.empty(n_samples, dtype=torch.long)
+    all_dms = torch.empty(n_samples)
 
-        # Single ESM2 forward for ref + var combined
-        with torch.amp.autocast("cuda", dtype=torch.float16, enabled=device.type == "cuda"):
-            out = model(ids, attention_mask=mask).last_hidden_state
+    for i in range(n_samples):
+        sample = dataset[i]
+        ref_m, ref_x = lookup[sample["ref_protein"]]
+        var_m, var_x = lookup[sample["var_protein"]]
+        all_ref_mean[i] = ref_m
+        all_ref_max[i] = ref_x
+        all_var_mean[i] = var_m
+        all_var_max[i] = var_x
+        all_nuc[i] = sample["nucleotide_features"]
+        all_labels[i] = sample["label"]
+        all_dms[i] = sample.get("dms_score", 0.0)
 
-        # Split back into ref / var
-        ref_out, var_out = out[:n_ref], out[n_ref:]
-        ref_mask, var_mask = mask[:n_ref], mask[n_ref:]
-
-        # Pool: mean and max (matching ComparisonModule._pool logic)
-        def _pool(emb, m):
-            m_f = m.unsqueeze(-1).float()
-            mean_p = (emb * m_f).sum(1) / m_f.sum(1).clamp(min=1)
-            emb_masked = emb.masked_fill(~m.unsqueeze(-1).bool(), float("-inf"))
-            max_p = emb_masked.max(dim=1).values
-            max_p = max_p.masked_fill(max_p == float("-inf"), 0.0)
-            return mean_p.float().cpu(), max_p.float().cpu()
-
-        ref_mean, ref_max = _pool(ref_out, ref_mask)
-        var_mean, var_max = _pool(var_out, var_mask)
-
-        all_ref_mean.append(ref_mean)
-        all_ref_max.append(ref_max)
-        all_var_mean.append(var_mean)
-        all_var_max.append(var_max)
-        all_nuc.append(batch["nucleotide_features"])
-        all_labels.append(batch["labels"])
-        all_dms.append(batch["dms_scores"])
-
-    # Save as single tensor file
     data = {
-        "ref_mean": torch.cat(all_ref_mean),
-        "ref_max": torch.cat(all_ref_max),
-        "var_mean": torch.cat(all_var_mean),
-        "var_max": torch.cat(all_var_max),
-        "nucleotide_features": torch.cat(all_nuc),
-        "labels": torch.cat(all_labels),
-        "dms_scores": torch.cat(all_dms),
+        "ref_mean": all_ref_mean,
+        "ref_max": all_ref_max,
+        "var_mean": all_var_mean,
+        "var_max": all_var_max,
+        "nucleotide_features": all_nuc,
+        "labels": all_labels,
+        "dms_scores": all_dms,
     }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(data, output_path)
 
-    n = len(data["labels"])
-    hidden = data["ref_mean"].shape[1]
     size_mb = output_path.stat().st_size / 1e6
-    logger.info(f"Saved {n} embeddings (hidden={hidden}) to {output_path} ({size_mb:.1f} MB)")
+    logger.info(f"Saved {n_samples} embeddings (hidden={hidden}) to {output_path} ({size_mb:.1f} MB)")
 
 
 def main():
@@ -196,6 +221,10 @@ def main():
     model.eval()
     for p in model.parameters():
         p.requires_grad = False
+
+    if args.compile and hasattr(torch, "compile"):
+        logger.info("Compiling ESM2 with torch.compile (first batch will be slow)")
+        model = torch.compile(model)
 
     # Train split
     logger.info(f"Loading train data: {args.train_data}")

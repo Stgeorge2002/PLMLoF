@@ -1,4 +1,4 @@
-"""PyTorch Dataset for PLMLoF reference-variant sequence pairs."""
+"""PyTorch Dataset for PLMLoF reference-variant protein sequence pairs."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ import torch
 from torch.utils.data import Dataset
 
 from plmlof.data.features import extract_nucleotide_features
-from plmlof.utils.sequence_utils import translate_dna
 
 
 class PLMLoFDataset(Dataset):
@@ -32,7 +31,7 @@ class PLMLoFDataset(Dataset):
         """
         Args:
             data_path: Path to parquet/csv file with columns:
-                ref_protein, var_protein, ref_dna, var_dna, label, gene, species
+                ref_protein, var_protein, label, gene, species
             max_seq_length: Maximum protein sequence length (will be truncated).
         """
         self.max_seq_length = max_seq_length
@@ -50,7 +49,7 @@ class PLMLoFDataset(Dataset):
         if missing:
             raise ValueError(f"Missing required columns: {missing}")
 
-        # --- Pre-extract columns as lists (avoid pd.Series alloc per __getitem__) ---
+        # Pre-extract columns as lists for fast __getitem__
         self._ref_proteins_raw = [
             str(v)[:max_seq_length] for v in self.df["ref_protein"]
         ]
@@ -58,19 +57,6 @@ class PLMLoFDataset(Dataset):
             str(v)[:max_seq_length] for v in self.df["var_protein"]
         ]
         self._labels = self.df["label"].astype(int).tolist()
-
-        has_dna_col = "ref_dna" in self.df.columns and "var_dna" in self.df.columns
-        self._ref_dnas: list[str] = []
-        self._var_dnas: list[str] = []
-        if has_dna_col:
-            for rd, vd in zip(self.df["ref_dna"], self.df["var_dna"]):
-                rd_s = "" if pd.isna(rd) else str(rd)
-                vd_s = "" if pd.isna(vd) else str(vd)
-                self._ref_dnas.append(rd_s)
-                self._var_dnas.append(vd_s)
-        else:
-            self._ref_dnas = [""] * len(self.df)
-            self._var_dnas = [""] * len(self.df)
 
         has_dms = "dms_zscore" in self.df.columns
         self._dms_scores: list[float] = []
@@ -84,22 +70,16 @@ class PLMLoFDataset(Dataset):
         self._genes = [str(v) for v in self.df.get("gene", [""] * len(self.df))]
         self._species = [str(v) for v in self.df.get("species", [""] * len(self.df))]
 
-        # --- Pre-compute nucleotide features once (deterministic, no need to redo per epoch) ---
-        self._nuc_features = self._precompute_nucleotide_features()
+        # Pre-compute protein features once (deterministic, no need to redo per epoch)
+        self._nuc_features = self._precompute_features()
 
-    def _precompute_nucleotide_features(self) -> torch.Tensor:
-        """Compute all nucleotide features upfront. Called once at init."""
+    def _precompute_features(self) -> torch.Tensor:
+        """Compute all protein features upfront. Called once at init."""
         features_list = []
         for i in range(len(self.df)):
-            ref_dna = self._ref_dnas[i]
-            var_dna = self._var_dnas[i]
             ref_prot = self._ref_proteins_raw[i]
             var_prot = self._var_proteins_raw[i]
-
-            if ref_dna and var_dna:
-                feat = extract_nucleotide_features(ref_dna, var_dna, ref_prot, var_prot)
-            else:
-                feat = extract_nucleotide_features("", "", ref_prot, var_prot)
+            feat = extract_nucleotide_features(ref_prot, var_prot)
             features_list.append(feat)
         return torch.stack(features_list)
 
@@ -144,7 +124,7 @@ class SyntheticPLMLoFDataset(Dataset):
                 var_raw = ref_base
 
             # Compute real features before stripping "*"
-            nuc_features = extract_nucleotide_features("", "", ref_base, var_raw)
+            nuc_features = extract_nucleotide_features(ref_base, var_raw)
             # Strip "*" for ESM2 tokenization
             var_clean = var_raw.replace("*", "")
 

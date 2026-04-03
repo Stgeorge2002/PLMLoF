@@ -8,7 +8,6 @@ from pathlib import Path
 
 from Bio import SeqIO
 
-from plmlof.data.features import extract_nucleotide_features
 from plmlof.data.preprocessing import apply_snp_to_dna, apply_insertion, apply_deletion
 from plmlof.utils.sequence_utils import translate_dna
 
