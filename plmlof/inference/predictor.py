@@ -78,7 +78,6 @@ class PLMLoFPredictor:
             path = candidates[0]
 
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        state_dict = checkpoint.get("model_state_dict", checkpoint)
 
         # Reconstruct model from saved config if available
         model_cfg = checkpoint.get("model_config", {})
@@ -93,7 +92,18 @@ class PLMLoFPredictor:
             classifier_dropout=model_cfg.get("classifier_dropout", 0.3),
             pool_strategy=model_cfg.get("pool_strategy", "mean_max"),
         )
-        model.load_state_dict(state_dict, strict=False)
+
+        if checkpoint.get("cached_training"):
+            # Cached checkpoint stores component state dicts separately
+            model.comparison.load_state_dict(checkpoint["comparison_state_dict"])
+            model.classifier.load_state_dict(checkpoint["classifier_state_dict"])
+            if "feature_norm_state_dict" in checkpoint:
+                model.feature_norm.load_state_dict(checkpoint["feature_norm_state_dict"])
+            logger.info("Assembled PLMLoFModel from cached-training checkpoint")
+        else:
+            state_dict = checkpoint.get("model_state_dict", checkpoint)
+            model.load_state_dict(state_dict, strict=False)
+
         logger.info(f"Loaded model with ESM2: {esm2_name}")
         return model.to(self.device)
 

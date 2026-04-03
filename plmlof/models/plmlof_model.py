@@ -48,6 +48,9 @@ class PLMLoFModel(nn.Module):
             pool_strategy=pool_strategy,
         )
 
+        # Normalize nucleotide features (scales differ by ~100x across dims)
+        self.feature_norm = nn.LayerNorm(num_nuc_features)
+
         # Classifier head
         classifier_input_size = self.comparison.output_size + num_nuc_features
         self.classifier = ClassifierHead(
@@ -101,7 +104,8 @@ class PLMLoFModel(nn.Module):
             ref_emb, var_emb, ref_attention_mask, var_attention_mask
         )
 
-        # Concatenate comparison features with nucleotide features
+        # Normalize and concatenate nucleotide features
+        nucleotide_features = self.feature_norm(nucleotide_features)
         features = torch.cat([comparison, nucleotide_features], dim=-1)
 
         # Classify

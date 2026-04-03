@@ -50,44 +50,75 @@ class PLMLoFDataset(Dataset):
         if missing:
             raise ValueError(f"Missing required columns: {missing}")
 
+        # --- Pre-extract columns as lists (avoid pd.Series alloc per __getitem__) ---
+        self._ref_proteins_raw = [
+            str(v)[:max_seq_length] for v in self.df["ref_protein"]
+        ]
+        self._var_proteins_raw = [
+            str(v)[:max_seq_length] for v in self.df["var_protein"]
+        ]
+        self._labels = self.df["label"].astype(int).tolist()
+
+        has_dna_col = "ref_dna" in self.df.columns and "var_dna" in self.df.columns
+        self._ref_dnas: list[str] = []
+        self._var_dnas: list[str] = []
+        if has_dna_col:
+            for rd, vd in zip(self.df["ref_dna"], self.df["var_dna"]):
+                rd_s = "" if pd.isna(rd) else str(rd)
+                vd_s = "" if pd.isna(vd) else str(vd)
+                self._ref_dnas.append(rd_s)
+                self._var_dnas.append(vd_s)
+        else:
+            self._ref_dnas = [""] * len(self.df)
+            self._var_dnas = [""] * len(self.df)
+
+        has_dms = "dms_zscore" in self.df.columns
+        self._dms_scores: list[float] = []
+        if has_dms:
+            self._dms_scores = [
+                float(v) if pd.notna(v) else 0.0 for v in self.df["dms_zscore"]
+            ]
+        else:
+            self._dms_scores = [0.0] * len(self.df)
+
+        self._genes = [str(v) for v in self.df.get("gene", [""] * len(self.df))]
+        self._species = [str(v) for v in self.df.get("species", [""] * len(self.df))]
+
+        # --- Pre-compute nucleotide features once (deterministic, no need to redo per epoch) ---
+        self._nuc_features = self._precompute_nucleotide_features()
+
+    def _precompute_nucleotide_features(self) -> torch.Tensor:
+        """Compute all nucleotide features upfront. Called once at init."""
+        features_list = []
+        for i in range(len(self.df)):
+            ref_dna = self._ref_dnas[i]
+            var_dna = self._var_dnas[i]
+            ref_prot = self._ref_proteins_raw[i]
+            var_prot = self._var_proteins_raw[i]
+
+            if ref_dna and var_dna:
+                feat = extract_nucleotide_features(ref_dna, var_dna, ref_prot, var_prot)
+            else:
+                feat = extract_nucleotide_features("", "", ref_prot, var_prot)
+            features_list.append(feat)
+        return torch.stack(features_list)
+
     def __len__(self) -> int:
         return len(self.df)
 
     def __getitem__(self, idx: int) -> dict:
-        row = self.df.iloc[idx]
-
-        # Keep raw proteins (with "*") for feature extraction
-        ref_protein_raw = str(row["ref_protein"])[: self.max_seq_length]
-        var_protein_raw = str(row["var_protein"])[: self.max_seq_length]
-        label = int(row["label"])
-
-        # Compute nucleotide features BEFORE stripping "*"
-        # (has_premature_stop, nonsense count, truncation_fraction rely on "*")
-        ref_dna = str(row.get("ref_dna", ""))
-        var_dna = str(row.get("var_dna", ""))
-
-        if ref_dna and var_dna and ref_dna != "nan" and var_dna != "nan":
-            nuc_features = extract_nucleotide_features(
-                ref_dna, var_dna, ref_protein_raw, var_protein_raw
-            )
-        else:
-            # Fallback: compute from protein-level differences only
-            nuc_features = extract_nucleotide_features(
-                "", "", ref_protein_raw, var_protein_raw
-            )
-
         # Strip "*" for ESM2 tokenization (ESM2 cannot tokenize stop codons)
-        ref_protein = ref_protein_raw.replace("*", "")
-        var_protein = var_protein_raw.replace("*", "")
+        ref_protein = self._ref_proteins_raw[idx].replace("*", "")
+        var_protein = self._var_proteins_raw[idx].replace("*", "")
 
         return {
             "ref_protein": ref_protein,
             "var_protein": var_protein,
-            "nucleotide_features": nuc_features,
-            "label": label,
-            "dms_score": float(row["dms_zscore"]) if "dms_zscore" in self.df.columns and pd.notna(row.get("dms_zscore")) else 0.0,
-            "gene": str(row.get("gene", "")),
-            "species": str(row.get("species", "")),
+            "nucleotide_features": self._nuc_features[idx],
+            "label": self._labels[idx],
+            "dms_score": self._dms_scores[idx],
+            "gene": self._genes[idx],
+            "species": self._species[idx],
         }
 
 

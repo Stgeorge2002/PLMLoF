@@ -138,16 +138,21 @@ def extract_nucleotide_features(
     # Mutation density
     density = (n_total / protein_len) * 100
 
-    # Affected region (average if multiple mutations)
+    # Affected region — fraction of mutations in each region (continuous)
     region_n = 0.0
     region_c = 0.0
     if mutations:
         pos_mutations = [m for m in mutations if "position" in m]
         if pos_mutations:
-            avg_pos = sum(m["position"] for m in pos_mutations) / len(pos_mutations)
-            region = _classify_region(int(avg_pos), protein_len)
-            region_n = float(region == "N-terminal")
-            region_c = float(region == "C-terminal")
+            n_pos = len(pos_mutations)
+            region_n = sum(
+                1.0 for m in pos_mutations
+                if _classify_region(m["position"], protein_len) == "N-terminal"
+            ) / n_pos
+            region_c = sum(
+                1.0 for m in pos_mutations
+                if _classify_region(m["position"], protein_len) == "C-terminal"
+            ) / n_pos
 
     features = torch.tensor(
         [
