@@ -118,4 +118,4 @@ class RegressionHead(nn.Module):
         Returns:
             Predicted z-scores [batch].
         """
-        return self.mlp(features).squeeze(-1)
+        return self.mlp(features).squeeze(-1).clamp(-10.0, 10.0)

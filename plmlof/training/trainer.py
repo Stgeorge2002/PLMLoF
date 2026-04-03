@@ -204,7 +204,7 @@ class PLMLoFTrainer:
 
         optimizer = self._build_optimizer(learning_rate, weight_decay)
         # Linear warmup + cosine decay for stable training with randomly initialized heads
-        warmup_epochs = min(5, max(1, max_epochs // 10))
+        warmup_epochs = min(10, max(1, max_epochs // 10))
         warmup_sched = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
         cosine_sched = CosineAnnealingLR(optimizer, T_max=max(max_epochs - warmup_epochs, 1), eta_min=1e-6)
         scheduler = SequentialLR(optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_epochs])
@@ -556,7 +556,7 @@ class CachedTrainer:
             params += list(self.regressor.parameters())
         optimizer = AdamW(params, lr=learning_rate, weight_decay=weight_decay)
         # Linear warmup + cosine decay — critical for large randomly-initialized layers
-        warmup_epochs = min(5, max(1, max_epochs // 10))
+        warmup_epochs = min(10, max(1, max_epochs // 10))
         warmup_scheduler = LinearLR(
             optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs,
         )
