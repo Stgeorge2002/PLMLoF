@@ -142,7 +142,7 @@ class PLMLoFTrainer:
             loss = self.criterion(logits, batch["labels"])
             total_loss += loss.item()
 
-            probs = torch.softmax(logits, dim=-1).cpu().numpy()
+            probs = torch.softmax(logits, dim=-1).float().cpu().numpy()
             preds = logits.argmax(dim=-1).cpu().numpy()
             all_preds.extend(preds)
             all_labels.extend(batch["labels"].cpu().numpy())
@@ -430,7 +430,7 @@ class CachedTrainer:
             all_preds.extend(logits.argmax(dim=-1).cpu().numpy())
             all_labels.extend(batch["labels"].cpu().numpy())
             if reg_pred is not None:
-                all_reg_preds.extend(reg_pred.detach().cpu().numpy())
+                all_reg_preds.extend(reg_pred.detach().float().cpu().numpy())
                 all_dms_targets.extend(batch["dms_scores"].cpu().numpy())
             pbar.set_postfix({"loss": f"{loss.item() * grad_accum_steps:.4f}"})
 
@@ -474,9 +474,9 @@ class CachedTrainer:
             total_reg_loss += reg_l
             all_preds.extend(logits.argmax(dim=-1).cpu().numpy())
             all_labels.extend(batch["labels"].cpu().numpy())
-            all_probs.extend(torch.softmax(logits, dim=-1).cpu().numpy())
+            all_probs.extend(torch.softmax(logits, dim=-1).float().cpu().numpy())
             if reg_pred is not None:
-                all_reg_preds.extend(reg_pred.cpu().numpy())
+                all_reg_preds.extend(reg_pred.float().cpu().numpy())
                 all_dms_targets.extend(batch["dms_scores"].cpu().numpy())
 
         n_batches = max(len(self.val_loader), 1)
