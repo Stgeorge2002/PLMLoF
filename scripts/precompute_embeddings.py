@@ -5,9 +5,12 @@ time from hours to minutes. Each sample's ref and var protein are
 encoded once and saved to disk as tensors.
 
 Optimisations:
-  - Sequence-level deduplication: each unique protein is embedded once
+  - Cross-split deduplication: each unique protein across train+val
+    is embedded exactly once (shared refs get a single forward pass)
   - Length-sorted batching on unique sequences minimises padding waste
   - fp16 autocast, pinned memory, prefetched DataLoader
+  - Vectorised scatter via tensor indexing (no per-sample Python loop)
+  - Embedding cache (.embedding_cache.pt) for crash resume
   - Optional torch.compile for ESM2 forward pass
 
 Usage:
@@ -93,11 +96,11 @@ def _embed_unique_sequences(
     batch_size: int,
     max_seq_length: int,
     desc: str = "Embedding",
-) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
-    """Embed a list of unique sequences and return a lookup dict.
+) -> tuple[list[str], torch.Tensor, torch.Tensor]:
+    """Embed unique sequences and return indexed tensors.
 
     Returns:
-        Dict mapping sequence → (mean_pooled [D], max_pooled [D]) on CPU.
+        (ordered_sequences, mean_tensor [N, D], max_tensor [N, D]) on CPU.
     """
     ds = _UniqueSeqDataset(sequences)
     loader = DataLoader(
@@ -110,97 +113,59 @@ def _embed_unique_sequences(
         prefetch_factor=2,
     )
 
-    lookup: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    ordered_seqs: list[str] = []
+    mean_chunks: list[torch.Tensor] = []
+    max_chunks: list[torch.Tensor] = []
     model.eval()
 
     for batch in tqdm(loader, desc=desc):
         ids = batch["input_ids"].to(device, non_blocking=True)
         mask = batch["attention_mask"].to(device, non_blocking=True)
-        seqs = batch["sequences"]
 
         with torch.amp.autocast("cuda", dtype=torch.float16, enabled=device.type == "cuda"):
             out = model(ids, attention_mask=mask).last_hidden_state
 
         mean_p, max_p = _pool(out, mask)
-        mean_cpu = mean_p.cpu()
-        max_cpu = max_p.cpu()
+        mean_chunks.append(mean_p.cpu())
+        max_chunks.append(max_p.cpu())
+        ordered_seqs.extend(batch["sequences"])
 
-        for j, seq in enumerate(seqs):
-            lookup[seq] = (mean_cpu[j], max_cpu[j])
-
-    return lookup
+    return ordered_seqs, torch.cat(mean_chunks), torch.cat(max_chunks)
 
 
-@torch.no_grad()
-def precompute_split(
+def _scatter_embeddings(
     dataset: PLMLoFDataset,
-    model: AutoModel,
-    tokenizer: AutoTokenizer,
+    seq_to_idx: dict[str, int],
+    mean_tensor: torch.Tensor,
+    max_tensor: torch.Tensor,
     output_path: Path,
-    device: torch.device,
-    batch_size: int = 256,
-    max_seq_length: int = 1024,
 ) -> None:
-    """Pre-compute and save pooled embeddings for a dataset split.
+    """Scatter pre-computed embeddings to per-sample tensors using vectorised indexing."""
+    n = len(dataset)
 
-    Deduplicates all protein sequences (ref ∪ var), embeds each unique
-    sequence exactly once, then scatters results back per sample.
-    """
-    n_samples = len(dataset)
+    # Access pre-extracted protein lists directly (skip __getitem__ overhead)
+    ref_proteins = [s.replace("*", "") for s in dataset._ref_proteins_raw]
+    var_proteins = [s.replace("*", "") for s in dataset._var_proteins_raw]
 
-    # Collect all ref/var protein strings and deduplicate
-    ref_seqs = [dataset[i]["ref_protein"] for i in range(n_samples)]
-    var_seqs = [dataset[i]["var_protein"] for i in range(n_samples)]
-    unique_seqs = list(set(ref_seqs) | set(var_seqs))
+    ref_idx = torch.tensor([seq_to_idx[s] for s in ref_proteins], dtype=torch.long)
+    var_idx = torch.tensor([seq_to_idx[s] for s in var_proteins], dtype=torch.long)
 
-    logger.info(
-        f"  {n_samples} samples → {n_samples * 2} total sequences, "
-        f"{len(unique_seqs)} unique ({(1 - len(unique_seqs) / (n_samples * 2)) * 100:.0f}% dedup)"
-    )
-
-    # Embed unique sequences
-    lookup = _embed_unique_sequences(
-        unique_seqs, model, tokenizer, device, batch_size, max_seq_length,
-        desc=f"Encoding {output_path.stem}",
-    )
-
-    # Scatter back to per-sample tensors
-    hidden = next(iter(lookup.values()))[0].shape[0]
-    all_ref_mean = torch.empty(n_samples, hidden)
-    all_ref_max = torch.empty(n_samples, hidden)
-    all_var_mean = torch.empty(n_samples, hidden)
-    all_var_max = torch.empty(n_samples, hidden)
-    all_nuc = torch.empty(n_samples, dataset[0]["nucleotide_features"].shape[0])
-    all_labels = torch.empty(n_samples, dtype=torch.long)
-    all_dms = torch.empty(n_samples)
-
-    for i in range(n_samples):
-        sample = dataset[i]
-        ref_m, ref_x = lookup[sample["ref_protein"]]
-        var_m, var_x = lookup[sample["var_protein"]]
-        all_ref_mean[i] = ref_m
-        all_ref_max[i] = ref_x
-        all_var_mean[i] = var_m
-        all_var_max[i] = var_x
-        all_nuc[i] = sample["nucleotide_features"]
-        all_labels[i] = sample["label"]
-        all_dms[i] = sample.get("dms_score", 0.0)
-
+    # Vectorised gather — single C-level indexing op per tensor
     data = {
-        "ref_mean": all_ref_mean,
-        "ref_max": all_ref_max,
-        "var_mean": all_var_mean,
-        "var_max": all_var_max,
-        "nucleotide_features": all_nuc,
-        "labels": all_labels,
-        "dms_scores": all_dms,
+        "ref_mean": mean_tensor[ref_idx],
+        "ref_max": max_tensor[ref_idx],
+        "var_mean": mean_tensor[var_idx],
+        "var_max": max_tensor[var_idx],
+        "nucleotide_features": dataset._nuc_features,
+        "labels": torch.tensor(dataset._labels, dtype=torch.long),
+        "dms_scores": torch.tensor(dataset._dms_scores, dtype=torch.float),
     }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(data, output_path)
 
     size_mb = output_path.stat().st_size / 1e6
-    logger.info(f"Saved {n_samples} embeddings (hidden={hidden}) to {output_path} ({size_mb:.1f} MB)")
+    logger.info(f"  Saved {n} samples → {output_path} ({size_mb:.1f} MB)")
 
 
 def main():
@@ -215,31 +180,95 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"Loading ESM2: {args.esm2_model}")
-    tokenizer = AutoTokenizer.from_pretrained(args.esm2_model)
-    model = AutoModel.from_pretrained(args.esm2_model).to(device)
-    model.eval()
-    for p in model.parameters():
-        p.requires_grad = False
-
-    if args.compile and hasattr(torch, "compile"):
-        logger.info("Compiling ESM2 with torch.compile (first batch will be slow)")
-        model = torch.compile(model)
-
-    # Train split
+    # ── Load datasets ──
     logger.info(f"Loading train data: {args.train_data}")
     train_ds = PLMLoFDataset(args.train_data, max_seq_length=args.max_seq_length)
-    logger.info(f"Train samples: {len(train_ds)}")
-    precompute_split(train_ds, model, tokenizer, output_dir / "train_embeddings.pt",
-                     device, args.batch_size, args.max_seq_length)
+    splits: list[tuple[str, PLMLoFDataset, Path]] = [
+        ("train", train_ds, output_dir / "train_embeddings.pt"),
+    ]
 
-    # Val split
     if args.val_data:
         logger.info(f"Loading val data: {args.val_data}")
         val_ds = PLMLoFDataset(args.val_data, max_seq_length=args.max_seq_length)
-        logger.info(f"Val samples: {len(val_ds)}")
-        precompute_split(val_ds, model, tokenizer, output_dir / "val_embeddings.pt",
-                         device, args.batch_size, args.max_seq_length)
+        splits.append(("val", val_ds, output_dir / "val_embeddings.pt"))
+
+    # ── Collect unique sequences across ALL splits ──
+    all_unique: set[str] = set()
+    for name, ds, _ in splits:
+        ref_seqs = {s.replace("*", "") for s in ds._ref_proteins_raw}
+        var_seqs = {s.replace("*", "") for s in ds._var_proteins_raw}
+        split_unique = ref_seqs | var_seqs
+        logger.info(f"  {name}: {len(ds)} samples, {len(split_unique)} unique sequences")
+        all_unique |= split_unique
+
+    total_seqs = sum(len(ds) * 2 for _, ds, _ in splits)
+    logger.info(
+        f"Cross-split dedup: {total_seqs} total → {len(all_unique)} unique "
+        f"({(1 - len(all_unique) / max(total_seqs, 1)) * 100:.0f}% reduction)"
+    )
+
+    # ── Embed unique sequences (with cache for crash resume) ──
+    cache_path = output_dir / ".embedding_cache.pt"
+    need_embed = True
+
+    if cache_path.exists():
+        logger.info(f"Found embedding cache: {cache_path}")
+        cache = torch.load(cache_path, weights_only=False)
+        cached_set = set(cache["sequences"])
+        if all_unique <= cached_set:
+            logger.info(f"  Cache complete ({len(cached_set)} sequences), skipping ESM2")
+            ordered_seqs = cache["sequences"]
+            mean_tensor = cache["means"]
+            max_tensor = cache["maxes"]
+            need_embed = False
+        else:
+            logger.info(
+                f"  Cache stale ({len(cached_set)} cached, "
+                f"{len(all_unique - cached_set)} missing), re-embedding all"
+            )
+
+    if need_embed:
+        logger.info(f"Loading ESM2: {args.esm2_model}")
+        tokenizer = AutoTokenizer.from_pretrained(args.esm2_model)
+        model = AutoModel.from_pretrained(args.esm2_model).to(device)
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad = False
+
+        if args.compile and hasattr(torch, "compile"):
+            logger.info("Compiling ESM2 with torch.compile (first batch will be slow)")
+            model = torch.compile(model)
+
+        ordered_seqs, mean_tensor, max_tensor = _embed_unique_sequences(
+            list(all_unique), model, tokenizer, device,
+            args.batch_size, args.max_seq_length,
+            desc="Encoding all splits",
+        )
+
+        # Save cache for crash resume
+        logger.info(f"Saving embedding cache → {cache_path}")
+        torch.save(
+            {"sequences": ordered_seqs, "means": mean_tensor, "maxes": max_tensor},
+            cache_path,
+        )
+
+        # Free GPU memory before scatter
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    # ── Build sequence → index lookup ──
+    seq_to_idx = {seq: i for i, seq in enumerate(ordered_seqs)}
+
+    # ── Scatter to each split ──
+    for name, ds, out_path in splits:
+        logger.info(f"Scattering {name} ({len(ds)} samples)...")
+        _scatter_embeddings(ds, seq_to_idx, mean_tensor, max_tensor, out_path)
+
+    # Clean up cache (output files are the source of truth now)
+    if cache_path.exists():
+        cache_path.unlink()
+        logger.info("Cleaned up embedding cache")
 
     logger.info("Embedding pre-computation complete!")
 
