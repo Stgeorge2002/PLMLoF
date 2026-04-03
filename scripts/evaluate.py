@@ -85,14 +85,21 @@ def main():
         from transformers import AutoTokenizer, AutoModel
 
         # Load comparison + classifier
-        hidden_size = 1280  # ESM2-650M
+        # Infer hidden_size from checkpoint state dict
+        comparison_state = checkpoint["comparison_state_dict"]
+        # _pre_norm.weight shape is [raw_size], raw_size = 8*D for mean_max, 4*D for mean
+        pre_norm_shape = comparison_state["_pre_norm.weight"].shape[0]
+        if pool_strategy == "mean_max":
+            hidden_size = pre_norm_shape // 8
+        else:
+            hidden_size = pre_norm_shape // 4
         comparison = ComparisonModule(hidden_size=hidden_size, pool_strategy=pool_strategy)
         comparison.load_state_dict(checkpoint["comparison_state_dict"])
 
         classifier_input = comparison.output_size + NUM_NUCLEOTIDE_FEATURES
         classifier = ClassifierHead(
             input_size=classifier_input,
-            hidden_dims=model_cfg.get("classifier_hidden_dims", [512, 128]),
+            hidden_dims=model_cfg.get("classifier_hidden_dims", [256, 64]),
             num_classes=3,
             dropout=model_cfg.get("classifier_dropout", 0.3),
         )
@@ -105,8 +112,8 @@ def main():
             regressor.load_state_dict(checkpoint["regressor_state_dict"])
             logger.info("Loaded regression head for DMS score prediction")
 
-        # Load feature normalization (BatchNorm for engineered features)
-        feature_norm = nn.BatchNorm1d(NUM_NUCLEOTIDE_FEATURES)
+        # Load feature normalization (LayerNorm for engineered features)
+        feature_norm = nn.LayerNorm(NUM_NUCLEOTIDE_FEATURES)
         if "feature_norm_state_dict" in checkpoint:
             feature_norm.load_state_dict(checkpoint["feature_norm_state_dict"])
             logger.info("Loaded feature normalization")
@@ -208,7 +215,7 @@ def main():
                 diff_pool = ref_pool - var_pool
                 prod_pool = ref_pool * var_pool
                 comp = torch.cat([diff_pool, prod_pool, ref_pool, var_pool], dim=-1)
-                comp = comparison._proj(comp)
+                comp = comparison.project(comp)
                 nuc_normed = feature_norm(nuc)
                 features = torch.cat([comp, nuc_normed], dim=-1)
                 logits = classifier(features)

@@ -148,7 +148,7 @@ if [[ "$MODE" == "full" || "$MODE" == "train" || "$MODE" == "test" ]]; then
         # Already trained inline in step 2 for test mode
         echo "Test training already done in step 2."
     else
-        echo "Training with cached embeddings (focal loss, cross-attn, BatchNorm)..."
+        echo "Training with cached embeddings (CE loss, cross-attn, LayerNorm)..."
         python scripts/train.py \
             --config "$TRAIN_CFG" \
             --model-config "$MODEL_CFG" \
@@ -198,4 +198,19 @@ echo " Pipeline complete!"
 echo ""
 echo " Checkpoint:   $CHECKPOINT"
 echo " Predict:      python scripts/predict.py --model $CHECKPOINT --reference <ref.fasta> --variants <var.fasta> --device $DEVICE"
-echo "=============================================="
+echo "==============================================" 
+
+# ── STEP 5: Sync outputs to S3 ──
+if [[ -n "${S3_BUCKET:-}" ]]; then
+    echo ""
+    echo "──────── Step 5: Sync to S3 ────────"
+    S3_DEST="s3://${S3_BUCKET}/plmlof-runs/$(date +%Y%m%d_%H%M%S)"
+    echo "Syncing outputs → $S3_DEST"
+    aws s3 sync "$OUTPUT_DIR" "$S3_DEST" \
+        --exclude '*.tmp' \
+        --no-progress
+    echo "S3 sync complete: $S3_DEST"
+else
+    echo ""
+    echo "Tip: set S3_BUCKET=your-bucket-name in runpod/env.sh to auto-sync outputs to AWS."
+fi

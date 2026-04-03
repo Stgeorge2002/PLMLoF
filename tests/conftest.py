@@ -83,11 +83,11 @@ def csv_dataset_path(tmp_path: Path) -> Path:
     ref = "MKTLLLTLVVVTLAALG"
     rows = [
         {"ref_protein": ref, "var_protein": ref[:5] + "*" + ref[6:], "label": 0,
-         "ref_dna": "", "var_dna": "", "gene": "g1", "species": "sp1"},
+         "ref_dna": "", "var_dna": "", "gene": "g1", "species": "sp1", "dms_zscore": -1.5},
         {"ref_protein": ref, "var_protein": ref, "label": 1,
-         "ref_dna": "", "var_dna": "", "gene": "g2", "species": "sp1"},
+         "ref_dna": "", "var_dna": "", "gene": "g2", "species": "sp1", "dms_zscore": 0.0},
         {"ref_protein": ref, "var_protein": "M" + "R" + ref[2:], "label": 2,
-         "ref_dna": "", "var_dna": "", "gene": "g3", "species": "sp1"},
+         "ref_dna": "", "var_dna": "", "gene": "g3", "species": "sp1", "dms_zscore": 1.8},
     ]
     df = pd.DataFrame(rows)
     csv_path = tmp_path / "test_data.csv"

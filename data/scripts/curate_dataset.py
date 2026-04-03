@@ -60,16 +60,18 @@ def merge_datasets() -> pd.DataFrame:
     if "label" in df.columns:
         df["label"] = df["label"].astype(int)
 
-    # Strip stop codon '*' characters — ESM2 cannot tokenize them
-    df["ref_protein"] = df["ref_protein"].str.replace("*", "", regex=False)
-    df["var_protein"] = df["var_protein"].str.replace("*", "", regex=False)
+    # NOTE: Do NOT strip "*" here — feature extraction (has_premature_stop,
+    # nonsense count, truncation_fraction) depends on "*" being present.
+    # The Dataset class / collator strip "*" only at the ESM2 tokenization stage.
 
     # Drop rows with empty proteins
     df = df[df["ref_protein"].str.len() > 0]
     df = df[df["var_protein"].str.len() > 0]
 
-    # Drop exact duplicates
-    df = df.drop_duplicates(subset=["ref_protein", "var_protein", "label"])
+    # Drop duplicates on (ref_protein, var_protein) only — keep first label
+    # This avoids conflicting labels when the same variant appears in
+    # different assays with different fitness thresholds.
+    df = df.drop_duplicates(subset=["ref_protein", "var_protein"])
 
     logger.info(f"ProteinGym after dedup: {len(df)} records")
     label_counts = df["label"].value_counts()

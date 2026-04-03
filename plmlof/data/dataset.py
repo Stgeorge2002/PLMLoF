@@ -56,23 +56,29 @@ class PLMLoFDataset(Dataset):
     def __getitem__(self, idx: int) -> dict:
         row = self.df.iloc[idx]
 
-        ref_protein = str(row["ref_protein"]).replace("*", "")[: self.max_seq_length]
-        var_protein = str(row["var_protein"]).replace("*", "")[: self.max_seq_length]
+        # Keep raw proteins (with "*") for feature extraction
+        ref_protein_raw = str(row["ref_protein"])[: self.max_seq_length]
+        var_protein_raw = str(row["var_protein"])[: self.max_seq_length]
         label = int(row["label"])
 
-        # Compute nucleotide features if DNA columns available
+        # Compute nucleotide features BEFORE stripping "*"
+        # (has_premature_stop, nonsense count, truncation_fraction rely on "*")
         ref_dna = str(row.get("ref_dna", ""))
         var_dna = str(row.get("var_dna", ""))
 
         if ref_dna and var_dna and ref_dna != "nan" and var_dna != "nan":
             nuc_features = extract_nucleotide_features(
-                ref_dna, var_dna, ref_protein, var_protein
+                ref_dna, var_dna, ref_protein_raw, var_protein_raw
             )
         else:
             # Fallback: compute from protein-level differences only
             nuc_features = extract_nucleotide_features(
-                "", "", ref_protein, var_protein
+                "", "", ref_protein_raw, var_protein_raw
             )
+
+        # Strip "*" for ESM2 tokenization (ESM2 cannot tokenize stop codons)
+        ref_protein = ref_protein_raw.replace("*", "")
+        var_protein = var_protein_raw.replace("*", "")
 
         return {
             "ref_protein": ref_protein,
@@ -99,17 +105,22 @@ class SyntheticPLMLoFDataset(Dataset):
         # Simple test proteins
         ref_base = "MKTLLLTLVVVTLAALG"
         for i, label in enumerate(labels):
-            if label == 0:  # LoF — premature stop
-                var = ref_base[:5] + "*" + ref_base[6:]
+            if label == 0:  # LoF — truncation (premature stop removed for ESM2)
+                var_raw = ref_base[:5] + "*" + ref_base[6:]
             elif label == 2:  # GoF — missense in key position
-                var = "M" + "R" + ref_base[2:]
+                var_raw = "M" + "R" + ref_base[2:]
             else:  # WT — identical or synonymous
-                var = ref_base
+                var_raw = ref_base
+
+            # Compute real features before stripping "*"
+            nuc_features = extract_nucleotide_features("", "", ref_base, var_raw)
+            # Strip "*" for ESM2 tokenization
+            var_clean = var_raw.replace("*", "")
 
             self.samples.append({
                 "ref_protein": ref_base,
-                "var_protein": var,
-                "nucleotide_features": torch.randn(12, generator=rng),
+                "var_protein": var_clean,
+                "nucleotide_features": nuc_features,
                 "label": label,
                 "dms_score": 0.0,
                 "gene": f"test_gene_{i}",

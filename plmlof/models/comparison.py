@@ -64,9 +64,37 @@ class ComparisonModule(nn.Module):
             # mean + max for each → doubles the output
             self.output_size = 4 * hidden_size * 2
 
-        # Projection to standardize output size
-        self._proj = nn.Linear(self.output_size, 4 * hidden_size)
+        # Normalize before projection (critical: diff/prod/ref/var have very different scales)
+        raw_size = self.output_size
+        self._pre_norm = nn.LayerNorm(raw_size)
+
+        # Two-stage projection with activation for better gradient flow
+        proj_intermediate = 2 * hidden_size
+        self._proj = nn.Sequential(
+            nn.Linear(raw_size, proj_intermediate),
+            nn.GELU(),
+            nn.Linear(proj_intermediate, 4 * hidden_size),
+        )
         self.output_size = 4 * hidden_size
+
+        # Initialize projection with small gains for stable early training
+        self._init_proj_weights()
+
+    def _init_proj_weights(self):
+        """Initialize projection weights for stable training."""
+        for m in self._proj.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.1)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def project(self, raw_comparison: torch.Tensor) -> torch.Tensor:
+        """Normalize and project raw comparison features.
+
+        Use this method in both cached and non-cached training paths
+        to ensure consistent processing.
+        """
+        return self._proj(self._pre_norm(raw_comparison))
 
     def _pool(
         self, embeddings: torch.Tensor, mask: torch.Tensor
@@ -134,7 +162,5 @@ class ComparisonModule(nn.Module):
             [diff_pool, prod_pool, ref_pool, var_pool], dim=-1
         )  # [B, output_size_raw]
 
-        # Project to standardized size
-        comparison = self._proj(comparison)  # [B, 4*D]
-
-        return comparison
+        # Normalize and project to standardized size
+        return self.project(comparison)  # [B, 4*D]
