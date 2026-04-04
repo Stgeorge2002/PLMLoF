@@ -319,6 +319,9 @@ class CachedTrainer:
         self.best_metric = 0.0
         self.best_epoch = -1
 
+        # Persistent loss EMA across epochs for spike rejection
+        self._loss_ema: float | None = None
+
         self.mixed_precision = mixed_precision
         self.use_amp = mixed_precision in ("fp16", "bf16") and self.device.type == "cuda"
         self.amp_dtype = torch.float16 if mixed_precision == "fp16" else torch.bfloat16 if mixed_precision == "bf16" else torch.float32
@@ -400,10 +403,8 @@ class CachedTrainer:
         all_preds, all_labels = [], []
         all_reg_preds, all_dms_targets = [], []
         optimizer.zero_grad()
-
-        # Loss spike rejection: EMA of per-batch loss to detect and skip outlier batches
-        _loss_ema: float | None = None
-        _ema_alpha = 0.02  # ~50-batch warm-up window
+        n_skipped = 0
+        accum_count = 0  # track actual backward passes for correct grad accumulation
 
         pbar = tqdm(self.train_loader, desc="Training", leave=False)
         for step, batch in enumerate(pbar):
@@ -415,18 +416,23 @@ class CachedTrainer:
                 loss, cls_l, reg_l = self._compute_loss(logits, reg_pred, batch)
                 loss = loss / grad_accum_steps
 
+            # Per-batch spike rejection using persistent EMA across epochs
             raw_loss = loss.item() * grad_accum_steps
-            if _loss_ema is None:
-                _loss_ema = raw_loss
-            is_spike = _loss_ema > 0.05 and raw_loss > 4.0 * _loss_ema
-            _loss_ema = _ema_alpha * raw_loss + (1 - _ema_alpha) * _loss_ema
+            if self._loss_ema is None:
+                self._loss_ema = raw_loss
+            is_spike = self._loss_ema > 0.05 and raw_loss > 4.0 * self._loss_ema
             if is_spike:
+                n_skipped += 1
                 optimizer.zero_grad()
+                accum_count = 0
                 continue
+            # Only update EMA for non-spike batches
+            self._loss_ema = 0.02 * raw_loss + 0.98 * self._loss_ema
 
             self.scaler.scale(loss).backward()
+            accum_count += 1
 
-            if (step + 1) % grad_accum_steps == 0:
+            if accum_count % grad_accum_steps == 0:
                 self.scaler.unscale_(optimizer)
                 params = (
                     list(self.comparison.parameters())
@@ -435,7 +441,6 @@ class CachedTrainer:
                     + (list(self.cross_attn.parameters()) if self.cross_attn else [])
                     + (list(self.regressor.parameters()) if self.regressor else [])
                 )
-                # Guard against NaN/Inf gradients (bf16 instability) — zero them out before clipping
                 for p in params:
                     if p.grad is not None:
                         p.grad.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
@@ -443,6 +448,7 @@ class CachedTrainer:
                 self.scaler.step(optimizer)
                 self.scaler.update()
                 optimizer.zero_grad()
+                accum_count = 0
 
             total_loss += loss.item() * grad_accum_steps
             total_cls_loss += cls_l
@@ -454,7 +460,10 @@ class CachedTrainer:
                 all_dms_targets.extend(batch["dms_scores"].cpu().numpy())
             pbar.set_postfix({"loss": f"{loss.item() * grad_accum_steps:.4f}"})
 
-        n_batches = max(len(self.train_loader), 1)
+        if n_skipped > 0:
+            logger.warning(f"  Skipped {n_skipped} spike batches (loss > 4x EMA)")
+
+        n_batches = max(len(self.train_loader) - n_skipped, 1)
         metrics = compute_metrics(np.array(all_preds), np.array(all_labels))
         metrics["loss"] = total_loss / n_batches
         metrics["cls_loss"] = total_cls_loss / n_batches
@@ -609,6 +618,24 @@ class CachedTrainer:
             logger.info(f"  Val   loss={val_m['loss']:.4f}, macro_f1={val_m['macro_f1']:.4f}" +
                         (f", spearman={val_m.get('spearman', 0):.4f}" if self.regressor else "") +
                         f", lr={current_lr:.2e}")
+
+            # Epoch-level rollback: if val F1 collapses (>50% drop from best),
+            # restore best checkpoint weights and skip this epoch entirely.
+            if self.best_metric > 0.3 and val_m["macro_f1"] < 0.5 * self.best_metric:
+                logger.warning(
+                    f"  Epoch-level rollback: val macro_f1={val_m['macro_f1']:.4f} "
+                    f"collapsed vs best={self.best_metric:.4f} — restoring best weights"
+                )
+                ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=True)
+                self.comparison.load_state_dict(ckpt["comparison_state_dict"])
+                self.classifier.load_state_dict(ckpt["classifier_state_dict"])
+                if "feature_norm_state_dict" in ckpt:
+                    self.feature_norm.load_state_dict(ckpt["feature_norm_state_dict"])
+                if self.cross_attn is not None and "cross_attn_state_dict" in ckpt:
+                    self.cross_attn.load_state_dict(ckpt["cross_attn_state_dict"])
+                if self.regressor is not None and "regressor_state_dict" in ckpt:
+                    self.regressor.load_state_dict(ckpt["regressor_state_dict"])
+                continue  # don't count toward patience
 
             if val_m["macro_f1"] > self.best_metric:
                 self.best_metric = val_m["macro_f1"]
