@@ -99,6 +99,9 @@ class PLMLoFTrainer:
 
             if (step + 1) % grad_accum_steps == 0:
                 self.scaler.unscale_(optimizer)
+                for p in self.model.parameters():
+                    if p.grad is not None:
+                        p.grad.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.scaler.step(optimizer)
                 self.scaler.update()
@@ -419,6 +422,10 @@ class CachedTrainer:
                     + (list(self.cross_attn.parameters()) if self.cross_attn else [])
                     + (list(self.regressor.parameters()) if self.regressor else [])
                 )
+                # Guard against NaN/Inf gradients (bf16 instability) — zero them out before clipping
+                for p in params:
+                    if p.grad is not None:
+                        p.grad.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
                 torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
                 self.scaler.step(optimizer)
                 self.scaler.update()
