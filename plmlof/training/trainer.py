@@ -401,6 +401,10 @@ class CachedTrainer:
         all_reg_preds, all_dms_targets = [], []
         optimizer.zero_grad()
 
+        # Loss spike rejection: EMA of per-batch loss to detect and skip outlier batches
+        _loss_ema: float | None = None
+        _ema_alpha = 0.02  # ~50-batch warm-up window
+
         pbar = tqdm(self.train_loader, desc="Training", leave=False)
         for step, batch in enumerate(pbar):
             batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
@@ -410,6 +414,15 @@ class CachedTrainer:
                 logits, reg_pred = self._forward(batch)
                 loss, cls_l, reg_l = self._compute_loss(logits, reg_pred, batch)
                 loss = loss / grad_accum_steps
+
+            raw_loss = loss.item() * grad_accum_steps
+            if _loss_ema is None:
+                _loss_ema = raw_loss
+            is_spike = _loss_ema > 0.05 and raw_loss > 4.0 * _loss_ema
+            _loss_ema = _ema_alpha * raw_loss + (1 - _ema_alpha) * _loss_ema
+            if is_spike:
+                optimizer.zero_grad()
+                continue
 
             self.scaler.scale(loss).backward()
 
