@@ -404,7 +404,8 @@ class CachedTrainer:
         all_reg_preds, all_dms_targets = [], []
         optimizer.zero_grad()
         n_skipped = 0
-        accum_count = 0  # track actual backward passes for correct grad accumulation
+        accum_count = 0
+        n_counted = 0  # batches contributing to epoch loss
 
         pbar = tqdm(self.train_loader, desc="Training", leave=False)
         for step, batch in enumerate(pbar):
@@ -420,7 +421,7 @@ class CachedTrainer:
             raw_loss = loss.item() * grad_accum_steps
             if self._loss_ema is None:
                 self._loss_ema = raw_loss
-            is_spike = self._loss_ema > 0.05 and raw_loss > 4.0 * self._loss_ema
+            is_spike = self._loss_ema > 0.05 and raw_loss > 3.0 * self._loss_ema
             if is_spike:
                 n_skipped += 1
                 optimizer.zero_grad()
@@ -428,6 +429,22 @@ class CachedTrainer:
                 continue
             # Only update EMA for non-spike batches
             self._loss_ema = 0.02 * raw_loss + 0.98 * self._loss_ema
+
+            # Mid-epoch instability detection: if running epoch loss is already
+            # >2x the EMA after a significant number of batches, abort early.
+            n_counted += 1
+            total_loss += raw_loss
+            if n_counted >= 50:
+                running_avg = total_loss / n_counted
+                if self._loss_ema > 0.05 and running_avg > 2.0 * self._loss_ema:
+                    logger.warning(
+                        f"  Mid-epoch abort: running loss {running_avg:.4f} > "
+                        f"2x EMA {self._loss_ema:.4f} after {n_counted} batches"
+                    )
+                    optimizer.zero_grad()
+                    # Signal the epoch loop to rollback
+                    return {"loss": running_avg, "macro_f1": 0.0, "cls_loss": 0.0,
+                            "reg_loss": 0.0, "spearman": 0.0, "_aborted": True}
 
             self.scaler.scale(loss).backward()
             accum_count += 1
@@ -450,7 +467,6 @@ class CachedTrainer:
                 optimizer.zero_grad()
                 accum_count = 0
 
-            total_loss += loss.item() * grad_accum_steps
             total_cls_loss += cls_l
             total_reg_loss += reg_l
             all_preds.extend(logits.argmax(dim=-1).cpu().numpy())
@@ -458,12 +474,12 @@ class CachedTrainer:
             if reg_pred is not None:
                 all_reg_preds.extend(reg_pred.detach().float().cpu().numpy())
                 all_dms_targets.extend(batch["dms_scores"].cpu().numpy())
-            pbar.set_postfix({"loss": f"{loss.item() * grad_accum_steps:.4f}"})
+            pbar.set_postfix({"loss": f"{raw_loss:.4f}"})
 
         if n_skipped > 0:
-            logger.warning(f"  Skipped {n_skipped} spike batches (loss > 4x EMA)")
+            logger.warning(f"  Skipped {n_skipped} spike batches (loss > 3x EMA)")
 
-        n_batches = max(len(self.train_loader) - n_skipped, 1)
+        n_batches = max(n_counted, 1)
         metrics = compute_metrics(np.array(all_preds), np.array(all_labels))
         metrics["loss"] = total_loss / n_batches
         metrics["cls_loss"] = total_cls_loss / n_batches
@@ -609,6 +625,23 @@ class CachedTrainer:
             self._current_epoch = epoch
             logger.info(f"Epoch {epoch}/{max_epochs}")
             train_m = self._train_epoch(optimizer, grad_accum_steps)
+
+            # Mid-epoch abort: restore best weights and retry this epoch
+            if train_m.get("_aborted"):
+                logger.warning(f"  Restoring best weights after mid-epoch abort")
+                if ckpt_path.exists():
+                    ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=True)
+                    self.comparison.load_state_dict(ckpt["comparison_state_dict"])
+                    self.classifier.load_state_dict(ckpt["classifier_state_dict"])
+                    if "feature_norm_state_dict" in ckpt:
+                        self.feature_norm.load_state_dict(ckpt["feature_norm_state_dict"])
+                    if self.cross_attn is not None and "cross_attn_state_dict" in ckpt:
+                        self.cross_attn.load_state_dict(ckpt["cross_attn_state_dict"])
+                    if self.regressor is not None and "regressor_state_dict" in ckpt:
+                        self.regressor.load_state_dict(ckpt["regressor_state_dict"])
+                scheduler.step()
+                continue
+
             val_m = self._eval_epoch()
             scheduler.step()
 
