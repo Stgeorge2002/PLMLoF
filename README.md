@@ -59,12 +59,7 @@ Outputs: `data/embeddings/train_embeddings.pt` and `val_embeddings.pt`.
 ### 4. Train (fast cached mode)
 
 ```bash
-python scripts/train.py \
-  --config configs/runpod_training.yaml \
-  --model-config configs/runpod_model.yaml \
-  --precomputed data/embeddings/ \
-  --mixed-precision fp16 \
-  --output-dir outputs/production/
+ 
 ```
 
 Checkpoint saved to `outputs/production/checkpoints/model_best.pt` on best validation macro-F1.
