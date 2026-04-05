@@ -269,7 +269,7 @@ def run_logistic_regression(train: dict, test: dict) -> dict:
     X_test = scaler.transform(X_test)
 
     clf = LogisticRegression(
-        C=1.0, max_iter=1000, solver="lbfgs", n_jobs=-1,
+        C=1.0, max_iter=3000, solver="lbfgs",
     )
     clf.fit(X_train, y_train)
 
@@ -308,7 +308,8 @@ def run_random_forest(train: dict, test: dict) -> dict:
 
 class _SimpleMLP(nn.Module):
     """2-layer MLP baseline — same capacity as ClassifierHead but no
-    ComparisonModule, no cross-attention, no LayerNorm on features."""
+    ComparisonModule, no cross-attention, no LayerNorm on features.
+    Includes optional regression head for DMS z-score prediction."""
 
     def __init__(self, input_size: int, hidden_dims=(512, 128), num_classes=3, dropout=0.2):
         super().__init__()
@@ -317,19 +318,25 @@ class _SimpleMLP(nn.Module):
         for dim in hidden_dims:
             layers += [nn.Linear(prev, dim), nn.ReLU(), nn.Dropout(dropout)]
             prev = dim
-        layers.append(nn.Linear(prev, num_classes))
-        self.net = nn.Sequential(*layers)
+        self.backbone = nn.Sequential(*layers)
+        self.cls_head = nn.Linear(prev, num_classes)
+        self.reg_head = nn.Sequential(
+            nn.Linear(prev, 64), nn.ReLU(), nn.Linear(64, 1),
+        )
 
     def forward(self, x):
-        return self.net(x)
+        h = self.backbone(x)
+        return self.cls_head(h), self.reg_head(h).squeeze(-1)
 
 
 def run_simple_mlp(train: dict, test: dict, device: str) -> dict:
-    """Train a simple MLP on concatenated ESM2 embeddings (no comparison module)."""
+    """Train a simple MLP on concatenated ESM2 embeddings (no comparison module).
+    Joint classification + regression to match PLMLoF's multi-task setup."""
     logger.info("Training simple MLP baseline...")
     X_train = _make_flat_features(train, mode="full")
     X_test = _make_flat_features(test, mode="full")
     y_train, y_test = train["labels"], test["labels"]
+    dms_train, dms_test = train["dms_scores"], test["dms_scores"]
 
     # Standardize
     mean = X_train.mean(axis=0)
@@ -340,38 +347,39 @@ def run_simple_mlp(train: dict, test: dict, device: str) -> dict:
     input_size = X_train_s.shape[1]
     model = _SimpleMLP(input_size).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=30, eta_min=1e-6)
+    cls_criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
+    reg_criterion = nn.SmoothL1Loss()
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50, eta_min=1e-6)
 
     train_X = torch.tensor(X_train_s, dtype=torch.float32)
     train_y = torch.tensor(y_train, dtype=torch.long)
-    train_ds = torch.utils.data.TensorDataset(train_X, train_y)
+    train_dms = torch.tensor(dms_train, dtype=torch.float32)
+    train_ds = torch.utils.data.TensorDataset(train_X, train_y, train_dms)
     train_loader = DataLoader(train_ds, batch_size=512, shuffle=True)
 
-    # Train for 30 epochs
+    # Train for 50 epochs with joint classification + regression (weight=0.1)
     model.train()
-    for epoch in range(30):
-        total_loss = 0.0
-        for xb, yb in train_loader:
-            xb, yb = xb.to(device), yb.to(device)
-            logits = model(xb)
-            loss = criterion(logits, yb)
+    for epoch in range(50):
+        for xb, yb, db in train_loader:
+            xb, yb, db = xb.to(device), yb.to(device), db.to(device)
+            logits, reg_out = model(xb)
+            loss = cls_criterion(logits, yb) + 0.1 * reg_criterion(reg_out, db)
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            total_loss += loss.item()
         scheduler.step()
 
     # Evaluate
     model.eval()
     test_X = torch.tensor(X_test_s, dtype=torch.float32).to(device)
     with torch.no_grad():
-        logits = model(test_X)
+        logits, reg_out = model(test_X)
         probs = torch.softmax(logits, dim=-1).cpu().numpy()
         preds = logits.argmax(dim=-1).cpu().numpy()
+        dms_preds = reg_out.cpu().numpy()
 
-    return _compute_all_metrics(preds, y_test, probs)
+    return _compute_all_metrics(preds, y_test, probs, dms_preds, dms_test)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -379,25 +387,27 @@ def run_simple_mlp(train: dict, test: dict, device: str) -> dict:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def run_plmlof(
-    checkpoint_path: str, test_data_path: str, device: str,
+    checkpoint_path: str, test: dict, device: str,
 ) -> dict:
-    """Load PLMLoF checkpoint and evaluate on the test set (cached path)."""
+    """Load PLMLoF checkpoint and evaluate using cached test embeddings.
+
+    Uses the same precomputed ESM2 embeddings as other baselines for fair
+    timing comparison, then runs them through the trained comparison module,
+    cross-attention, classifier head, and regression head.
+    """
     from plmlof.models.comparison import ComparisonModule, PooledCrossAttention
     from plmlof.models.classifier import ClassifierHead, RegressionHead
     from plmlof.data.features import NUM_NUCLEOTIDE_FEATURES
-    from plmlof.data.dataset import PLMLoFDataset
-    from transformers import AutoTokenizer, AutoModel
 
-    logger.info("Evaluating PLMLoF checkpoint...")
+    logger.info("Evaluating PLMLoF checkpoint (cached embeddings)...")
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     if not ckpt.get("cached_training"):
         raise ValueError("Only cached-training checkpoints are supported")
 
     model_cfg = ckpt.get("model_config", {})
-    esm2_name = model_cfg.get("esm2_model_name", "facebook/esm2_t33_650M_UR50D")
     pool_strategy = model_cfg.get("pool_strategy", "mean_max")
 
-    # Reconstruct model
+    # Reconstruct model components
     comparison_state = ckpt["comparison_state_dict"]
     pre_norm_shape = comparison_state["_pre_norm.weight"].shape[0]
     hidden_size = pre_norm_shape // 8 if pool_strategy == "mean_max" else pre_norm_shape // 4
@@ -440,81 +450,49 @@ def run_plmlof(
     if regressor is not None:
         regressor = regressor.to(dev).eval()
 
-    # Load ESM2 for embedding the test set
-    tokenizer = AutoTokenizer.from_pretrained(esm2_name)
-    esm2 = AutoModel.from_pretrained(esm2_name).to(dev).eval()
-    for p in esm2.parameters():
-        p.requires_grad = False
+    # Use cached embeddings — same precomputed tensors as other baselines
+    ref_mean_t = torch.tensor(test["ref_mean"], dtype=torch.float32)
+    ref_max_t = torch.tensor(test["ref_max"], dtype=torch.float32)
+    var_mean_t = torch.tensor(test["var_mean"], dtype=torch.float32)
+    var_max_t = torch.tensor(test["var_max"], dtype=torch.float32)
+    nuc_t = torch.tensor(test["nuc_features"], dtype=torch.float32)
+    labels = test["labels"]
+    dms_targets = test["dms_scores"]
 
-    dataset = PLMLoFDataset(test_data_path)
-
-    def _collate(batch):
-        ref_seqs = [s["ref_protein"] for s in batch]
-        var_seqs = [s["var_protein"] for s in batch]
-        enc = tokenizer(ref_seqs + var_seqs, padding=True, truncation=True,
-                        max_length=1024, return_tensors="pt")
-        return {
-            "input_ids": enc["input_ids"],
-            "attention_mask": enc["attention_mask"],
-            "n_ref": len(ref_seqs),
-            "nucleotide_features": torch.stack([s["nucleotide_features"] for s in batch]),
-            "labels": torch.tensor([s["label"] for s in batch], dtype=torch.long),
-            "dms_scores": torch.tensor([s.get("dms_score", 0.0) for s in batch], dtype=torch.float32),
-        }
-
-    loader = DataLoader(dataset, batch_size=16, collate_fn=_collate, num_workers=4, pin_memory=True)
-
-    all_preds, all_labels, all_probs = [], [], []
-    all_reg_preds, all_dms_targets = [], []
-
-    def _pool(emb, mask):
-        m_f = mask.unsqueeze(-1).float()
-        mean_p = (emb * m_f).sum(1) / m_f.sum(1).clamp(min=1)
-        emb_masked = emb.masked_fill(~mask.unsqueeze(-1).bool(), float("-inf"))
-        max_p = emb_masked.max(dim=1).values
-        max_p = max_p.masked_fill(max_p == float("-inf"), 0.0)
-        return mean_p, max_p
+    batch_size = 512
+    n = len(labels)
+    all_preds, all_probs, all_reg_preds = [], [], []
 
     with torch.no_grad():
-        for batch in tqdm(loader, desc="PLMLoF eval"):
-            ids = batch["input_ids"].to(dev, non_blocking=True)
-            mask = batch["attention_mask"].to(dev, non_blocking=True)
-            n_ref = batch["n_ref"]
-            nuc = batch["nucleotide_features"].to(dev, non_blocking=True)
-
-            with torch.amp.autocast("cuda", dtype=torch.float16, enabled=dev.type == "cuda"):
-                out = esm2(ids, attention_mask=mask).last_hidden_state
-
-            ref_out, var_out = out[:n_ref], out[n_ref:]
-            ref_mask, var_mask = mask[:n_ref], mask[n_ref:]
-            ref_mean, ref_max = _pool(ref_out, ref_mask)
-            var_mean, var_max = _pool(var_out, var_mask)
+        for i in tqdm(range(0, n, batch_size), desc="PLMLoF eval (cached)"):
+            j = min(i + batch_size, n)
+            rm = ref_mean_t[i:j].to(dev)
+            rx = ref_max_t[i:j].to(dev)
+            vm = var_mean_t[i:j].to(dev)
+            vx = var_max_t[i:j].to(dev)
+            nf = nuc_t[i:j].to(dev)
 
             if cross_attn is not None:
-                tokens = torch.stack([ref_mean, ref_max, var_mean, var_max], dim=1)
+                tokens = torch.stack([rm, rx, vm, vx], dim=1)
                 tokens = cross_attn(tokens)
-                ref_mean, ref_max, var_mean, var_max = tokens[:, 0], tokens[:, 1], tokens[:, 2], tokens[:, 3]
+                rm, rx, vm, vx = tokens[:, 0], tokens[:, 1], tokens[:, 2], tokens[:, 3]
 
-            ref_pool = torch.cat([ref_mean, ref_max], dim=-1)
-            var_pool = torch.cat([var_mean, var_max], dim=-1)
+            ref_pool = torch.cat([rm, rx], dim=-1)
+            var_pool = torch.cat([vm, vx], dim=-1)
             comp = torch.cat([ref_pool - var_pool, ref_pool * var_pool, ref_pool, var_pool], dim=-1)
             comp = comparison.project(comp)
-            features = torch.cat([comp, feature_norm(nuc)], dim=-1)
+            features = torch.cat([comp, feature_norm(nf)], dim=-1)
             logits = classifier(features)
 
-            all_probs.extend(torch.softmax(logits, dim=-1).float().cpu().numpy())
-            all_preds.extend(logits.argmax(dim=-1).cpu().numpy())
-            all_labels.extend(batch["labels"].numpy())
+            all_probs.append(torch.softmax(logits, dim=-1).float().cpu().numpy())
+            all_preds.append(logits.argmax(dim=-1).cpu().numpy())
 
             if regressor is not None:
-                all_reg_preds.extend(regressor(features).float().cpu().numpy())
-                all_dms_targets.extend(batch["dms_scores"].numpy())
+                all_reg_preds.append(regressor(features).squeeze(-1).float().cpu().numpy())
 
-    preds = np.array(all_preds)
-    labels = np.array(all_labels)
-    probs = np.array(all_probs)
-    reg_preds = np.array(all_reg_preds) if all_reg_preds else None
-    dms_targets = np.array(all_dms_targets) if all_dms_targets else None
+    preds = np.concatenate(all_preds)
+    probs = np.concatenate(all_probs)
+    reg_preds = np.concatenate(all_reg_preds) if all_reg_preds else None
 
     return _compute_all_metrics(preds, labels, probs, reg_preds, dms_targets)
 
@@ -663,7 +641,7 @@ def main():
         "random_forest": ("Random Forest (ESM2 + features)", lambda: run_random_forest(train, test)),
         "simple_mlp": ("Simple MLP (ESM2 + features, no comparison)", lambda: run_simple_mlp(train, test, device)),
         "esm1v": ("ESM-1v Zero-Shot (masked marginal)", lambda: run_esm1v_zeroshot(args.test_data, device)),
-        "plmlof": ("PLMLoF (ours)", lambda: run_plmlof(args.checkpoint, args.test_data, device)),
+        "plmlof": ("PLMLoF (ours)", lambda: run_plmlof(args.checkpoint, test, device)),
     }
 
     run_order = ["logistic_regression", "random_forest", "simple_mlp"]
