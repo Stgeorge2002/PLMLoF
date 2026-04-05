@@ -273,7 +273,19 @@ def main():
             logger.error(f"Checkpoint not found: {ckpt_path}")
             sys.exit(1)
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model_state_dict"])
+        if "model_state_dict" in ckpt:
+            model.load_state_dict(ckpt["model_state_dict"])
+        elif ckpt.get("cached_training"):
+            # Checkpoint from CachedTrainer — load submodule weights
+            model.comparison.load_state_dict(ckpt["comparison_state_dict"])
+            model.classifier.load_state_dict(ckpt["classifier_state_dict"])
+            if "feature_norm_state_dict" in ckpt:
+                model.feature_norm.load_state_dict(ckpt["feature_norm_state_dict"])
+            if "cross_attn_state_dict" in ckpt and hasattr(model.comparison, 'cross_attn'):
+                model.comparison.cross_attn.load_state_dict(ckpt["cross_attn_state_dict"])
+        else:
+            logger.error(f"Unknown checkpoint format: keys={list(ckpt.keys())}")
+            sys.exit(1)
         logger.info(f"Loaded checkpoint from {ckpt_path} (epoch {ckpt.get('epoch', '?')})")
 
     # Stage 1: Classification head only (ESM2 frozen)
