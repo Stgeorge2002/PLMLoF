@@ -642,13 +642,18 @@ def main():
     train = _load_cached_split(train_emb_path)
     logger.info(f"Loaded training embeddings: {len(train['labels'])} samples")
 
-    # Load or compute test embeddings
-    if args.test_embeddings and Path(args.test_embeddings).exists():
-        test = _load_cached_split(Path(args.test_embeddings))
-        logger.info(f"Loaded test embeddings: {len(test['labels'])} samples")
+    # Load or compute test embeddings — auto-cache to avoid recomputing
+    auto_cache = Path(args.train_embeddings).parent / "test_embeddings.pt"
+    test_emb_path = Path(args.test_embeddings) if args.test_embeddings else auto_cache
+    if test_emb_path.exists():
+        test = _load_cached_split(test_emb_path)
+        logger.info(f"Loaded test embeddings from {test_emb_path}: {len(test['labels'])} samples")
     else:
         test = _compute_test_embeddings(args.test_data, device)
         logger.info(f"Computed test embeddings: {len(test['labels'])} samples")
+        # Save for future runs
+        torch.save({k: torch.tensor(v) for k, v in test.items()}, test_emb_path)
+        logger.info(f"Saved test embeddings to {test_emb_path}")
 
     results = {}
 
