@@ -45,6 +45,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--precomputed", type=str, default=None,
                         help="Path to pre-computed embeddings dir (from precompute_embeddings.py). "
                              "Trains comparison+classifier only — no ESM2 forward passes.")
+    parser.add_argument("--stage2-only", action="store_true",
+                        help="Skip Stage 1 and run only Stage 2 (LoRA fine-tuning). "
+                             "Requires --checkpoint to load Stage 1 weights.")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Path to checkpoint .pt file to resume from.")
     return parser.parse_args()
 
 
@@ -261,17 +266,33 @@ def main():
         "lora_config": lora_config,
     }
 
+    # Load checkpoint if provided
+    if args.checkpoint:
+        ckpt_path = Path(args.checkpoint)
+        if not ckpt_path.exists():
+            logger.error(f"Checkpoint not found: {ckpt_path}")
+            sys.exit(1)
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        logger.info(f"Loaded checkpoint from {ckpt_path} (epoch {ckpt.get('epoch', '?')})")
+
     # Stage 1: Classification head only (ESM2 frozen)
-    logger.info("=" * 60)
-    logger.info("STAGE 1: Training classification head (ESM2 frozen)")
-    logger.info("=" * 60)
-    trainer.train(
-        stage=1,
-        max_epochs=max_epochs_s1,
-        learning_rate=lr_s1,
-        patience=train_cfg.get("early_stopping_patience", 5),
-        grad_accum_steps=grad_accum_s1,
-    )
+    if not args.stage2_only:
+        logger.info("=" * 60)
+        logger.info("STAGE 1: Training classification head (ESM2 frozen)")
+        logger.info("=" * 60)
+        trainer.train(
+            stage=1,
+            max_epochs=max_epochs_s1,
+            learning_rate=lr_s1,
+            patience=train_cfg.get("early_stopping_patience", 5),
+            grad_accum_steps=grad_accum_s1,
+        )
+    else:
+        if not args.checkpoint:
+            logger.error("--stage2-only requires --checkpoint to load Stage 1 weights")
+            sys.exit(1)
+        logger.info("Skipping Stage 1 (--stage2-only)")
 
     # Stage 2: LoRA fine-tuning (skip in tiny mode or if no LoRA)
     if lora_config and not args.tiny:
