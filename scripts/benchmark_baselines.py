@@ -60,7 +60,7 @@ def _load_cached_split(path: Path) -> dict:
         "ref_max": data["ref_max"].numpy(),
         "var_mean": data["var_mean"].numpy(),
         "var_max": data["var_max"].numpy(),
-        "nuc_features": (data.get("nucleotide_features") or data.get("nuc_features")).numpy(),
+        "nuc_features": data["nucleotide_features" if "nucleotide_features" in data else "nuc_features"].numpy(),
         "labels": data["labels"].numpy(),
         "dms_scores": data.get("dms_scores", torch.zeros(len(data["labels"]))).numpy(),
     }
