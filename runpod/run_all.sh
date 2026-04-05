@@ -15,6 +15,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
+# Auto-activate PyTorch env if present (AWS Deep Learning AMI) and python not already on PATH
+if ! command -v python &>/dev/null && [[ -f /opt/pytorch/bin/activate ]]; then
+    source /opt/pytorch/bin/activate
+fi
+
 # ── Logging setup ──
 LOG_DIR="$PROJECT_DIR/outputs/logs"
 mkdir -p "$LOG_DIR"
