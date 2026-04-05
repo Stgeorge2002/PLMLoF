@@ -269,8 +269,7 @@ def run_logistic_regression(train: dict, test: dict) -> dict:
     X_test = scaler.transform(X_test)
 
     clf = LogisticRegression(
-        C=1.0, max_iter=1000, solver="lbfgs",
-        multi_class="multinomial", n_jobs=-1,
+        C=1.0, max_iter=1000, solver="lbfgs", n_jobs=-1,
     )
     clf.fit(X_train, y_train)
 
