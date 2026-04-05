@@ -1,5 +1,5 @@
-# PLMLoF requirements — pinned for RunPod reproducibility
-torch>=2.0,<2.5
+# PLMLoF requirements
+torch>=2.0
 transformers>=4.30,<5.0
 peft>=0.7,<1.0
 datasets>=2.14
