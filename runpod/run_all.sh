@@ -40,8 +40,10 @@ for arg in "$@"; do
 done
 
 # ── Env setup ──
-export HF_HOME="${HF_HOME:-/workspace/.cache/huggingface}"
-export TORCH_HOME="${TORCH_HOME:-/workspace/.cache/torch}"
+# Default cache to $HOME/.cache so it works on both RunPod (/workspace) and EC2 (~)
+DEFAULT_CACHE_DIR="${WORKSPACE_DIR:-$HOME}/.cache"
+export HF_HOME="${HF_HOME:-$DEFAULT_CACHE_DIR/huggingface}"
+export TORCH_HOME="${TORCH_HOME:-$DEFAULT_CACHE_DIR/torch}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/hub}"
 
 # Paths

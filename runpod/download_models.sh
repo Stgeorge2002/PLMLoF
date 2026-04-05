@@ -9,7 +9,8 @@
 
 set -euo pipefail
 
-export HF_HOME="${HF_HOME:-/workspace/.cache/huggingface}"
+DEFAULT_CACHE_DIR="${WORKSPACE_DIR:-$HOME}/.cache"
+export HF_HOME="${HF_HOME:-$DEFAULT_CACHE_DIR/huggingface}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/hub}"
 mkdir -p "$HF_HOME" "$TRANSFORMERS_CACHE"
 
