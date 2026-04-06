@@ -42,6 +42,11 @@ class ESM2Encoder(nn.Module):
 
         self._lora_enabled = lora_config is not None
 
+        # Enable gradient checkpointing to reduce VRAM during fine-tuning
+        if lora_config is not None:
+            self.model.enable_input_require_grads()
+            self.model.gradient_checkpointing_enable()
+
     @property
     def device(self) -> torch.device:
         return next(self.model.parameters()).device
