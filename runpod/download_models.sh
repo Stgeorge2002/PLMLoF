@@ -11,8 +11,8 @@ set -euo pipefail
 
 DEFAULT_CACHE_DIR="${WORKSPACE_DIR:-$HOME}/.cache"
 export HF_HOME="${HF_HOME:-$DEFAULT_CACHE_DIR/huggingface}"
-export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/hub}"
-mkdir -p "$HF_HOME" "$TRANSFORMERS_CACHE"
+# HF_HOME is sufficient; TRANSFORMERS_CACHE is deprecated in transformers v4+.
+mkdir -p "$HF_HOME"
 
 MODE="${1:---production}"
 

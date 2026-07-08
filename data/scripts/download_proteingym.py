@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import io
 import logging
+import ssl
 import zipfile
 from pathlib import Path
 from urllib.request import urlopen, Request
@@ -91,13 +92,36 @@ _TEM1_MUTATIONS_FALLBACK = [
 ]
 
 
+def _make_ssl_context() -> ssl.SSLContext:
+    """Build an SSL context using certifi CA bundle when available.
+
+    RunPod Docker images sometimes lack the system root certificates that
+    marks.hms.harvard.edu requires.  certifi ships its own bundle which
+    works regardless of the host CA store.
+    """
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except (ImportError, Exception):
+        pass
+    try:
+        return ssl.create_default_context()
+    except Exception:
+        pass
+    # Last resort — skip verification (logs a warning)
+    ctx = ssl._create_unverified_context()  # noqa: S501
+    logger.warning("SSL certificate verification disabled (certifi not available)")
+    return ctx
+
+
 def _download_with_fallback(urls: list[str], dest_path: Path) -> bool:
     """Try downloading from multiple URLs using chunked streaming; return True on success."""
+    ssl_ctx = _make_ssl_context()
     for url in urls:
         logger.info(f"Trying: {url}")
         try:
             req = Request(url, headers={"User-Agent": "PLMLoF/1.0"})
-            response = urlopen(req, timeout=120)  # noqa: S310 — 120s per-chunk socket timeout
+            response = urlopen(req, timeout=120, context=ssl_ctx)  # noqa: S310 — 120s per-chunk socket timeout
             # Stream in 8 MB chunks so large ZIPs don't time out on slow connections
             CHUNK = 8 << 20
             chunks: list[bytes] = []
@@ -119,6 +143,41 @@ def _download_with_fallback(urls: list[str], dest_path: Path) -> bool:
                 return True
         except Exception as e:
             logger.warning(f"Failed ({url}): {e}")
+    return False
+
+
+def _download_zip_via_hf_hub(dest_path: Path) -> bool:
+    """Try downloading the ProteinGym substitutions ZIP via huggingface_hub.
+
+    huggingface_hub handles LFS files, authentication, and resumable downloads
+    better than raw HTTP — use it as the last fallback for the large ZIP.
+    """
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        logger.debug("huggingface_hub not available")
+        return False
+
+    repo_id = "OATML-Markslab/ProteinGym_v0.1"
+    candidates = [
+        "DMS_ProteinGym_substitutions.zip",
+        "ProteinGym_substitutions/DMS_ProteinGym_substitutions.zip",
+        "substitution_data/DMS_ProteinGym_substitutions.zip",
+    ]
+    for filename in candidates:
+        try:
+            logger.info(f"Trying HF Hub: {repo_id}/{filename}")
+            local = hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                repo_type="dataset",
+            )
+            import shutil
+            shutil.copy(local, dest_path)
+            logger.info(f"Downloaded via HF Hub → {dest_path}")
+            return True
+        except Exception as e:
+            logger.debug(f"  {filename}: {e}")
     return False
 
 
@@ -151,7 +210,11 @@ def download_proteingym_scores(output_dir: Path = OUTPUT_DIR) -> Path:
 
     if not zip_path.exists():
         logger.info("Downloading ProteinGym substitution scores...")
-        if not _download_with_fallback(PROTEINGYM_SUBS_URLS, zip_path):
+        success = _download_with_fallback(PROTEINGYM_SUBS_URLS, zip_path)
+        if not success:
+            logger.info("Trying HuggingFace Hub as final fallback...")
+            success = _download_zip_via_hf_hub(zip_path)
+        if not success:
             logger.warning("Could not download ProteinGym scores ZIP.")
             return extract_dir
 

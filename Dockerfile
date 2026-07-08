@@ -11,7 +11,7 @@ ENV PYTHONUNBUFFERED=1
 # Override at runtime: docker run -e HF_HOME=/custom/path ...
 ENV HF_HOME=/workspace/.cache/huggingface
 ENV TORCH_HOME=/workspace/.cache/torch
-ENV TRANSFORMERS_CACHE=/workspace/.cache/huggingface/hub
+# HF_HOME is sufficient; TRANSFORMERS_CACHE is deprecated in transformers v4+.
 
 WORKDIR /workspace/PLMLoF
 

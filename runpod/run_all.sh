@@ -49,7 +49,7 @@ done
 DEFAULT_CACHE_DIR="${WORKSPACE_DIR:-$HOME}/.cache"
 export HF_HOME="${HF_HOME:-$DEFAULT_CACHE_DIR/huggingface}"
 export TORCH_HOME="${TORCH_HOME:-$DEFAULT_CACHE_DIR/torch}"
-export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/hub}"
+# HF_HOME is sufficient; TRANSFORMERS_CACHE is deprecated in transformers v4+.
 
 # Paths
 DATA_DIR="data/processed"
@@ -167,7 +167,7 @@ if [[ "$MODE" == "full" || "$MODE" == "train" || "$MODE" == "test" ]]; then
         PRECISION="fp16"
         if python -c "import torch; cap = torch.cuda.get_device_capability(); exit(0 if cap >= (8,0) else 1)" 2>/dev/null; then
             PRECISION="bf16"
-            echo "  A100/H100 detected — using bf16"
+            echo "  Ampere+ GPU detected (compute cap ≥ 8.0) — using bf16"
         fi
         python scripts/train.py \
             --config "$TRAIN_CFG" \

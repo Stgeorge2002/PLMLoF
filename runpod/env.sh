@@ -6,7 +6,8 @@
 # ── Persistent cache directories (survive pod restarts) ──
 export HF_HOME="${HF_HOME:-/workspace/.cache/huggingface}"
 export TORCH_HOME="${TORCH_HOME:-/workspace/.cache/torch}"
-export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/hub}"
+# HF_HOME is sufficient; HF_HUB_CACHE is derived from it automatically.
+# TRANSFORMERS_CACHE is deprecated in transformers v4+ — do not set it.
 
 # ── CUDA settings ──
 export CUDA_LAUNCH_BLOCKING=0
@@ -24,4 +25,4 @@ export TOKENIZERS_PARALLELISM=true
 # export WANDB_ENTITY="your-entity"
 
 # ── Create cache dirs ──
-mkdir -p "$HF_HOME" "$TORCH_HOME" "$TRANSFORMERS_CACHE"
+mkdir -p "$HF_HOME" "$TORCH_HOME"
