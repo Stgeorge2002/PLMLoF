@@ -152,13 +152,18 @@ def main():
         val_dataset = CachedEmbeddingDataset(val_cache) if val_cache.exists() else train_dataset
         logger.info(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
 
+        # Respect --num-workers flag (or auto-detect) in cached mode too
+        cached_workers = args.num_workers
+        if cached_workers is None:
+            cached_workers = 4 if device == "cuda" else 0
+
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size_s1 * 4, shuffle=True,
-            num_workers=4, pin_memory=(device == "cuda"),
+            num_workers=cached_workers, pin_memory=(device == "cuda"),
         )
         val_loader = DataLoader(
             val_dataset, batch_size=batch_size_s1 * 4, shuffle=False,
-            num_workers=4, pin_memory=(device == "cuda"),
+            num_workers=cached_workers, pin_memory=(device == "cuda"),
         )
 
         # Build lightweight model (comparison + classifier only)
@@ -255,6 +260,7 @@ def main():
         output_dir=output_dir,
         label_smoothing=model_cfg.get("classifier", {}).get("label_smoothing", 0.05),
         mixed_precision=mixed_precision,
+        focal_gamma=train_cfg.get("focal_gamma", 0.0),
     )
 
     # Save model config for later reconstruction during inference/eval

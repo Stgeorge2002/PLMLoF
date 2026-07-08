@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from plmlof.models.plmlof_model import PLMLoFModel
+from plmlof.models.classifier import FocalLoss
 from plmlof.training.metrics import compute_metrics
 
 
@@ -38,6 +39,7 @@ class PLMLoFTrainer:
         class_weights: list[float] | None = None,
         label_smoothing: float = 0.0,
         mixed_precision: str = "no",
+        focal_gamma: float = 0.0,
     ):
         self.model = model.to(device)
         self.train_loader = train_loader
@@ -46,11 +48,12 @@ class PLMLoFTrainer:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Loss with optional class weights
+        # Loss — FocalLoss with gamma=0 is mathematically equivalent to CrossEntropyLoss.
+        # Set focal_gamma > 0 to down-weight easy examples (useful for imbalanced datasets).
         weight = None
         if class_weights is not None:
             weight = torch.tensor(class_weights, dtype=torch.float32, device=self.device)
-        self.criterion = nn.CrossEntropyLoss(weight=weight, label_smoothing=label_smoothing)
+        self.criterion = FocalLoss(gamma=focal_gamma, label_smoothing=label_smoothing, weight=weight)
 
         self.best_metric = 0.0
         self.best_epoch = -1
@@ -312,9 +315,9 @@ class CachedTrainer:
                 dropout=cross_attn_dropout,
             ).to(self.device)
 
-        # CrossEntropyLoss — balanced data doesn't benefit from focal loss
-        # (focal loss reduces gradient magnitude, causing mode collapse on balanced data)
-        self.criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+        # FocalLoss with gamma=0 is equivalent to CrossEntropyLoss (no down-weighting).
+        # Set focal_gamma > 0 to focus on hard examples (useful for imbalanced datasets).
+        self.criterion = FocalLoss(gamma=focal_gamma, label_smoothing=label_smoothing)
         self.reg_criterion = nn.SmoothL1Loss()
         self.best_metric = 0.0
         self.best_epoch = -1

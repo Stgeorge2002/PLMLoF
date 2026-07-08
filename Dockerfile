@@ -7,6 +7,8 @@ LABEL maintainer="PLMLoF" \
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
+# Cache defaults target RunPod's persistent /workspace volume.
+# Override at runtime: docker run -e HF_HOME=/custom/path ...
 ENV HF_HOME=/workspace/.cache/huggingface
 ENV TORCH_HOME=/workspace/.cache/torch
 ENV TRANSFORMERS_CACHE=/workspace/.cache/huggingface/hub
@@ -22,7 +24,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     htop \
     tmux \
     build-essential \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    # Ensure /workspace cache dirs exist even when not mounted (non-RunPod usage)
+    && mkdir -p /workspace/.cache/huggingface/hub /workspace/.cache/torch
 
 # Copy requirements first for layer caching
 COPY requirements.txt .

@@ -133,6 +133,17 @@ def stratified_split(
         remaining_df = df
         holdout_df = pd.DataFrame()
 
+    # Guard: sklearn needs at least 1 / test_size samples to produce a non-empty train set.
+    min_needed = max(10, int(1 / test_size) + 1)
+    if len(remaining_df) < min_needed:
+        raise RuntimeError(
+            f"Dataset has only {len(remaining_df)} records — too small to split "
+            f"(need ≥ {min_needed}).\n"
+            "The ProteinGym download likely failed or returned no bacterial assays.\n"
+            "Re-run:  python data/scripts/download_proteingym.py\n"
+            "Then check data/raw/proteingym/ for non-empty CSV files."
+        )
+
     # Stratified split on label
     stratify_col = remaining_df["label"]
 

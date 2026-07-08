@@ -26,9 +26,12 @@ echo "CUDA:        $(python -c 'import torch; print(torch.version.cuda)' 2>/dev/
 echo ""
 
 # ── 1. Set cache directories to persistent storage ──
-export HF_HOME="${HF_HOME:-/workspace/.cache/huggingface}"
-export TORCH_HOME="${TORCH_HOME:-/workspace/.cache/torch}"
-export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/hub}"
+# Default: RunPod persistent volume at /workspace, or $HOME elsewhere.
+# Override by setting WORKSPACE_DIR before running this script.
+CACHE_BASE="${WORKSPACE_DIR:-${HOME}}"
+export HF_HOME="${HF_HOME:-${CACHE_BASE}/.cache/huggingface}"
+export TORCH_HOME="${TORCH_HOME:-${CACHE_BASE}/.cache/torch}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/hub}"
 mkdir -p "$HF_HOME" "$TORCH_HOME" "$TRANSFORMERS_CACHE"
 echo "Cache dirs:"
 echo "  HF_HOME=$HF_HOME"

@@ -225,12 +225,25 @@ echo "=============================================="
 if [[ -n "${S3_BUCKET:-}" ]]; then
     echo ""
     echo "──────── Step 5: Sync to S3 ────────"
-    S3_DEST="s3://${S3_BUCKET}/plmlof-runs/$(date +%Y%m%d_%H%M%S)"
-    echo "Syncing outputs → $S3_DEST"
-    aws s3 sync "$OUTPUT_DIR" "$S3_DEST" \
-        --exclude '*.tmp' \
-        --no-progress
-    echo "S3 sync complete: $S3_DEST"
+
+    # Validate AWS CLI is installed
+    if ! command -v aws &>/dev/null; then
+        echo "ERROR: S3_BUCKET is set but 'aws' CLI is not installed. Skipping S3 sync."
+        echo "  Install with: pip install awscli  or  apt-get install awscli"
+    else
+        # Validate credentials are working before attempting sync
+        if ! aws sts get-caller-identity &>/dev/null; then
+            echo "ERROR: AWS credentials are invalid or not configured. Skipping S3 sync."
+            echo "  Set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_DEFAULT_REGION in runpod/env.sh"
+        else
+            S3_DEST="s3://${S3_BUCKET}/plmlof-runs/$(date +%Y%m%d_%H%M%S)"
+            echo "Syncing outputs → $S3_DEST"
+            aws s3 sync "$OUTPUT_DIR" "$S3_DEST" \
+                --exclude '*.tmp' \
+                --no-progress
+            echo "S3 sync complete: $S3_DEST"
+        fi
+    fi
 else
     echo ""
     echo "Tip: set S3_BUCKET=your-bucket-name in runpod/env.sh to auto-sync outputs to AWS."

@@ -27,6 +27,14 @@ training:
   max_seq_length: 1024
   seed: 42
 
+  # Multi-task regression (DMS z-score prediction)
+  regression_weight: 0.1       # Weight of SmoothL1 regression loss vs CE classification loss
+  regression_warmup_epochs: 3  # Linearly ramp regression weight over first N epochs
+
+  # Focal loss (set gamma > 0 to enable; 0.0 = standard CrossEntropyLoss)
+  # Useful for imbalanced datasets; leave at 0.0 for balanced data
+  focal_gamma: 0.0
+
   # Class weights (auto-computed if null)
   class_weights: null
 

@@ -92,19 +92,33 @@ _TEM1_MUTATIONS_FALLBACK = [
 
 
 def _download_with_fallback(urls: list[str], dest_path: Path) -> bool:
-    """Try downloading from multiple URLs; return True on success."""
+    """Try downloading from multiple URLs using chunked streaming; return True on success."""
     for url in urls:
         logger.info(f"Trying: {url}")
         try:
             req = Request(url, headers={"User-Agent": "PLMLoF/1.0"})
-            response = urlopen(req, timeout=60)  # noqa: S310
-            data = response.read()
-            if len(data) > 100:
+            response = urlopen(req, timeout=120)  # noqa: S310 — 120s per-chunk socket timeout
+            # Stream in 8 MB chunks so large ZIPs don't time out on slow connections
+            CHUNK = 8 << 20
+            chunks: list[bytes] = []
+            total = 0
+            next_log = 50 << 20
+            while True:
+                chunk = response.read(CHUNK)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total >= next_log:
+                    logger.info(f"  Downloaded {total / 1e6:.0f} MB...")
+                    next_log += 50 << 20
+            data = b"".join(chunks)
+            if total > 100:
                 dest_path.write_bytes(data)
-                logger.info(f"Downloaded {len(data) / 1e6:.2f} MB")
+                logger.info(f"Downloaded {total / 1e6:.2f} MB → {dest_path}")
                 return True
         except Exception as e:
-            logger.warning(f"Failed: {e}")
+            logger.warning(f"Failed ({url}): {e}")
     return False
 
 
@@ -332,8 +346,16 @@ def _guess_species(dms_id: str) -> str:
     return ""
 
 
-def _apply_mutation_string(ref_protein: str, mutation: str) -> str:
-    """Apply a mutation string like 'A23T' or 'A23T:G45R' to a protein sequence."""
+def _apply_mutation_string(ref_protein: str, mutation: str, strict: bool = True) -> str:
+    """Apply a mutation string like 'A23T' or 'A23T:G45R' to a protein sequence.
+
+    Args:
+        ref_protein: Reference amino acid sequence.
+        mutation: Mutation string (e.g. 'M69I' or 'M69I:G238S').
+        strict: If True (default), skip any mutation where the reference amino acid
+            does not match.  Set False for synthetic/fallback data where the
+            positions are applied unconditionally.
+    """
     var = list(ref_protein)
     mutations = mutation.replace(";", ":").split(":")
 
@@ -348,8 +370,7 @@ def _apply_mutation_string(ref_protein: str, mutation: str) -> str:
         except ValueError:
             continue
         if 0 <= pos < len(var):
-            # Validate that the reference amino acid matches
-            if var[pos] != ref_aa:
+            if strict and var[pos] != ref_aa:
                 logger.debug(f"Mutation {mut}: expected {ref_aa} at pos {pos+1}, found {var[pos]}")
                 continue
             var[pos] = var_aa
@@ -358,10 +379,19 @@ def _apply_mutation_string(ref_protein: str, mutation: str) -> str:
 
 
 def _generate_fallback_data() -> pd.DataFrame:
-    """Generate bacterial DMS-like data from curated TEM-1 mutations as fallback."""
+    """Generate bacterial DMS-like data from curated TEM-1 mutations as fallback.
+
+    Uses strict=False so mutations are applied unconditionally — the position
+    numbering in _TEM1_MUTATIONS_FALLBACK uses Ambler/ProteinGym conventions
+    which may differ from the residues present in _TEM1_REF, but the resulting
+    variant sequences are still distinct and usable as synthetic training data.
+    """
     records = []
     for mut_str, label in _TEM1_MUTATIONS_FALLBACK:
-        var_protein = _apply_mutation_string(_TEM1_REF, mut_str)
+        var_protein = _apply_mutation_string(_TEM1_REF, mut_str, strict=False)
+        if var_protein == _TEM1_REF:
+            logger.debug(f"Mutation {mut_str} produced no change — skipping")
+            continue
         records.append({
             "gene": "TEM1_ECOLI",
             "species": "Escherichia coli",
@@ -370,6 +400,8 @@ def _generate_fallback_data() -> pd.DataFrame:
             "ref_dna": "",
             "var_dna": "",
             "label": label,
+            "dms_score": 0.0,
+            "dms_zscore": 0.0,
             "source": "ProteinGym_curated",
         })
     logger.info(f"Generated {len(records)} curated TEM-1 mutations as fallback")
