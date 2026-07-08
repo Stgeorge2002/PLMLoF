@@ -15,6 +15,7 @@ import logging
 import ssl
 import zipfile
 from pathlib import Path
+from urllib.error import URLError
 from urllib.request import urlopen, Request
 
 import pandas as pd
@@ -114,33 +115,58 @@ def _make_ssl_context() -> ssl.SSLContext:
     return ctx
 
 
+def _stream_url(url: str, ssl_ctx: ssl.SSLContext, dest_path: Path) -> bool:
+    """Stream a single URL to dest_path; return True on success."""
+    req = Request(url, headers={"User-Agent": "PLMLoF/1.0"})
+    response = urlopen(req, timeout=120, context=ssl_ctx)  # noqa: S310
+    CHUNK = 8 << 20
+    chunks: list[bytes] = []
+    total = 0
+    next_log = 50 << 20
+    while True:
+        chunk = response.read(CHUNK)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total >= next_log:
+            logger.info(f"  Downloaded {total / 1e6:.0f} MB...")
+            next_log += 50 << 20
+    data = b"".join(chunks)
+    if total > 100:
+        dest_path.write_bytes(data)
+        logger.info(f"Downloaded {total / 1e6:.2f} MB → {dest_path}")
+        return True
+    return False
+
+
 def _download_with_fallback(urls: list[str], dest_path: Path) -> bool:
-    """Try downloading from multiple URLs using chunked streaming; return True on success."""
+    """Try downloading from multiple URLs using chunked streaming; return True on success.
+
+    For SSL verification failures, automatically retries with certificate
+    verification disabled (marks.hms.harvard.edu uses an intermediate CA that
+    may not be present in the container's trust store).
+    """
     ssl_ctx = _make_ssl_context()
+    unverified_ctx = ssl._create_unverified_context()  # noqa: S501 — fallback only
+
     for url in urls:
         logger.info(f"Trying: {url}")
         try:
-            req = Request(url, headers={"User-Agent": "PLMLoF/1.0"})
-            response = urlopen(req, timeout=120, context=ssl_ctx)  # noqa: S310 — 120s per-chunk socket timeout
-            # Stream in 8 MB chunks so large ZIPs don't time out on slow connections
-            CHUNK = 8 << 20
-            chunks: list[bytes] = []
-            total = 0
-            next_log = 50 << 20
-            while True:
-                chunk = response.read(CHUNK)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                total += len(chunk)
-                if total >= next_log:
-                    logger.info(f"  Downloaded {total / 1e6:.0f} MB...")
-                    next_log += 50 << 20
-            data = b"".join(chunks)
-            if total > 100:
-                dest_path.write_bytes(data)
-                logger.info(f"Downloaded {total / 1e6:.2f} MB → {dest_path}")
-                return True
+            return _stream_url(url, ssl_ctx, dest_path)
+        except (ssl.SSLError, URLError) as e:
+            # URLError wraps SSLError when urllib can't open the connection
+            is_ssl = isinstance(e, ssl.SSLError) or (
+                isinstance(e, URLError) and isinstance(e.reason, ssl.SSLError)
+            )
+            if is_ssl:
+                logger.warning(f"SSL error ({url}): {e} — retrying without certificate verification")
+                try:
+                    return _stream_url(url, unverified_ctx, dest_path)
+                except Exception as e2:
+                    logger.warning(f"Failed ({url}): {e2}")
+            else:
+                logger.warning(f"Failed ({url}): {e}")
         except Exception as e:
             logger.warning(f"Failed ({url}): {e}")
     return False
