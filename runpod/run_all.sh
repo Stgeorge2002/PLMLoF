@@ -209,7 +209,7 @@ if [[ "$MODE" == "full" || "$MODE" == "train" || "$MODE" == "test" ]]; then
         echo "──────── Step 3b: Stage 2 LoRA Fine-tuning ────────"
         if [[ -f "$CHECKPOINT" ]]; then
             S2_EPOCH_FLAG=""
-            [[ -n "$S2_EPOCHS" ]] && S2_EPOCH_FLAG="--max-epochs $S2_EPOCHS"
+            [[ -n "$S2_EPOCHS" ]] && S2_EPOCH_FLAG="--s2-max-epochs $S2_EPOCHS"
             python scripts/train.py \
                 --config "$TRAIN_CFG" \
                 --model-config "$MODEL_CFG" \
