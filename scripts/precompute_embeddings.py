@@ -168,6 +168,14 @@ def _scatter_embeddings(
     logger.info(f"  Saved {n} samples → {output_path} ({size_mb:.1f} MB)")
 
 
+def _is_ampere(device: torch.device) -> bool:
+    """Return True if the device is Ampere or newer (compute capability >= 8.0)."""
+    if device.type != "cuda":
+        return False
+    major, _ = torch.cuda.get_device_capability(device)
+    return major >= 8
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     args = parse_args()
@@ -176,14 +184,6 @@ def main():
     if device.type == "cuda":
         logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
         torch.backends.cudnn.benchmark = True
-
-
-def _is_ampere(device: torch.device) -> bool:
-    """Return True if the device is Ampere or newer (compute capability >= 8.0)."""
-    if device.type != "cuda":
-        return False
-    major, _ = torch.cuda.get_device_capability(device)
-    return major >= 8
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
