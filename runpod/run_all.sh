@@ -4,6 +4,9 @@
 # Usage:
 #   bash runpod/run_all.sh              # Full pipeline (setup → data → embed → train → eval)
 #   bash runpod/run_all.sh --test       # Quick smoke test (ESM2-8M, synthetic, 2 epochs)
+#   bash runpod/run_all.sh --quick      # Fast validation run (30K samples, 20 S1 epochs, 2 S2 epochs)
+#   bash runpod/run_all.sh --scale 60   # Custom scale: 60K samples (default 300 for full)
+#   bash runpod/run_all.sh --s1-epochs 30 --s2-epochs 3  # Override epoch caps
 #   bash runpod/run_all.sh --data-only  # Download + curate data only
 #   bash runpod/run_all.sh --train-only # Train + eval only (assumes embeddings exist)
 #   bash runpod/run_all.sh --eval-only  # Evaluate only (assumes checkpoint exists)
@@ -30,18 +33,37 @@ echo "Logging to: $LOG_FILE"
 # ── Parse arguments ──
 MODE="full"
 SKIP_SETUP=false
-for arg in "$@"; do
+# Scale controls how many thousand training samples to use.
+# Default 300 (full 300K balanced dataset). --quick sets 30. --scale N overrides.
+SCALE=300
+S1_EPOCHS=""   # empty = use config default
+S2_EPOCHS=""   # empty = use config default
+
+ARGS=("$@")
+i=0
+while [[ $i -lt ${#ARGS[@]} ]]; do
+    arg="${ARGS[$i]}"
     case $arg in
         --test)        MODE="test" ;;
+        --quick)       SCALE=30; S1_EPOCHS=20; S2_EPOCHS=2 ;;
+        --scale)       i=$((i+1)); SCALE="${ARGS[$i]}" ;;
+        --s1-epochs)   i=$((i+1)); S1_EPOCHS="${ARGS[$i]}" ;;
+        --s2-epochs)   i=$((i+1)); S2_EPOCHS="${ARGS[$i]}" ;;
         --data-only)   MODE="data" ;;
         --train-only)  MODE="train" ;;
         --eval-only)   MODE="eval" ;;
         --skip-setup)  SKIP_SETUP=true ;;
         --help|-h)
-            echo "Usage: bash runpod/run_all.sh [--test|--data-only|--train-only|--eval-only] [--skip-setup]"
+            echo "Usage: bash runpod/run_all.sh [--test|--quick|--scale N|--s1-epochs N|--s2-epochs N|--data-only|--train-only|--eval-only] [--skip-setup]"
+            echo ""
+            echo "  --quick          30K samples, 20 Stage-1 epochs, 2 Stage-2 epochs (~1–2 hrs)"
+            echo "  --scale N        Use N*1000 samples total (default: 300 = full 300K)"
+            echo "  --s1-epochs N    Override Stage 1 max epochs (default: from config)"
+            echo "  --s2-epochs N    Override Stage 2 max epochs (default: from config)"
             exit 0
             ;;
     esac
+    i=$((i+1))
 done
 
 # ── Env setup ──
@@ -60,7 +82,9 @@ TRAIN_CFG="configs/runpod_training.yaml"
 MODEL_CFG="configs/runpod_model.yaml"
 
 echo "=============================================="
-echo " PLMLoF Pipeline — Mode: $MODE"
+echo " PLMLoF Pipeline — Mode: $MODE | Scale: ${SCALE}K samples"
+[[ -n "$S1_EPOCHS" ]] && echo " Stage 1 epochs: $S1_EPOCHS"
+[[ -n "$S2_EPOCHS" ]] && echo " Stage 2 epochs: $S2_EPOCHS"
 echo "=============================================="
 echo ""
 
@@ -102,8 +126,9 @@ if [[ "$MODE" == "full" || "$MODE" == "data" || "$MODE" == "test" ]]; then
         echo "Downloading ProteinGym data..."
         python data/scripts/download_proteingym.py || echo "  ProteinGym download failed, continuing..."
 
-        echo "Curating dataset (150K balanced)..."
-        python data/scripts/curate_dataset.py
+        TOTAL_SAMPLES=$(( SCALE * 1000 ))
+        echo "Curating dataset (${SCALE}K balanced = ${TOTAL_SAMPLES} samples)..."
+        python data/scripts/curate_dataset.py --total-samples "$TOTAL_SAMPLES"
 
         echo "Data files:"
         wc -l "$DATA_DIR"/*.parquet 2>/dev/null || true
@@ -169,17 +194,22 @@ if [[ "$MODE" == "full" || "$MODE" == "train" || "$MODE" == "test" ]]; then
             PRECISION="bf16"
             echo "  Ampere+ GPU detected (compute cap ≥ 8.0) — using bf16"
         fi
+        S1_EPOCH_FLAG=""
+        [[ -n "$S1_EPOCHS" ]] && S1_EPOCH_FLAG="--max-epochs $S1_EPOCHS"
         python scripts/train.py \
             --config "$TRAIN_CFG" \
             --model-config "$MODEL_CFG" \
             --precomputed "$EMB_DIR" \
             --device "$DEVICE" \
             --mixed-precision "$PRECISION" \
-            --output-dir "$OUTPUT_DIR"
+            --output-dir "$OUTPUT_DIR" \
+            $S1_EPOCH_FLAG
 
         # Stage 2: LoRA fine-tuning of ESM2 encoder (requires Stage 1 checkpoint)
         echo "──────── Step 3b: Stage 2 LoRA Fine-tuning ────────"
         if [[ -f "$CHECKPOINT" ]]; then
+            S2_EPOCH_FLAG=""
+            [[ -n "$S2_EPOCHS" ]] && S2_EPOCH_FLAG="--max-epochs $S2_EPOCHS"
             python scripts/train.py \
                 --config "$TRAIN_CFG" \
                 --model-config "$MODEL_CFG" \
@@ -189,7 +219,8 @@ if [[ "$MODE" == "full" || "$MODE" == "train" || "$MODE" == "test" ]]; then
                 --checkpoint "$CHECKPOINT" \
                 --device "$DEVICE" \
                 --mixed-precision "$PRECISION" \
-                --output-dir "$OUTPUT_DIR"
+                --output-dir "$OUTPUT_DIR" \
+                $S2_EPOCH_FLAG
         else
             echo "  No Stage 1 checkpoint at $CHECKPOINT — skipping Stage 2."
         fi

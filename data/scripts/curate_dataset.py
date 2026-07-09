@@ -37,12 +37,12 @@ def load_source(path: Path, source_name: str) -> pd.DataFrame:
     return df
 
 
-# Total samples and per-class target for balanced subsampling
-TOTAL_SAMPLES = 300_000
-SAMPLES_PER_CLASS = TOTAL_SAMPLES // 3  # 100,000 each
+# Total samples and per-class target for balanced subsampling.
+# Overridden at runtime by --total-samples CLI arg (or PLMLOF_TOTAL_SAMPLES env var).
+DEFAULT_TOTAL_SAMPLES = 300_000
 
 
-def merge_datasets() -> pd.DataFrame:
+def merge_datasets(total_samples: int = DEFAULT_TOTAL_SAMPLES) -> pd.DataFrame:
     """Load ProteinGym data and subsample to a balanced dataset."""
     path = PROCESSED_DIR / "proteingym_bacterial.parquet"
     df = load_source(path, "ProteinGym")
@@ -79,10 +79,11 @@ def merge_datasets() -> pd.DataFrame:
     logger.info(f"Full label distribution: LoF={label_counts.get(0, 0)}, WT={label_counts.get(1, 0)}, GoF={label_counts.get(2, 0)}")
 
     # Balanced subsample: equal thirds per class
+    samples_per_class = total_samples // 3
     balanced_dfs = []
     for label in [0, 1, 2]:
         class_df = df[df["label"] == label]
-        n = min(len(class_df), SAMPLES_PER_CLASS)
+        n = min(len(class_df), samples_per_class)
         balanced_dfs.append(class_df.sample(n=n, random_state=42))
         logger.info(f"  Label {label}: sampled {n} / {len(class_df)} available")
 
@@ -174,9 +175,18 @@ def stratified_split(
 
 
 def main():
-    logging.basicConfig(level=logging.INFO)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--total-samples", type=int, default=DEFAULT_TOTAL_SAMPLES,
+        help=f"Total balanced samples across LoF/WT/GoF (default: {DEFAULT_TOTAL_SAMPLES:,})",
+    )
+    args = parser.parse_args()
 
-    merged = merge_datasets()
+    logging.basicConfig(level=logging.INFO)
+    logger.info(f"Target dataset size: {args.total_samples:,} samples ({args.total_samples // 3:,} per class)")
+
+    merged = merge_datasets(total_samples=args.total_samples)
 
     train_df, val_df, test_df, holdout_df = stratified_split(
         merged,
