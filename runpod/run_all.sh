@@ -71,7 +71,8 @@ done
 DEFAULT_CACHE_DIR="${WORKSPACE_DIR:-$HOME}/.cache"
 export HF_HOME="${HF_HOME:-$DEFAULT_CACHE_DIR/huggingface}"
 export TORCH_HOME="${TORCH_HOME:-$DEFAULT_CACHE_DIR/torch}"
-# HF_HOME is sufficient; TRANSFORMERS_CACHE is deprecated in transformers v4+.
+# Reduce CUDA memory fragmentation (helps with variable-length protein sequences)
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 # Paths
 DATA_DIR="data/processed"
@@ -171,7 +172,7 @@ if [[ "$MODE" == "full" || "$MODE" == "test" ]]; then
                 --val-data "$DATA_DIR/val.parquet" \
                 --output-dir "$EMB_DIR" \
                 --device "$DEVICE" \
-                --batch-size 256   # A40 48 GB handles 256 sequences per batch
+                --batch-size 64   # Conservative for A40 — long sequences (>800 aa) OOM at 256
         fi
         echo "Embeddings: $(du -sh "$EMB_DIR" 2>/dev/null | cut -f1)"
     fi
