@@ -386,7 +386,11 @@ class CachedTrainer:
 
         # Curriculum sampler — replaces the train DataLoader when enabled.
         # Requires the dataset to expose a `dms_scores` tensor attribute.
+        # curriculum_epochs is treated as a fraction of max_epochs when < 1,
+        # or capped at max_epochs - 2 so the full dataset is always seen before
+        # training ends (resolved at train() call time via set_max_epochs).
         self.curriculum_sampler: CurriculumSampler | None = None
+        self._curriculum_epochs_cfg = curriculum_epochs  # stored for scaling
         if (
             curriculum_z_thresh > 0
             and curriculum_epochs > 0
@@ -682,6 +686,16 @@ class CachedTrainer:
         best_val_metrics = {}
 
         logger.info(f"Starting cached training (lr={learning_rate}, epochs={start_epoch}-{max_epochs})")
+
+        # Cap curriculum_epochs so the full dataset is seen for at least 3 epochs
+        if self.curriculum_sampler is not None:
+            effective_curriculum = min(self._curriculum_epochs_cfg, max(1, max_epochs - 3))
+            if effective_curriculum != self.curriculum_sampler.curriculum_epochs:
+                logger.info(
+                    f"  Curriculum epochs capped: {self._curriculum_epochs_cfg} → {effective_curriculum} "
+                    f"(max_epochs={max_epochs})"
+                )
+                self.curriculum_sampler.curriculum_epochs = effective_curriculum
 
         for epoch in range(start_epoch, max_epochs + 1):
             self._current_epoch = epoch
