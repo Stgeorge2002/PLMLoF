@@ -142,8 +142,8 @@ def stratified_split(
             "Then check data/raw/proteingym/ for non-empty CSV files."
         )
 
-    # ── Gene-level split — all variants from the same assay stay together ──
-    # Genes/assays with empty names are treated as a single anonymous group.
+    # ── Gene-level TEST split — holds out entire genes to prevent leakage ──
+    # Val uses random stratified split so early-stopping has a representative signal.
     remaining_df["gene"] = remaining_df["gene"].fillna("").astype(str)
     genes = np.array(sorted(remaining_df["gene"].unique()))
 
@@ -152,23 +152,33 @@ def stratified_split(
 
     n_genes = len(genes)
     n_test_genes = max(1, round(n_genes * test_size))
-    n_val_genes = max(1, round(n_genes * val_size))
-    # Guard: ensure at least one gene is left for training
-    if n_test_genes + n_val_genes >= n_genes:
+    # Guard: ensure at least one gene is left for train/val
+    if n_test_genes >= n_genes:
         n_test_genes = max(1, n_genes // 5)
-        n_val_genes = max(1, n_genes // 5)
 
     test_genes = set(genes[:n_test_genes])
-    val_genes = set(genes[n_test_genes:n_test_genes + n_val_genes])
-
-    train_df = remaining_df[~remaining_df["gene"].isin(test_genes | val_genes)].reset_index(drop=True)
-    val_df = remaining_df[remaining_df["gene"].isin(val_genes)].reset_index(drop=True)
+    non_test_df = remaining_df[~remaining_df["gene"].isin(test_genes)].copy()
     test_df = remaining_df[remaining_df["gene"].isin(test_genes)].reset_index(drop=True)
 
+    # Random stratified val split on the non-test data
+    from sklearn.model_selection import train_test_split as _tts
+    val_fraction = val_size / (1 - test_size)
+    try:
+        train_df, val_df = _tts(
+            non_test_df,
+            test_size=val_fraction,
+            stratify=non_test_df["label"],
+            random_state=seed,
+        )
+    except ValueError:
+        train_df, val_df = _tts(non_test_df, test_size=val_fraction, random_state=seed)
+
+    train_df = train_df.reset_index(drop=True)
+    val_df = val_df.reset_index(drop=True)
+
     logger.info(
-        f"Gene-level split: {n_genes} total genes — "
-        f"train={n_genes - n_test_genes - n_val_genes}, "
-        f"val={n_val_genes}, test={n_test_genes}"
+        f"Split: gene-level test ({n_test_genes}/{n_genes} genes), "
+        f"random-stratified train/val"
     )
     logger.info(f"Split: train={len(train_df)}, val={len(val_df)}, test={len(test_df)}")
     return train_df, val_df, test_df, holdout_df

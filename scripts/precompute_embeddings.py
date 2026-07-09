@@ -122,7 +122,7 @@ def _embed_unique_sequences(
         ids = batch["input_ids"].to(device, non_blocking=True)
         mask = batch["attention_mask"].to(device, non_blocking=True)
 
-        with torch.amp.autocast("cuda", dtype=torch.float16, enabled=device.type == "cuda"):
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16 if _is_ampere(device) else torch.float16, enabled=device.type == "cuda"):
             out = model(ids, attention_mask=mask).last_hidden_state
 
         mean_p, max_p = _pool(out, mask)
@@ -176,6 +176,14 @@ def main():
     if device.type == "cuda":
         logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
         torch.backends.cudnn.benchmark = True
+
+
+def _is_ampere(device: torch.device) -> bool:
+    """Return True if the device is Ampere or newer (compute capability >= 8.0)."""
+    if device.type != "cuda":
+        return False
+    major, _ = torch.cuda.get_device_capability(device)
+    return major >= 8
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -265,7 +273,7 @@ def main():
         logger.info(f"Scattering {name} ({len(ds)} samples)...")
         _scatter_embeddings(ds, seq_to_idx, mean_tensor, max_tensor, out_path)
 
-    # Clean up cache (output files are the source of truth now)
+    # Clean up cache only after ALL splits have been successfully scattered
     if cache_path.exists():
         cache_path.unlink()
         logger.info("Cleaned up embedding cache")

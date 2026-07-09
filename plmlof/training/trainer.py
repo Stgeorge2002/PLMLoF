@@ -288,14 +288,29 @@ class PLMLoFTrainer:
             val_metrics = self._eval_epoch()
             scheduler.step()
 
+            current_lr = optimizer.param_groups[0]["lr"]
             logger.info(
                 f"  Train loss={train_metrics['loss']:.4f}, "
                 f"macro_f1={train_metrics['macro_f1']:.4f}"
             )
             logger.info(
                 f"  Val   loss={val_metrics['loss']:.4f}, "
-                f"macro_f1={val_metrics['macro_f1']:.4f}"
+                f"macro_f1={val_metrics['macro_f1']:.4f}, "
+                f"lr={current_lr:.2e}"
             )
+
+            # Rollback on catastrophic collapse (>70% drop from best)
+            if self.best_metric > 0.3 and val_metrics["macro_f1"] < 0.3 * self.best_metric:
+                logger.warning(
+                    f"  Stage 2 rollback: val macro_f1={val_metrics['macro_f1']:.4f} "
+                    f"collapsed vs best={self.best_metric:.4f} — restoring best weights"
+                )
+                ckpt_path = self.output_dir / "checkpoints" / "model_best.pt"
+                if ckpt_path.exists():
+                    ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+                    if "model_state_dict" in ckpt:
+                        self.model.load_state_dict(ckpt["model_state_dict"])
+                continue  # don't count toward patience
 
             # Check for improvement
             if val_metrics["macro_f1"] > self.best_metric:
@@ -722,9 +737,10 @@ class CachedTrainer:
                         (f", spearman={val_m.get('spearman', 0):.4f}" if self.regressor else "") +
                         f", lr={current_lr:.2e}")
 
-            # Epoch-level rollback: if val F1 collapses (>50% drop from best),
-            # restore best checkpoint weights and skip this epoch entirely.
-            if self.best_metric > 0.3 and val_m["macro_f1"] < 0.5 * self.best_metric:
+            # Epoch-level rollback: only on catastrophic collapse (>70% drop from best),
+            # not on normal val noise. Does NOT reduce LR — LR reduction on rollback was
+            # driving LR to the floor when val set is small/noisy.
+            if self.best_metric > 0.3 and val_m["macro_f1"] < 0.3 * self.best_metric:
                 logger.warning(
                     f"  Epoch-level rollback: val macro_f1={val_m['macro_f1']:.4f} "
                     f"collapsed vs best={self.best_metric:.4f} — restoring best weights"
@@ -738,10 +754,8 @@ class CachedTrainer:
                     self.cross_attn.load_state_dict(ckpt["cross_attn_state_dict"])
                 if self.regressor is not None and "regressor_state_dict" in ckpt:
                     self.regressor.load_state_dict(ckpt["regressor_state_dict"])
-                # Reduce LR to prevent the same collapse from recurring
-                for g in optimizer.param_groups:
-                    g["lr"] = max(g["lr"] * 0.5, 1e-6)
-                logger.info(f"  LR reduced to {optimizer.param_groups[0]['lr']:.2e} after rollback")
+                # Restore weights but keep LR unchanged — reducing LR on noisy val
+                # collapses drives learning rate to the floor and kills training.
                 continue  # don't count toward patience
 
             if val_m["macro_f1"] > self.best_metric:

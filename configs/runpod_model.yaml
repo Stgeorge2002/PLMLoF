@@ -11,7 +11,10 @@ model:
     target_modules: ["query", "value"]
 
   comparison:
-    use_cross_attention: true
+    use_cross_attention: false  # Disabled: cross_attn lives only in CachedTrainer (Stage 1)
+                                # and is not replicated in ComparisonModule.forward() (Stage 2).
+                                # Enabling it causes Stage 2 to get raw pooled inputs into
+                                # a project() trained on cross_attn-modified inputs → loss ~2.2.
     pool_strategy: "mean_max"
 
   classifier:
