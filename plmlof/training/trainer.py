@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from tqdm import tqdm
 
 from plmlof.models.plmlof_model import PLMLoFModel
@@ -19,6 +19,69 @@ from plmlof.training.metrics import compute_metrics
 
 
 logger = logging.getLogger(__name__)
+
+
+class CurriculumSampler(Sampler):
+    """Curriculum sampler that starts with unambiguous variants and progressively
+    introduces borderline ones.
+
+    Uses DMS z-score magnitude as a difficulty proxy:
+        - High |z| (≥ z_thresh) → clear LoF/GoF, easy to classify → shown first
+        - Near-zero |z|          → ambiguous WT-like      → introduced gradually
+
+    Pacing function: at epoch e with curriculum_epochs N,
+        current_threshold = z_thresh * max(0, 1 - e / N)
+    After epoch N all samples are eligible (standard uniform sampling).
+
+    Args:
+        z_scores:          Tensor of DMS z-scores for each training sample.
+        z_thresh:          Starting |z| threshold (e.g. 2.0 = ≥2σ from mean).
+        curriculum_epochs: Number of epochs to linearly anneal the threshold to 0.
+        seed:              Base random seed (varied per epoch for reproducibility).
+    """
+
+    def __init__(
+        self,
+        z_scores: torch.Tensor,
+        z_thresh: float,
+        curriculum_epochs: int,
+        seed: int = 42,
+    ) -> None:
+        self._abs_z = z_scores.abs().float()
+        self.z_thresh = z_thresh
+        self.curriculum_epochs = curriculum_epochs
+        self.seed = seed
+        self._n_total = len(z_scores)
+        self._epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = epoch
+
+    def current_threshold(self) -> float:
+        if self.curriculum_epochs <= 0:
+            return 0.0
+        progress = min(1.0, self._epoch / self.curriculum_epochs)
+        return self.z_thresh * (1.0 - progress)
+
+    def _eligible_indices(self) -> torch.Tensor:
+        thresh = self.current_threshold()
+        if thresh <= 0.0:
+            return torch.arange(self._n_total)
+        eligible = torch.where(self._abs_z >= thresh)[0]
+        if len(eligible) == 0:
+            # Safety: never return an empty iterator
+            return torch.arange(self._n_total)
+        return eligible
+
+    def __iter__(self):
+        eligible = self._eligible_indices()
+        g = torch.Generator()
+        g.manual_seed(self.seed + self._epoch)
+        perm = torch.randperm(len(eligible), generator=g)
+        return iter(eligible[perm].tolist())
+
+    def __len__(self) -> int:
+        return len(self._eligible_indices())
 
 
 class PLMLoFTrainer:
@@ -285,6 +348,11 @@ class CachedTrainer:
         use_cross_attention: bool = False,
         cross_attn_heads: int = 4,
         cross_attn_dropout: float = 0.1,
+        # LR schedule
+        warmup_ratio: float = 0.1,
+        # Curriculum learning
+        curriculum_z_thresh: float = 0.0,
+        curriculum_epochs: int = 0,
     ):
         self.device = torch.device(device)
         self.comparison = comparison.to(self.device)
@@ -293,6 +361,7 @@ class CachedTrainer:
         self.regression_weight = regression_weight
         self.regression_warmup_epochs = regression_warmup_epochs
         self._current_epoch = 1
+        self.warmup_ratio = warmup_ratio
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.output_dir = Path(output_dir)
@@ -315,14 +384,39 @@ class CachedTrainer:
                 dropout=cross_attn_dropout,
             ).to(self.device)
 
+        # Curriculum sampler — replaces the train DataLoader when enabled.
+        # Requires the dataset to expose a `dms_scores` tensor attribute.
+        self.curriculum_sampler: CurriculumSampler | None = None
+        if (
+            curriculum_z_thresh > 0
+            and curriculum_epochs > 0
+            and hasattr(self.train_loader.dataset, "dms_scores")
+        ):
+            self.curriculum_sampler = CurriculumSampler(
+                z_scores=self.train_loader.dataset.dms_scores,
+                z_thresh=curriculum_z_thresh,
+                curriculum_epochs=curriculum_epochs,
+            )
+            self.train_loader = DataLoader(
+                self.train_loader.dataset,
+                batch_size=self.train_loader.batch_size,
+                sampler=self.curriculum_sampler,
+                num_workers=self.train_loader.num_workers,
+                pin_memory=self.train_loader.pin_memory,
+                drop_last=False,
+            )
+            logger.info(
+                f"Curriculum learning enabled: z_thresh={curriculum_z_thresh}, "
+                f"curriculum_epochs={curriculum_epochs}, "
+                f"initial eligible samples: {len(self.curriculum_sampler)}/{self.curriculum_sampler._n_total}"
+            )
+
         # FocalLoss with gamma=0 is equivalent to CrossEntropyLoss (no down-weighting).
         # Set focal_gamma > 0 to focus on hard examples (useful for imbalanced datasets).
         self.criterion = FocalLoss(gamma=focal_gamma, label_smoothing=label_smoothing)
         self.reg_criterion = nn.SmoothL1Loss()
         self.best_metric = 0.0
         self.best_epoch = -1
-
-        self.mixed_precision = mixed_precision
         self.use_amp = mixed_precision in ("fp16", "bf16") and self.device.type == "cuda"
         self.amp_dtype = torch.float16 if mixed_precision == "fp16" else torch.bfloat16 if mixed_precision == "bf16" else torch.float32
         self.scaler = torch.amp.GradScaler("cuda", enabled=(mixed_precision == "fp16" and self.device.type == "cuda"))
@@ -340,6 +434,9 @@ class CachedTrainer:
             "use_cross_attention": use_cross_attention,
             "cross_attn_heads": cross_attn_heads,
             "cross_attn_dropout": cross_attn_dropout,
+            "warmup_ratio": warmup_ratio,
+            "curriculum_z_thresh": curriculum_z_thresh,
+            "curriculum_epochs": curriculum_epochs,
         }
 
     def _forward(self, batch: dict) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -565,7 +662,8 @@ class CachedTrainer:
             params += list(self.regressor.parameters())
         optimizer = AdamW(params, lr=learning_rate, weight_decay=weight_decay)
         # Linear warmup + cosine decay — critical for large randomly-initialized layers
-        warmup_epochs = min(10, max(1, max_epochs // 10))
+        # warmup_ratio is set in __init__ from config (default 0.1)
+        warmup_epochs = max(1, round(max_epochs * self.warmup_ratio))
         warmup_scheduler = LinearLR(
             optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs,
         )
@@ -588,6 +686,17 @@ class CachedTrainer:
         for epoch in range(start_epoch, max_epochs + 1):
             self._current_epoch = epoch
             logger.info(f"Epoch {epoch}/{max_epochs}")
+
+            # Curriculum: update eligible sample set and log progress
+            if self.curriculum_sampler is not None:
+                self.curriculum_sampler.set_epoch(epoch)
+                n_eligible = len(self.curriculum_sampler)
+                thresh = self.curriculum_sampler.current_threshold()
+                logger.info(
+                    f"  Curriculum: {n_eligible}/{self.curriculum_sampler._n_total} samples "
+                    f"eligible (|z|\u2265{thresh:.2f})"
+                )
+
             train_m = self._train_epoch(optimizer, grad_accum_steps)
             val_m = self._eval_epoch()
             scheduler.step()
@@ -615,6 +724,10 @@ class CachedTrainer:
                     self.cross_attn.load_state_dict(ckpt["cross_attn_state_dict"])
                 if self.regressor is not None and "regressor_state_dict" in ckpt:
                     self.regressor.load_state_dict(ckpt["regressor_state_dict"])
+                # Reduce LR to prevent the same collapse from recurring
+                for g in optimizer.param_groups:
+                    g["lr"] = max(g["lr"] * 0.5, 1e-6)
+                logger.info(f"  LR reduced to {optimizer.param_groups[0]['lr']:.2e} after rollback")
                 continue  # don't count toward patience
 
             if val_m["macro_f1"] > self.best_metric:

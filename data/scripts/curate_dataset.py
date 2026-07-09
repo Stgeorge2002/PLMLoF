@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
@@ -101,39 +102,35 @@ def stratified_split(
     val_size: float = 0.1,
     seed: int = 42,
     holdout_species: list[str] | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Split dataset into train/val/test with stratification.
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Split dataset into train/val/test using gene-level stratification.
 
-    Optionally holds out entire species for cross-species generalization testing.
+    All variants from the same gene/assay go to the same split, preventing
+    reference-sequence leakage across train, val, and test.
 
-    Args:
-        df: Full dataset.
-        test_size: Fraction for test set.
-        val_size: Fraction for validation set.
-        seed: Random seed.
-        holdout_species: Species to exclude from train/val and put entirely in test.
+    Holdout species are extracted first and returned as a separate DataFrame
+    (not merged into test) for independent cross-species evaluation.
 
     Returns:
-        Tuple of (train_df, val_df, test_df).
+        Tuple of (train_df, val_df, test_df, holdout_df).
     """
-    # Holdout species
+    # ── Holdout species (extracted before split, returned separately) ──
     if holdout_species:
         holdout_mask = df["species"].str.lower().apply(
             lambda s: any(h.lower() in s for h in holdout_species) if isinstance(s, str) else False
         )
-        holdout_df = df[holdout_mask]
-        remaining_df = df[~holdout_mask]
+        holdout_df = df[holdout_mask].copy()
+        remaining_df = df[~holdout_mask].copy()
         logger.info(f"Held out {len(holdout_df)} records from species: {holdout_species}")
     else:
         holdout_df = pd.DataFrame()
-        remaining_df = df
+        remaining_df = df.copy()
 
     if remaining_df.empty:
         logger.warning("No data remaining after holdout. Using all data.")
-        remaining_df = df
+        remaining_df = df.copy()
         holdout_df = pd.DataFrame()
 
-    # Guard: sklearn needs at least 1 / test_size samples to produce a non-empty train set.
     min_needed = max(10, int(1 / test_size) + 1)
     if len(remaining_df) < min_needed:
         raise RuntimeError(
@@ -144,51 +141,36 @@ def stratified_split(
             "Then check data/raw/proteingym/ for non-empty CSV files."
         )
 
-    # Stratified split on label
-    stratify_col = remaining_df["label"]
+    # ── Gene-level split — all variants from the same assay stay together ──
+    # Genes/assays with empty names are treated as a single anonymous group.
+    remaining_df["gene"] = remaining_df["gene"].fillna("").astype(str)
+    genes = np.array(sorted(remaining_df["gene"].unique()))
 
-    # Check if stratification is possible (need ≥2 samples per class per split)
-    min_class_count = stratify_col.value_counts().min()
-    can_stratify = min_class_count >= 3  # Need at least 3 to split into train/val/test
+    rng = np.random.default_rng(seed)
+    rng.shuffle(genes)
 
-    # First split: separate test set
-    try:
-        train_val_df, test_df = train_test_split(
-            remaining_df,
-            test_size=test_size,
-            stratify=stratify_col if can_stratify else None,
-            random_state=seed,
-        )
-    except ValueError:
-        # Fallback: no stratification if classes are too small
-        train_val_df, test_df = train_test_split(
-            remaining_df,
-            test_size=test_size,
-            random_state=seed,
-        )
+    n_genes = len(genes)
+    n_test_genes = max(1, round(n_genes * test_size))
+    n_val_genes = max(1, round(n_genes * val_size))
+    # Guard: ensure at least one gene is left for training
+    if n_test_genes + n_val_genes >= n_genes:
+        n_test_genes = max(1, n_genes // 5)
+        n_val_genes = max(1, n_genes // 5)
 
-    # Second split: separate validation from training
-    val_fraction = val_size / (1 - test_size)
-    try:
-        train_df, val_df = train_test_split(
-            train_val_df,
-            test_size=val_fraction,
-            stratify=train_val_df["label"] if can_stratify else None,
-            random_state=seed,
-        )
-    except ValueError:
-        train_df, val_df = train_test_split(
-            train_val_df,
-            test_size=val_fraction,
-            random_state=seed,
-        )
+    test_genes = set(genes[:n_test_genes])
+    val_genes = set(genes[n_test_genes:n_test_genes + n_val_genes])
 
-    # Add holdout species to test set
-    if not holdout_df.empty:
-        test_df = pd.concat([test_df, holdout_df], ignore_index=True)
+    train_df = remaining_df[~remaining_df["gene"].isin(test_genes | val_genes)].reset_index(drop=True)
+    val_df = remaining_df[remaining_df["gene"].isin(val_genes)].reset_index(drop=True)
+    test_df = remaining_df[remaining_df["gene"].isin(test_genes)].reset_index(drop=True)
 
+    logger.info(
+        f"Gene-level split: {n_genes} total genes — "
+        f"train={n_genes - n_test_genes - n_val_genes}, "
+        f"val={n_val_genes}, test={n_test_genes}"
+    )
     logger.info(f"Split: train={len(train_df)}, val={len(val_df)}, test={len(test_df)}")
-    return train_df, val_df, test_df
+    return train_df, val_df, test_df, holdout_df
 
 
 def main():
@@ -196,7 +178,7 @@ def main():
 
     merged = merge_datasets()
 
-    train_df, val_df, test_df = stratified_split(
+    train_df, val_df, test_df, holdout_df = stratified_split(
         merged,
         holdout_species=["Pseudomonas aeruginosa", "Salmonella"],
     )
@@ -206,6 +188,12 @@ def main():
         path = OUTPUT_DIR / f"{split_name}.parquet"
         split_df.to_parquet(path, index=False)
         logger.info(f"Saved {split_name}: {len(split_df)} records → {path}")
+
+    # Save holdout species separately for cross-species generalisation evaluation
+    if not holdout_df.empty:
+        holdout_path = OUTPUT_DIR / "test_holdout_species.parquet"
+        holdout_df.to_parquet(holdout_path, index=False)
+        logger.info(f"Saved holdout species: {len(holdout_df)} records → {holdout_path}")
 
     # Save full merged dataset
     merged_path = OUTPUT_DIR / "merged_all.parquet"

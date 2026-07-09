@@ -205,6 +205,9 @@ def main():
             classifier_hidden_dims=classifier_hidden_dims,
             classifier_dropout=classifier_dropout,
             lora_config=lora_config,
+            warmup_ratio=s1_cfg.get("warmup_ratio", 0.1),
+            curriculum_z_thresh=s1_cfg.get("curriculum_z_thresh", 0.0),
+            curriculum_epochs=s1_cfg.get("curriculum_epochs", 0),
         )
 
         logger.info("=" * 60)

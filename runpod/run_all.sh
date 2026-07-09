@@ -176,6 +176,23 @@ if [[ "$MODE" == "full" || "$MODE" == "train" || "$MODE" == "test" ]]; then
             --device "$DEVICE" \
             --mixed-precision "$PRECISION" \
             --output-dir "$OUTPUT_DIR"
+
+        # Stage 2: LoRA fine-tuning of ESM2 encoder (requires Stage 1 checkpoint)
+        echo "──────── Step 3b: Stage 2 LoRA Fine-tuning ────────"
+        if [[ -f "$CHECKPOINT" ]]; then
+            python scripts/train.py \
+                --config "$TRAIN_CFG" \
+                --model-config "$MODEL_CFG" \
+                --train-data "$DATA_DIR/train.parquet" \
+                --val-data "$DATA_DIR/val.parquet" \
+                --stage2-only \
+                --checkpoint "$CHECKPOINT" \
+                --device "$DEVICE" \
+                --mixed-precision "$PRECISION" \
+                --output-dir "$OUTPUT_DIR"
+        else
+            echo "  No Stage 1 checkpoint at $CHECKPOINT — skipping Stage 2."
+        fi
     fi
     echo ""
 fi
@@ -206,6 +223,16 @@ if [[ "$MODE" == "full" || "$MODE" == "eval" || "$MODE" == "eval_after_train" ||
                 --model "$CHECKPOINT" \
                 --test-data "$DATA_DIR/test.parquet" \
                 --device "$DEVICE"
+
+            # Cross-species generalisation evaluation (Pseudomonas / Salmonella)
+            HOLDOUT_DATA="$DATA_DIR/test_holdout_species.parquet"
+            if [[ -f "$HOLDOUT_DATA" ]]; then
+                echo "Evaluating on held-out species (cross-species generalisation)..."
+                python scripts/evaluate.py \
+                    --model "$CHECKPOINT" \
+                    --test-data "$HOLDOUT_DATA" \
+                    --device "$DEVICE"
+            fi
         else
             echo "No checkpoint at $CHECKPOINT. Skipping evaluation."
         fi

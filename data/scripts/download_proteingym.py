@@ -160,7 +160,7 @@ def _download_with_fallback(urls: list[str], dest_path: Path) -> bool:
                 isinstance(e, URLError) and isinstance(e.reason, ssl.SSLError)
             )
             if is_ssl:
-                logger.warning(f"SSL error ({url}): {e} — retrying without certificate verification")
+                logger.info(f"SSL verification failed for {url} — retrying without certificate verification")
                 try:
                     return _stream_url(url, unverified_ctx, dest_path)
                 except Exception as e2:
