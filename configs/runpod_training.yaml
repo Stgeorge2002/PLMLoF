@@ -1,12 +1,12 @@
-# RunPod production training config — optimized for GPU pods (A100/H100/A6000)
+# RunPod production training config — optimised for NVIDIA A40 (48 GB, Ampere)
 training:
   # Stage 1: Classification head only (ESM2 frozen)
   stage1:
     max_epochs: 100
     learning_rate: 1.5e-4        # Reduced from 3e-4 — peak LR at 3e-4 caused epoch-10 collapse
     weight_decay: 0.01
-    batch_size: 32          # Larger batch on GPU
-    gradient_accumulation_steps: 2
+    batch_size: 64          # A40 48 GB — cached embeddings, no ESM2 in memory
+    gradient_accumulation_steps: 1
     warmup_ratio: 0.15           # 15 epochs warmup; previously hardcoded as min(10, N//10)
     scheduler: "cosine"
     # Curriculum learning: start with high-|z| variants, progressively add near-zero
@@ -18,15 +18,15 @@ training:
     max_epochs: 5
     learning_rate: 5.0e-5
     weight_decay: 0.01
-    batch_size: 16
-    gradient_accumulation_steps: 4
+    batch_size: 32          # A40 48 GB — ESM2-650M (~2.5 GB) + LoRA + activations fits at 32
+    gradient_accumulation_steps: 2
     warmup_ratio: 0.05
     scheduler: "cosine"
 
   # General
   early_stopping_patience: 7
   metric_for_best_model: "macro_f1"
-  mixed_precision: "fp16"      # Use bf16 for A100/H100: "bf16"
+  mixed_precision: "bf16"     # A40 is Ampere (compute cap 8.6) — bf16 is native and faster than fp16
   max_seq_length: 1024
   seed: 42
 

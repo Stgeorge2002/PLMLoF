@@ -171,7 +171,7 @@ if [[ "$MODE" == "full" || "$MODE" == "test" ]]; then
                 --val-data "$DATA_DIR/val.parquet" \
                 --output-dir "$EMB_DIR" \
                 --device "$DEVICE" \
-                --batch-size 128
+                --batch-size 256   # A40 48 GB handles 256 sequences per batch
         fi
         echo "Embeddings: $(du -sh "$EMB_DIR" 2>/dev/null | cut -f1)"
     fi
