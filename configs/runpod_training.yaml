@@ -24,7 +24,7 @@ training:
     scheduler: "cosine"
 
   # General
-  early_stopping_patience: 15
+  early_stopping_patience: 12   # Reduced from 15 — model plateaus around epoch 90-100
   metric_for_best_model: "macro_f1"
   mixed_precision: "bf16"     # A40 is Ampere (compute cap 8.6) — bf16 is native and faster than fp16
   max_seq_length: 1024
@@ -35,7 +35,7 @@ training:
   seed: 42
 
   # Multi-task regression (DMS z-score prediction)
-  regression_weight: 0.0       # Disabled — remove regression head in future if not needed
+  regression_weight: 0.0       # Disabled — negative Spearman correlation suggests misalignment
   regression_warmup_epochs: 3
   focal_gamma: 2.0             # Keep proven value — higher values caused instability
   label_smoothing: 0.10        # Increased for better calibration (from 0.05)

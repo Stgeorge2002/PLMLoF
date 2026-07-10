@@ -39,7 +39,8 @@ def load_source(path: Path, source_name: str) -> pd.DataFrame:
 
 # Total samples and per-class target for balanced subsampling.
 # Overridden at runtime by --total-samples CLI arg (or PLMLOF_TOTAL_SAMPLES env var).
-DEFAULT_TOTAL_SAMPLES = 300_000
+# INCREASED to use ALL available bacterial data (previously 300k)
+DEFAULT_TOTAL_SAMPLES = 900_000
 
 # Species used for per-species evaluation.  All of their variants are prioritised
 # during subsampling so the model has been trained on as many of their sequences as
@@ -51,6 +52,7 @@ EVALUATION_SPECIES: list[tuple[str, str]] = [
     ("stau",    "Staphylococcus aureus"),
     ("klepn",   "Klebsiella pneumoniae"),
     ("strpn",   "Streptococcus pneumoniae"),
+    ("strsp",   "Streptococcus sp"),  # Streptococcus sp. group G (2,150 single mutants)
 ]
 
 # Species whose variants are included at 100 % in the subsampled training pool.
@@ -76,8 +78,9 @@ PRIORITY_SPECIES_SUBSTRINGS = [
 ]
 
 # Fraction of E. coli variants to include (before class-balancing)
-# — keeps E. coli as majority while letting other species breathe.
-ECOLI_SAMPLING_RATE = 0.45
+# SET TO 1.0 to include ALL E. coli data (40K+ single mutants)
+# Previously 0.45 which discarded ~22K variants
+ECOLI_SAMPLING_RATE = 1.0
 
 
 def _is_ecoli(species: str) -> bool:
@@ -91,10 +94,12 @@ def _is_priority(species: str) -> bool:
 def merge_datasets(total_samples: int = DEFAULT_TOTAL_SAMPLES) -> pd.DataFrame:
     """Load ProteinGym data and subsample using species-aware sampling.
 
-    E. coli is the largest assay by far but is capped at ECOLI_SAMPLING_RATE
-    so that all other bacterial species contribute proportionally more.
-    Priority test species (M. tuberculosis, S. aureus, Klebsiella, etc.) are
-    included at 100 %.
+    UPDATED: Now includes ALL bacterial data:
+    - E. coli: 100% (40K+ single mutants, was 45%)
+    - Priority species: 100% (M. tuberculosis, S. aureus, Klebsiella, etc.)
+    - Other species: 100%
+    - Multiple mutants: INCLUDED (epistatic effects handled by model)
+    
     A final class-balance step ensures equal LoF / WT / GoF counts.
     """
     path = PROCESSED_DIR / "proteingym_bacterial.parquet"
@@ -139,8 +144,11 @@ def merge_datasets(total_samples: int = DEFAULT_TOTAL_SAMPLES) -> pd.DataFrame:
     # Priority species: include ALL available variants
     priority_df = df[priority_mask].copy()
 
-    # E. coli: cap at ECOLI_SAMPLING_RATE of its available variants
-    ecoli_df = df[ecoli_mask].sample(frac=ECOLI_SAMPLING_RATE, random_state=42)
+    # E. coli: include at ECOLI_SAMPLING_RATE (now 1.0 = 100%)
+    if ECOLI_SAMPLING_RATE >= 1.0:
+        ecoli_df = df[ecoli_mask].copy()
+    else:
+        ecoli_df = df[ecoli_mask].sample(frac=ECOLI_SAMPLING_RATE, random_state=42)
 
     # Other (unknown species): include all
     other_df = df[other_mask].copy()

@@ -1,21 +1,26 @@
+# Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
+*.pyc
 .venv/
 venv/
-env/
 *.egg-info/
-dist/
-build/
-data/raw/
-data/processed/
+
+# IGNORE EVERYTHING IN DATA
+data/
+aws/ 
+
+# IGNORE ALL OUTPUTS
 outputs/
+
+# IGNORE ALL MODELS
 *.pt
 *.pth
 *.ckpt
-.vscode/
-.idea/
+
+# IGNORE LOGS
 *.log
 wandb/
-aws/
+
+# IDE
+.vscode/
+.idea/
