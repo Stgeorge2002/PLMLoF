@@ -144,14 +144,17 @@ def _scatter_embeddings(
 ) -> None:
     """Scatter pre-computed embeddings to per-sample tensors using vectorised indexing."""
     n = len(dataset)
+    logger.info(f"  Building index mappings for {n} samples...")
 
     # Access pre-extracted protein lists directly (skip __getitem__ overhead)
     ref_proteins = [s.replace("*", "") for s in dataset._ref_proteins_raw]
     var_proteins = [s.replace("*", "") for s in dataset._var_proteins_raw]
 
+    logger.info(f"  Creating index tensors...")
     ref_idx = torch.tensor([seq_to_idx[s] for s in ref_proteins], dtype=torch.long)
     var_idx = torch.tensor([seq_to_idx[s] for s in var_proteins], dtype=torch.long)
 
+    logger.info(f"  Gathering embeddings...")
     # Vectorised gather — single C-level indexing op per tensor
     data = {
         "ref_mean": mean_tensor[ref_idx],
@@ -163,11 +166,17 @@ def _scatter_embeddings(
         "dms_scores": torch.tensor(dataset._dms_scores, dtype=torch.float),
     }
 
+    # Estimate output size
+    estimated_mb = sum(
+        v.numel() * v.element_size() for v in data.values() if isinstance(v, torch.Tensor)
+    ) / 1e6
+    logger.info(f"  Writing {estimated_mb:.1f} MB to disk (this may take 10-30 seconds)...")
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(data, output_path)
 
     size_mb = output_path.stat().st_size / 1e6
-    logger.info(f"  Saved {n} samples → {output_path} ({size_mb:.1f} MB)")
+    logger.info(f"  ✓ Saved {n} samples → {output_path} ({size_mb:.1f} MB)")
 
 
 def _is_ampere(device: torch.device) -> bool:
@@ -292,9 +301,18 @@ def main():
     seq_to_idx = {seq: i for i, seq in enumerate(ordered_seqs)}
 
     # ── Scatter to each split ──
-    for name, ds, out_path in splits:
-        logger.info(f"Scattering {name} ({len(ds)} samples)...")
+    import gc
+    import sys
+    
+    for split_idx, (name, ds, out_path) in enumerate(splits, 1):
+        logger.info(f"Scattering {name} ({len(ds)} samples) [{split_idx}/{len(splits)}]...")
+        sys.stdout.flush()  # Ensure logs appear immediately
+        
         _scatter_embeddings(ds, seq_to_idx, mean_tensor, max_tensor, out_path)
+        
+        # Force garbage collection after each scatter to free memory
+        gc.collect()
+        sys.stdout.flush()
 
     # Clean up cache only after ALL splits have been successfully scattered
     if cache_path.exists():
