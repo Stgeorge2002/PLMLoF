@@ -10,8 +10,8 @@ training:
     warmup_ratio: 0.15           # 15 epochs warmup; previously hardcoded as min(10, N//10)
     scheduler: "cosine"
     # Curriculum learning: start with high-|z| variants, progressively add near-zero
-    curriculum_z_thresh: 2.0     # Start with |dms_zscore| >= 2.0 (clear LoF/GoF)
-    curriculum_epochs: 25        # Fully open (all samples) after epoch 25
+    curriculum_z_thresh: 0.0     # DISABLED — WT variants have near-zero z-score and are excluded by curriculum
+    curriculum_epochs: 0         # Unused when z_thresh=0.0
 
   # Stage 2: LoRA fine-tuning
   stage2:
@@ -33,7 +33,7 @@ training:
   # Multi-task regression (DMS z-score prediction)
   regression_weight: 0.1       # Weight of SmoothL1 regression loss vs CE classification loss
   regression_warmup_epochs: 3  # Linearly ramp regression weight over first N epochs
-  focal_gamma: 0.0             # Focal loss gamma (0.0 = standard CE; set > 0 for imbalanced data)
+  focal_gamma: 2.0             # Focal loss — downweights easy examples, forces learning WT
 
   # Class weights (auto-computed if null)
   class_weights: null
