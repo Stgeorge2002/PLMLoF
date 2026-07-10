@@ -34,8 +34,8 @@ echo "Logging to: $LOG_FILE"
 MODE="full"
 SKIP_SETUP=false
 # Scale controls how many thousand training samples to use.
-# Default 300 (full 300K balanced dataset). --quick sets 30. --scale N overrides.
-SCALE=300
+# Default 900 (full 900K balanced dataset with ALL bacterial data). --quick sets 30. --scale N overrides.
+SCALE=900
 S1_EPOCHS=""   # empty = use config default
 S2_EPOCHS=""   # empty = use config default
 
@@ -57,7 +57,7 @@ while [[ $i -lt ${#ARGS[@]} ]]; do
             echo "Usage: bash runpod/run_all.sh [--test|--quick|--scale N|--s1-epochs N|--s2-epochs N|--data-only|--train-only|--eval-only] [--skip-setup]"
             echo ""
             echo "  --quick          30K samples, 20 Stage-1 epochs, 2 Stage-2 epochs (~1–2 hrs)"
-            echo "  --scale N        Use N*1000 samples total (default: 300 = full 300K)"
+            echo "  --scale N        Use N*1000 samples total (default: 900 = full 900K with ALL bacterial data)"
             echo "  --s1-epochs N    Override Stage 1 max epochs (default: from config)"
             echo "  --s2-epochs N    Override Stage 2 max epochs (default: from config)"
             exit 0
