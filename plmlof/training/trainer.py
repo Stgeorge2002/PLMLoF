@@ -537,7 +537,7 @@ class CachedTrainer:
         Returns:
             Augmented batch dictionary
         """
-        if self.mixup_alpha <= 0 or not self.training:
+        if self.mixup_alpha <= 0:
             return batch
         
         import numpy as np
@@ -577,7 +577,8 @@ class CachedTrainer:
         var_mean, var_max = batch["var_mean"], batch["var_max"]
         
         # Noise injection for regularization (training only)
-        if self.training and self.noise_scale > 0:
+        # Check if comparison module is in training mode
+        if self.comparison.training and self.noise_scale > 0:
             ref_mean = ref_mean + torch.randn_like(ref_mean) * self.noise_scale
             ref_max = ref_max + torch.randn_like(ref_max) * self.noise_scale
             var_mean = var_mean + torch.randn_like(var_mean) * self.noise_scale
