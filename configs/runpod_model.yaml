@@ -19,9 +19,9 @@ model:
 
   classifier:
     hidden_dims: [512, 128]   # Larger head for production
-    dropout: 0.2
+    dropout: 0.3              # Increased from 0.2 — better generalization for WT boundary cases
     num_classes: 3
-    label_smoothing: 0.05
+    label_smoothing: 0.10     # Synced with training.yaml
 
   nucleotide_features:
     num_features: 12

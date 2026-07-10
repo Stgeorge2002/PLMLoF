@@ -2,10 +2,10 @@
 training:
   # Stage 1: Classification head only (ESM2 frozen)
   stage1:
-    max_epochs: 100
-    learning_rate: 5.0e-5
+    max_epochs: 200            # Extended — model still improving at epoch 100
+    learning_rate: 1.0e-4      # 2× higher — faster convergence while staying stable
     weight_decay: 0.01
-    batch_size: 64          # A40 48 GB — cached embeddings, no ESM2 in memory
+    batch_size: 64             # A40 48 GB — cached embeddings, no ESM2 in memory
     gradient_accumulation_steps: 4   # effective batch = 256; reduces epoch-to-epoch val variance
     warmup_ratio: 0.10
     scheduler: "cosine"
@@ -31,10 +31,10 @@ training:
   seed: 42
 
   # Multi-task regression (DMS z-score prediction)
-  regression_weight: 0.0
+  regression_weight: 0.0       # Disabled — remove regression head in future if not needed
   regression_warmup_epochs: 3
-  focal_gamma: 2.0             # Down-weights easy examples, focuses on hard boundary cases (WT near LoF/GoF)
-  label_smoothing: 0.05        # Mild label smoothing helps calibration on borderline WT variants
+  focal_gamma: 2.5             # Increased from 2.0 — stronger focus on hard boundary cases (especially WT)
+  label_smoothing: 0.10        # Increased from 0.05 — better generalization for WT variants near boundaries
 
   # Training data is balanced (100K per class) — no class weighting needed.
   # Focal loss handles hard examples without introducing class bias.
