@@ -28,6 +28,10 @@ training:
   metric_for_best_model: "macro_f1"
   mixed_precision: "bf16"     # A40 is Ampere (compute cap 8.6) — bf16 is native and faster than fp16
   max_seq_length: 1024
+  
+  # Stochastic Weight Averaging (improves generalization)
+  use_swa: false              # Enable SWA for final 10-20 epochs (requires implementation)
+  swa_start_epoch: 180        # Start averaging from this epoch
   seed: 42
 
   # Multi-task regression (DMS z-score prediction)
