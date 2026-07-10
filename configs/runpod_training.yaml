@@ -33,12 +33,12 @@ training:
   # Multi-task regression (DMS z-score prediction)
   regression_weight: 0.0
   regression_warmup_epochs: 3
-  focal_gamma: 0.0             # Removed — combined with class weights caused gradient oscillation
+  focal_gamma: 2.0             # Down-weights easy examples, focuses on hard boundary cases (WT near LoF/GoF)
   label_smoothing: 0.05        # Mild label smoothing helps calibration on borderline WT variants
 
-  # Training data is balanced (100K per class) so heavy class weighting is not needed.
-  # Mild LoF boost retained because LoF is the hardest class to separate from WT.
-  class_weights: [1.5, 0.8, 1.0]  # LoF mild boost, WT slight down-weight, GoF neutral
+  # Training data is balanced (100K per class) — no class weighting needed.
+  # Focal loss handles hard examples without introducing class bias.
+  class_weights: null          # Balanced dataset — equal treatment for all classes
 
   # Logging
   log_every_n_steps: 25
