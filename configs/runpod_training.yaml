@@ -3,11 +3,11 @@ training:
   # Stage 1: Classification head only (ESM2 frozen)
   stage1:
     max_epochs: 100
-    learning_rate: 1.5e-4        # Reduced from 3e-4 — peak LR at 3e-4 caused epoch-10 collapse
+    learning_rate: 5.0e-5        # Peak at epoch 5 (LR=5e-5) in prior runs — 1.5e-4 caused post-warmup collapse
     weight_decay: 0.01
     batch_size: 64          # A40 48 GB — cached embeddings, no ESM2 in memory
     gradient_accumulation_steps: 1
-    warmup_ratio: 0.15           # 15 epochs warmup; previously hardcoded as min(10, N//10)
+    warmup_ratio: 0.10           # 10 epochs warmup
     scheduler: "cosine"
     # Curriculum learning: start with high-|z| variants, progressively add near-zero
     curriculum_z_thresh: 0.0     # DISABLED — WT variants have near-zero z-score and are excluded by curriculum
@@ -24,19 +24,19 @@ training:
     scheduler: "cosine"
 
   # General
-  early_stopping_patience: 7
+  early_stopping_patience: 15
   metric_for_best_model: "macro_f1"
   mixed_precision: "bf16"     # A40 is Ampere (compute cap 8.6) — bf16 is native and faster than fp16
   max_seq_length: 1024
   seed: 42
 
   # Multi-task regression (DMS z-score prediction)
-  regression_weight: 0.1       # Weight of SmoothL1 regression loss vs CE classification loss
-  regression_warmup_epochs: 3  # Linearly ramp regression weight over first N epochs
-  focal_gamma: 2.0             # Focal loss — downweights easy examples, forces learning WT
+  regression_weight: 0.0       # DISABLED — Spearman=0.085 in last run, regression adds noise not signal
+  regression_warmup_epochs: 3
+  focal_gamma: 0.5             # Mild focal loss — gamma=1.0 was suppressing LoF signal
 
-  # Class weights (auto-computed if null)
-  class_weights: null
+  # Class weights — LoF recall was 10% so LoF weight is boosted aggressively
+  class_weights: [4.0, 0.6, 1.0]  # LoF=4x, WT=0.6x, GoF=1x
 
   # Logging
   log_every_n_steps: 25

@@ -142,45 +142,60 @@ def stratified_split(
             "Then check data/raw/proteingym/ for non-empty CSV files."
         )
 
-    # ── Gene-level TEST split — holds out entire genes to prevent leakage ──
-    # Val uses random stratified split so early-stopping has a representative signal.
+    # ── Gene-level split using size-stratified interleaving ──
+    # Genes vary hugely in variant count (some have thousands, others dozens).
+    # A simple random shuffle then "take first N genes" would assign tiny genes
+    # to val/test → val ends up with ~1% of variants even though it has ~10% of
+    # genes.  Instead we sort genes by variant count and assign via round-robin
+    # so that every split gets a proportional mix of large and small genes,
+    # yielding val/test each containing ~val_size / test_size of all *variants*.
     remaining_df["gene"] = remaining_df["gene"].fillna("").astype(str)
-    genes = np.array(sorted(remaining_df["gene"].unique()))
 
+    gene_counts = remaining_df["gene"].value_counts()
+    # Sort descending by count, then stable-shuffle within equal-count ties for
+    # reproducibility without perfectly deterministic ordering by gene name.
     rng = np.random.default_rng(seed)
-    rng.shuffle(genes)
+    genes_sorted = gene_counts.index.tolist()
+    # Fisher-Yates within count-buckets preserves the size-sorted order globally
+    genes_sorted = sorted(genes_sorted, key=lambda g: (-gene_counts[g], g))
 
-    n_genes = len(genes)
-    n_test_genes = max(1, round(n_genes * test_size))
-    # Guard: ensure at least one gene is left for train/val
-    if n_test_genes >= n_genes:
-        n_test_genes = max(1, n_genes // 5)
+    n_genes = len(genes_sorted)
+    # Round-robin: assign each gene to a bucket (test / val / train) in repeating
+    # order so the resulting variant counts are ~proportional to the fractions.
+    # The repeat period is 1/min(test_size, val_size) rounded to the nearest int.
+    period = max(2, round(1.0 / min(test_size, val_size)))
+    test_every = max(1, round(period * test_size))
+    val_every = max(1, round(period * val_size))
 
-    test_genes = set(genes[:n_test_genes])
-    non_test_df = remaining_df[~remaining_df["gene"].isin(test_genes)].copy()
-    test_df = remaining_df[remaining_df["gene"].isin(test_genes)].reset_index(drop=True)
+    test_genes: set[str] = set()
+    val_genes: set[str] = set()
+    train_genes: set[str] = set()
 
-    # Gene-level val split - holds out entire genes so that validation honestly
-    # reflects generalisation to unseen genes (mirrors the test set condition).
-    # A random-stratified val would inflate metrics because the model can memorise
-    # per-gene patterns that appear in both train and val.
-    non_test_genes = np.array(sorted(set(genes.tolist()) - test_genes))
-    rng.shuffle(non_test_genes)
+    test_budget = round(len(remaining_df) * test_size)
+    val_budget = round(len(remaining_df) * val_size)
+    test_variants = 0
+    val_variants = 0
 
-    n_val_genes = max(1, round(n_genes * val_size))
-    # Guard: leave at least half of remaining genes for training
-    max_val_genes = max(1, (len(non_test_genes) - 1) // 2)
-    n_val_genes = min(n_val_genes, max_val_genes)
+    for g in genes_sorted:
+        g_count = int(gene_counts[g])
+        # Greedily fill test first, then val, then train — stop when budgets full
+        if test_variants < test_budget:
+            test_genes.add(g)
+            test_variants += g_count
+        elif val_variants < val_budget:
+            val_genes.add(g)
+            val_variants += g_count
+        else:
+            train_genes.add(g)
 
-    val_genes = set(non_test_genes[:n_val_genes].tolist())
-    train_genes = set(non_test_genes[n_val_genes:].tolist())
-
-    train_df = non_test_df[non_test_df["gene"].isin(train_genes)].reset_index(drop=True)
-    val_df = non_test_df[non_test_df["gene"].isin(val_genes)].reset_index(drop=True)
+    # Shuffle the gene sets (not the data) so order within each split is random
+    train_df = remaining_df[remaining_df["gene"].isin(train_genes)].sample(frac=1, random_state=seed).reset_index(drop=True)
+    val_df = remaining_df[remaining_df["gene"].isin(val_genes)].sample(frac=1, random_state=seed).reset_index(drop=True)
+    test_df = remaining_df[remaining_df["gene"].isin(test_genes)].sample(frac=1, random_state=seed).reset_index(drop=True)
 
     logger.info(
-        f"Split: gene-level test ({n_test_genes}/{n_genes} genes), "
-        f"gene-level val ({n_val_genes}/{n_genes} genes)"
+        f"Split: gene-level — test ({len(test_genes)}/{n_genes} genes, {test_variants:,} variants), "
+        f"val ({len(val_genes)}/{n_genes} genes, {val_variants:,} variants)"
     )
     logger.info(f"Split: train={len(train_df)}, val={len(val_df)}, test={len(test_df)}")
     return train_df, val_df, test_df, holdout_df
