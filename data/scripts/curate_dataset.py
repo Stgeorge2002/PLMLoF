@@ -142,62 +142,44 @@ def stratified_split(
             "Then check data/raw/proteingym/ for non-empty CSV files."
         )
 
-    # ── Gene-level split using size-stratified interleaving ──
-    # Genes vary hugely in variant count (some have thousands, others dozens).
-    # A simple random shuffle then "take first N genes" would assign tiny genes
-    # to val/test → val ends up with ~1% of variants even though it has ~10% of
-    # genes.  Instead we sort genes by variant count and assign via round-robin
-    # so that every split gets a proportional mix of large and small genes,
-    # yielding val/test each containing ~val_size / test_size of all *variants*.
+    # ── Stratified random split by label ──
+    # All genes appear in train, val, and test — different variants from the
+    # same gene end up in each split.  The model learns mutation-type patterns
+    # (stop codons, truncation fraction, conservative vs. radical substitutions)
+    # not gene identity, so gene-level leakage is not a meaningful concern.
+    # The only true leakage — identical (ref, var) pairs in multiple splits —
+    # is already prevented by drop_duplicates() in merge_datasets().
+    #
+    # Cross-gene / cross-species generalisation is evaluated separately using
+    # the held-out species set (Pseudomonas, Salmonella).
+    from sklearn.model_selection import train_test_split as _tts
+
     remaining_df["gene"] = remaining_df["gene"].fillna("").astype(str)
+    stratify_col = remaining_df["label"] if remaining_df["label"].nunique() > 1 else None
 
-    gene_counts = remaining_df["gene"].value_counts()
-    # Sort descending by count, then stable-shuffle within equal-count ties for
-    # reproducibility without perfectly deterministic ordering by gene name.
-    rng = np.random.default_rng(seed)
-    genes_sorted = gene_counts.index.tolist()
-    # Fisher-Yates within count-buckets preserves the size-sorted order globally
-    genes_sorted = sorted(genes_sorted, key=lambda g: (-gene_counts[g], g))
-
-    n_genes = len(genes_sorted)
-    # Round-robin: assign each gene to a bucket (test / val / train) in repeating
-    # order so the resulting variant counts are ~proportional to the fractions.
-    # The repeat period is 1/min(test_size, val_size) rounded to the nearest int.
-    period = max(2, round(1.0 / min(test_size, val_size)))
-    test_every = max(1, round(period * test_size))
-    val_every = max(1, round(period * val_size))
-
-    test_genes: set[str] = set()
-    val_genes: set[str] = set()
-    train_genes: set[str] = set()
-
-    test_budget = round(len(remaining_df) * test_size)
-    val_budget = round(len(remaining_df) * val_size)
-    test_variants = 0
-    val_variants = 0
-
-    for g in genes_sorted:
-        g_count = int(gene_counts[g])
-        # Greedily fill test first, then val, then train — stop when budgets full
-        if test_variants < test_budget:
-            test_genes.add(g)
-            test_variants += g_count
-        elif val_variants < val_budget:
-            val_genes.add(g)
-            val_variants += g_count
-        else:
-            train_genes.add(g)
-
-    # Shuffle the gene sets (not the data) so order within each split is random
-    train_df = remaining_df[remaining_df["gene"].isin(train_genes)].sample(frac=1, random_state=seed).reset_index(drop=True)
-    val_df = remaining_df[remaining_df["gene"].isin(val_genes)].sample(frac=1, random_state=seed).reset_index(drop=True)
-    test_df = remaining_df[remaining_df["gene"].isin(test_genes)].sample(frac=1, random_state=seed).reset_index(drop=True)
-
-    logger.info(
-        f"Split: gene-level — test ({len(test_genes)}/{n_genes} genes, {test_variants:,} variants), "
-        f"val ({len(val_genes)}/{n_genes} genes, {val_variants:,} variants)"
+    # First split: carve out test set
+    trainval_df, test_df = _tts(
+        remaining_df,
+        test_size=test_size,
+        stratify=stratify_col,
+        random_state=seed,
     )
-    logger.info(f"Split: train={len(train_df)}, val={len(val_df)}, test={len(test_df)}")
+
+    # Second split: carve val from train+val
+    val_frac = val_size / (1.0 - test_size)
+    strat_tv = trainval_df["label"] if trainval_df["label"].nunique() > 1 else None
+    train_df, val_df = _tts(
+        trainval_df,
+        test_size=val_frac,
+        stratify=strat_tv,
+        random_state=seed,
+    )
+
+    train_df = train_df.reset_index(drop=True)
+    val_df   = val_df.reset_index(drop=True)
+    test_df  = test_df.reset_index(drop=True)
+
+    logger.info(f"Split (stratified random): train={len(train_df):,}, val={len(val_df):,}, test={len(test_df):,}")
     return train_df, val_df, test_df, holdout_df
 
 

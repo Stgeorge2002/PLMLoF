@@ -35,8 +35,9 @@ training:
   regression_warmup_epochs: 3
   focal_gamma: 0.5             # Mild focal loss — gamma=1.0 was suppressing LoF signal
 
-  # Class weights — LoF recall was 10% so LoF weight is boosted aggressively
-  class_weights: [4.0, 0.6, 1.0]  # LoF=4x, WT=0.6x, GoF=1x
+  # Training data is balanced (100K per class) so heavy class weighting is not needed.
+  # Mild LoF boost retained because LoF is the hardest class to separate from WT.
+  class_weights: [1.5, 0.8, 1.0]  # LoF mild boost, WT slight down-weight, GoF neutral
 
   # Logging
   log_every_n_steps: 25
