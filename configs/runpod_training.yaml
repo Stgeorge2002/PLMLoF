@@ -3,11 +3,11 @@ training:
   # Stage 1: Classification head only (ESM2 frozen)
   stage1:
     max_epochs: 100
-    learning_rate: 5.0e-5        # Peak at epoch 5 (LR=5e-5) in prior runs — 1.5e-4 caused post-warmup collapse
+    learning_rate: 5.0e-5
     weight_decay: 0.01
     batch_size: 64          # A40 48 GB — cached embeddings, no ESM2 in memory
-    gradient_accumulation_steps: 1
-    warmup_ratio: 0.10           # 10 epochs warmup
+    gradient_accumulation_steps: 4   # effective batch = 256; reduces epoch-to-epoch val variance
+    warmup_ratio: 0.10
     scheduler: "cosine"
     # Curriculum learning: start with high-|z| variants, progressively add near-zero
     curriculum_z_thresh: 0.0     # DISABLED — WT variants have near-zero z-score and are excluded by curriculum
@@ -31,9 +31,10 @@ training:
   seed: 42
 
   # Multi-task regression (DMS z-score prediction)
-  regression_weight: 0.0       # DISABLED — Spearman=0.085 in last run, regression adds noise not signal
+  regression_weight: 0.0
   regression_warmup_epochs: 3
-  focal_gamma: 0.5             # Mild focal loss — gamma=1.0 was suppressing LoF signal
+  focal_gamma: 0.0             # Removed — combined with class weights caused gradient oscillation
+  label_smoothing: 0.05        # Mild label smoothing helps calibration on borderline WT variants
 
   # Training data is balanced (100K per class) so heavy class weighting is not needed.
   # Mild LoF boost retained because LoF is the hardest class to separate from WT.

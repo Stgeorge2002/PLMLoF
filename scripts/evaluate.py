@@ -30,7 +30,11 @@ logger = logging.getLogger(__name__)
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate PLMLoF model")
     parser.add_argument("--model", type=str, required=True, help="Path to model checkpoint")
-    parser.add_argument("--test-data", type=str, default=None, help="Path to test data")
+    parser.add_argument("--test-data", type=str, default=None, help="Path to test data parquet")
+    parser.add_argument("--embeddings", type=str, default=None,
+                        help="Path to pre-computed embeddings .pt file for the test set "
+                             "(e.g. data/embeddings/test_embeddings.pt). "
+                             "Skips ESM2 inference when provided.")
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--tiny", action="store_true", help="Use tiny model + synthetic data")
@@ -139,112 +143,158 @@ def main():
         if regressor is not None:
             regressor = regressor.to(device).eval()
 
-        # Load ESM2 for embedding the test set
-        logger.info(f"Loading ESM2: {esm2_name}")
-        tokenizer = AutoTokenizer.from_pretrained(esm2_name)
-        esm2 = AutoModel.from_pretrained(esm2_name).to(device)
-        esm2.eval()
-        for p in esm2.parameters():
-            p.requires_grad = False
+        # ── Fast path: use pre-computed embeddings if available ──────────
+        # Resolve the embeddings path: explicit --embeddings flag, or auto-
+        # detect test_embeddings.pt next to the train/val embeddings.
+        embeddings_path = None
+        if args.embeddings:
+            embeddings_path = Path(args.embeddings)
+        elif args.test_data:
+            _candidate = Path("data/embeddings/test_embeddings.pt")
+            if _candidate.exists():
+                embeddings_path = _candidate
+                logger.info(f"Auto-detected cached test embeddings: {_candidate}")
 
-        # Dataset
-        if args.tiny or args.test_data is None:
-            dataset = SyntheticPLMLoFDataset(num_samples=30)
+        if embeddings_path is not None and embeddings_path.exists():
+            from plmlof.data.dataset import CachedEmbeddingDataset
+            logger.info(f"Using pre-computed embeddings from {embeddings_path} — skipping ESM2 inference")
+            cached_ds = CachedEmbeddingDataset(embeddings_path)
+            cached_loader = DataLoader(
+                cached_ds, batch_size=args.batch_size * 8,  # larger batch OK without ESM2
+                num_workers=4, pin_memory=True,
+            )
+            all_preds, all_labels, all_probs = [], [], []
+            all_reg_preds, all_dms_targets = [], []
+            with torch.no_grad():
+                for batch in tqdm(cached_loader, desc="Evaluating"):
+                    batch = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+                             for k, v in batch.items()}
+                    ref_mean, ref_max = batch["ref_mean"], batch["ref_max"]
+                    var_mean, var_max = batch["var_mean"], batch["var_max"]
+                    if cross_attn is not None:
+                        tokens = torch.stack([ref_mean, ref_max, var_mean, var_max], dim=1)
+                        tokens = cross_attn(tokens)
+                        ref_mean, ref_max, var_mean, var_max = tokens[:, 0], tokens[:, 1], tokens[:, 2], tokens[:, 3]
+                    ref_pool = torch.cat([ref_mean, ref_max], dim=-1)
+                    var_pool = torch.cat([var_mean, var_max], dim=-1)
+                    comp = torch.cat([ref_pool - var_pool, ref_pool * var_pool, ref_pool, var_pool], dim=-1)
+                    comp = comparison.project(comp)
+                    features = torch.cat([comp, feature_norm(batch["nucleotide_features"])], dim=-1)
+                    logits = classifier(features)
+                    all_preds.extend(logits.argmax(dim=-1).cpu().numpy())
+                    all_labels.extend(batch["labels"].cpu().numpy())
+                    all_probs.extend(torch.softmax(logits, dim=-1).cpu().numpy())
+                    if regressor is not None:
+                        reg_pred = regressor(features)
+                        all_reg_preds.extend(reg_pred.cpu().numpy())
+                        all_dms_targets.extend(batch["dms_scores"].cpu().numpy())
+            preds = np.array(all_preds)
+            labels = np.array(all_labels)
+            probs = np.array(all_probs)
+            reg_preds = np.array(all_reg_preds) if all_reg_preds else None
+            dms_targets = np.array(all_dms_targets) if all_dms_targets else None
+
         else:
-            dataset = PLMLoFDataset(args.test_data)
+            # ── Slow path: embed test set on-the-fly with ESM2 ───────────
+            logger.info(f"Loading ESM2: {esm2_name}")
+            tokenizer = AutoTokenizer.from_pretrained(esm2_name)
+            esm2 = AutoModel.from_pretrained(esm2_name).to(device)
+            esm2.eval()
+            for p in esm2.parameters():
+                p.requires_grad = False
 
-        max_len = 1024
+            if args.tiny or args.test_data is None:
+                dataset = SyntheticPLMLoFDataset(num_samples=30)
+            else:
+                dataset = PLMLoFDataset(args.test_data)
 
-        def _collate_eval(batch):
-            ref_seqs = [s["ref_protein"] for s in batch]
-            var_seqs = [s["var_protein"] for s in batch]
-            all_seqs = ref_seqs + var_seqs
-            enc = tokenizer(all_seqs, padding=True, truncation=True,
-                            max_length=max_len, return_tensors="pt")
-            nuc = torch.stack([s["nucleotide_features"] for s in batch])
-            labels = torch.tensor([s["label"] for s in batch], dtype=torch.long)
-            dms_scores = torch.tensor([s.get("dms_score", 0.0) for s in batch], dtype=torch.float32)
-            return {
-                "input_ids": enc["input_ids"],
-                "attention_mask": enc["attention_mask"],
-                "n_ref": len(ref_seqs),
-                "nucleotide_features": nuc,
-                "labels": labels,
-                "dms_scores": dms_scores,
-            }
+            max_len = 1024
 
-        loader = DataLoader(dataset, batch_size=args.batch_size, collate_fn=_collate_eval,
-                            num_workers=4, pin_memory=True)
+            def _collate_eval(batch):
+                ref_seqs = [s["ref_protein"] for s in batch]
+                var_seqs = [s["var_protein"] for s in batch]
+                all_seqs = ref_seqs + var_seqs
+                enc = tokenizer(all_seqs, padding=True, truncation=True,
+                                max_length=max_len, return_tensors="pt")
+                nuc = torch.stack([s["nucleotide_features"] for s in batch])
+                labels = torch.tensor([s["label"] for s in batch], dtype=torch.long)
+                dms_scores = torch.tensor([s.get("dms_score", 0.0) for s in batch], dtype=torch.float32)
+                return {
+                    "input_ids": enc["input_ids"],
+                    "attention_mask": enc["attention_mask"],
+                    "n_ref": len(ref_seqs),
+                    "nucleotide_features": nuc,
+                    "labels": labels,
+                    "dms_scores": dms_scores,
+                }
 
-        all_preds, all_labels, all_probs = [], [], []
-        all_reg_preds, all_dms_targets = [], []
+            loader = DataLoader(dataset, batch_size=args.batch_size, collate_fn=_collate_eval,
+                                num_workers=4, pin_memory=True)
 
-        @torch.no_grad()
-        def _pool(emb, mask):
-            m_f = mask.unsqueeze(-1).float()
-            mean_p = (emb * m_f).sum(1) / m_f.sum(1).clamp(min=1)
-            emb_masked = emb.masked_fill(~mask.unsqueeze(-1).bool(), float("-inf"))
-            max_p = emb_masked.max(dim=1).values
-            max_p = max_p.masked_fill(max_p == float("-inf"), 0.0)
-            return mean_p, max_p
+            all_preds, all_labels, all_probs = [], [], []
+            all_reg_preds, all_dms_targets = [], []
 
-        with torch.no_grad():
-            for batch in tqdm(loader, desc="Evaluating"):
-                ids = batch["input_ids"].to(device, non_blocking=True)
-                mask = batch["attention_mask"].to(device, non_blocking=True)
-                n_ref = batch["n_ref"]
-                nuc = batch["nucleotide_features"].to(device, non_blocking=True)
+            @torch.no_grad()
+            def _pool(emb, mask):
+                m_f = mask.unsqueeze(-1).float()
+                mean_p = (emb * m_f).sum(1) / m_f.sum(1).clamp(min=1)
+                emb_masked = emb.masked_fill(~mask.unsqueeze(-1).bool(), float("-inf"))
+                max_p = emb_masked.max(dim=1).values
+                max_p = max_p.masked_fill(max_p == float("-inf"), 0.0)
+                return mean_p, max_p
 
-                # Use bfloat16 on Ampere+ GPUs (compute capability ≥ 8.0) to match
-                # the dtype used by precompute_embeddings.py; otherwise fall back to
-                # float16.  A mismatch would shift the embedding distribution at
-                # evaluation time relative to training time.
-                _is_ampere = (
-                    device.type == "cuda"
-                    and torch.cuda.get_device_capability(device)[0] >= 8
-                )
-                _amp_dtype = torch.bfloat16 if _is_ampere else torch.float16
-                with torch.amp.autocast("cuda", dtype=_amp_dtype, enabled=device.type == "cuda"):
-                    out = esm2(ids, attention_mask=mask).last_hidden_state
+            with torch.no_grad():
+                for batch in tqdm(loader, desc="Evaluating"):
+                    ids = batch["input_ids"].to(device, non_blocking=True)
+                    mask = batch["attention_mask"].to(device, non_blocking=True)
+                    n_ref = batch["n_ref"]
+                    nuc = batch["nucleotide_features"].to(device, non_blocking=True)
 
-                ref_out, var_out = out[:n_ref], out[n_ref:]
-                ref_mask, var_mask = mask[:n_ref], mask[n_ref:]
+                    _is_ampere = (
+                        device.type == "cuda"
+                        and torch.cuda.get_device_capability(device)[0] >= 8
+                    )
+                    _amp_dtype = torch.bfloat16 if _is_ampere else torch.float16
+                    with torch.amp.autocast("cuda", dtype=_amp_dtype, enabled=device.type == "cuda"):
+                        out = esm2(ids, attention_mask=mask).last_hidden_state
 
-                ref_mean, ref_max = _pool(ref_out, ref_mask)
-                var_mean, var_max = _pool(var_out, var_mask)
+                    ref_out, var_out = out[:n_ref], out[n_ref:]
+                    ref_mask, var_mask = mask[:n_ref], mask[n_ref:]
 
-                # Optional cross-attention between pooled vectors
-                if cross_attn is not None:
-                    tokens = torch.stack([ref_mean, ref_max, var_mean, var_max], dim=1)
-                    tokens = cross_attn(tokens)
-                    ref_mean, ref_max, var_mean, var_max = tokens[:, 0], tokens[:, 1], tokens[:, 2], tokens[:, 3]
+                    ref_mean, ref_max = _pool(ref_out, ref_mask)
+                    var_mean, var_max = _pool(var_out, var_mask)
 
-                ref_pool = torch.cat([ref_mean, ref_max], dim=-1)
-                var_pool = torch.cat([var_mean, var_max], dim=-1)
-                diff_pool = ref_pool - var_pool
-                prod_pool = ref_pool * var_pool
-                comp = torch.cat([diff_pool, prod_pool, ref_pool, var_pool], dim=-1)
-                comp = comparison.project(comp)
-                nuc_normed = feature_norm(nuc)
-                features = torch.cat([comp, nuc_normed], dim=-1)
-                logits = classifier(features)
+                    if cross_attn is not None:
+                        tokens = torch.stack([ref_mean, ref_max, var_mean, var_max], dim=1)
+                        tokens = cross_attn(tokens)
+                        ref_mean, ref_max, var_mean, var_max = tokens[:, 0], tokens[:, 1], tokens[:, 2], tokens[:, 3]
 
-                probs = torch.softmax(logits, dim=-1).cpu().numpy()
-                preds_batch = logits.argmax(dim=-1).cpu().numpy()
-                all_preds.extend(preds_batch)
-                all_labels.extend(batch["labels"].numpy())
-                all_probs.extend(probs)
+                    ref_pool = torch.cat([ref_mean, ref_max], dim=-1)
+                    var_pool = torch.cat([var_mean, var_max], dim=-1)
+                    diff_pool = ref_pool - var_pool
+                    prod_pool = ref_pool * var_pool
+                    comp = torch.cat([diff_pool, prod_pool, ref_pool, var_pool], dim=-1)
+                    comp = comparison.project(comp)
+                    nuc_normed = feature_norm(nuc)
+                    features = torch.cat([comp, nuc_normed], dim=-1)
+                    logits = classifier(features)
 
-                if regressor is not None:
-                    reg_pred = regressor(features)
-                    all_reg_preds.extend(reg_pred.cpu().numpy())
-                    all_dms_targets.extend(batch["dms_scores"].numpy())
+                    probs = torch.softmax(logits, dim=-1).cpu().numpy()
+                    preds_batch = logits.argmax(dim=-1).cpu().numpy()
+                    all_preds.extend(preds_batch)
+                    all_labels.extend(batch["labels"].numpy())
+                    all_probs.extend(probs)
 
-        preds = np.array(all_preds)
-        labels = np.array(all_labels)
-        probs = np.array(all_probs)
-        reg_preds = np.array(all_reg_preds) if all_reg_preds else None
-        dms_targets = np.array(all_dms_targets) if all_dms_targets else None
+                    if regressor is not None:
+                        reg_pred = regressor(features)
+                        all_reg_preds.extend(reg_pred.cpu().numpy())
+                        all_dms_targets.extend(batch["dms_scores"].numpy())
+
+            preds = np.array(all_preds)
+            labels = np.array(all_labels)
+            probs = np.array(all_probs)
+            reg_preds = np.array(all_reg_preds) if all_reg_preds else None
+            dms_targets = np.array(all_dms_targets) if all_dms_targets else None
 
     else:
         # ── Full-model checkpoint ─────────────────────────────────────────

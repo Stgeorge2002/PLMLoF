@@ -170,6 +170,7 @@ if [[ "$MODE" == "full" || "$MODE" == "test" ]]; then
             python scripts/precompute_embeddings.py \
                 --train-data "$DATA_DIR/train.parquet" \
                 --val-data "$DATA_DIR/val.parquet" \
+                --test-data "$DATA_DIR/test.parquet" \
                 --output-dir "$EMB_DIR" \
                 --device "$DEVICE" \
                 --batch-size 64   # Conservative for A40 — long sequences (>800 aa) OOM at 256
@@ -220,16 +221,22 @@ if [[ "$MODE" == "full" || "$MODE" == "train" || "$MODE" == "test" ]]; then
             python scripts/evaluate.py \
                 --model "$S1_CHECKPOINT" \
                 --test-data "$DATA_DIR/test.parquet" \
+                --embeddings "$EMB_DIR/test_embeddings.pt" \
                 --device "$DEVICE"
 
-            HOLDOUT_DATA="$DATA_DIR/test_holdout_species.parquet"
-            if [[ -f "$HOLDOUT_DATA" ]]; then
-                echo "  Evaluating Stage 1 model on held-out species (cross-species)..."
-                python scripts/evaluate.py \
-                    --model "$S1_CHECKPOINT" \
-                    --test-data "$HOLDOUT_DATA" \
-                    --device "$DEVICE"
-            fi
+            # Per-species evaluation: E. coli, M. tuberculosis, S. aureus, Klebsiella, S. pneumoniae
+            for SPECIES_TAG in ecoli myctu stau klepn strpn; do
+                SPECIES_PARQUET="$DATA_DIR/test_${SPECIES_TAG}.parquet"
+                SPECIES_EMB="$EMB_DIR/test_${SPECIES_TAG}_embeddings.pt"
+                if [[ -f "$SPECIES_PARQUET" ]]; then
+                    echo "  Evaluating Stage 1 — ${SPECIES_TAG} species..."
+                    python scripts/evaluate.py \
+                        --model "$S1_CHECKPOINT" \
+                        --test-data "$SPECIES_PARQUET" \
+                        --embeddings "$SPECIES_EMB" \
+                        --device "$DEVICE"
+                fi
+            done
         else
             echo "  No Stage 1 checkpoint at $CHECKPOINT — skipping Stage 1 evaluation."
         fi
@@ -283,17 +290,22 @@ if [[ "$MODE" == "full" || "$MODE" == "eval" || "$MODE" == "eval_after_train" ||
             python scripts/evaluate.py \
                 --model "$CHECKPOINT" \
                 --test-data "$DATA_DIR/test.parquet" \
+                --embeddings "$EMB_DIR/test_embeddings.pt" \
                 --device "$DEVICE"
 
-            # Cross-species generalisation evaluation (Pseudomonas / Salmonella)
-            HOLDOUT_DATA="$DATA_DIR/test_holdout_species.parquet"
-            if [[ -f "$HOLDOUT_DATA" ]]; then
-                echo "Evaluating on held-out species (cross-species generalisation)..."
-                python scripts/evaluate.py \
-                    --model "$CHECKPOINT" \
-                    --test-data "$HOLDOUT_DATA" \
-                    --device "$DEVICE"
-            fi
+            # Per-species evaluation: E. coli, M. tuberculosis, S. aureus, Klebsiella, S. pneumoniae
+            for SPECIES_TAG in ecoli myctu stau klepn strpn; do
+                SPECIES_PARQUET="$DATA_DIR/test_${SPECIES_TAG}.parquet"
+                SPECIES_EMB="$EMB_DIR/test_${SPECIES_TAG}_embeddings.pt"
+                if [[ -f "$SPECIES_PARQUET" ]]; then
+                    echo "Evaluating final model — ${SPECIES_TAG} species..."
+                    python scripts/evaluate.py \
+                        --model "$CHECKPOINT" \
+                        --test-data "$SPECIES_PARQUET" \
+                        --embeddings "$SPECIES_EMB" \
+                        --device "$DEVICE"
+                fi
+            done
         else
             echo "No checkpoint at $CHECKPOINT. Skipping evaluation."
         fi

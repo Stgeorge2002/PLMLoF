@@ -59,6 +59,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Pre-compute ESM2 embeddings")
     parser.add_argument("--train-data", type=str, required=True)
     parser.add_argument("--val-data", type=str, default=None)
+    parser.add_argument("--test-data", type=str, default=None)
+    parser.add_argument("--holdout-data", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default="data/embeddings/")
     parser.add_argument("--esm2-model", type=str, default="facebook/esm2_t33_650M_UR50D")
     parser.add_argument("--batch-size", type=int, default=256)
@@ -199,6 +201,27 @@ def main():
         logger.info(f"Loading val data: {args.val_data}")
         val_ds = PLMLoFDataset(args.val_data, max_seq_length=args.max_seq_length)
         splits.append(("val", val_ds, output_dir / "val_embeddings.pt"))
+    if args.test_data:
+        logger.info(f"Loading test data: {args.test_data}")
+        test_ds = PLMLoFDataset(args.test_data, max_seq_length=args.max_seq_length)
+        splits.append(("test", test_ds, output_dir / "test_embeddings.pt"))
+    if args.holdout_data:
+        logger.info(f"Loading holdout data: {args.holdout_data}")
+        holdout_ds = PLMLoFDataset(args.holdout_data, max_seq_length=args.max_seq_length)
+        splits.append(("holdout", holdout_ds, output_dir / "holdout_embeddings.pt"))
+
+    # Auto-detect per-species test files (test_ecoli.parquet, test_myctu.parquet, …)
+    # produced by curate_dataset.py and add them to the embedding job.
+    _data_dir = Path(args.test_data).parent if args.test_data else Path("data/processed")
+    for _species_parquet in sorted(_data_dir.glob("test_*.parquet")):
+        if _species_parquet.name == "test.parquet":
+            continue  # main test already added above
+        _tag = _species_parquet.stem  # e.g. "test_ecoli"
+        _emb_path = output_dir / f"{_tag}_embeddings.pt"
+        logger.info(f"Auto-detected per-species test file: {_species_parquet.name}")
+        _ds = PLMLoFDataset(str(_species_parquet), max_seq_length=args.max_seq_length)
+        if len(_ds) > 0:
+            splits.append((_tag, _ds, _emb_path))
 
     # ── Collect unique sequences across ALL splits ──
     all_unique: set[str] = set()

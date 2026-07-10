@@ -427,6 +427,10 @@ def _guess_species(dms_id: str) -> str:
         "PSEAE": "Pseudomonas aeruginosa",
         "BACSU": "Bacillus subtilis",
         "SALTY": "Salmonella typhimurium",
+        "STRPN": "Streptococcus pneumoniae",
+        "STRAN": "Streptococcus",
+        "STRPY": "Streptococcus pyogenes",
+        "HUMAN": "Homo sapiens",
     }
     parts = dms_id.upper().split("_")
     for part in parts:

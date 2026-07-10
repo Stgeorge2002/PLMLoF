@@ -396,6 +396,7 @@ class CachedTrainer:
         val_loader: DataLoader,
         device: str | torch.device = "cpu",
         output_dir: str = "outputs/",
+        class_weights: list[float] | None = None,
         label_smoothing: float = 0.0,
         mixed_precision: str = "no",
         # Multi-task regression
@@ -481,7 +482,11 @@ class CachedTrainer:
 
         # FocalLoss with gamma=0 is equivalent to CrossEntropyLoss (no down-weighting).
         # Set focal_gamma > 0 to focus on hard examples (useful for imbalanced datasets).
-        self.criterion = FocalLoss(gamma=focal_gamma, label_smoothing=label_smoothing)
+        weight = None
+        if class_weights is not None:
+            weight = torch.tensor(class_weights, dtype=torch.float32, device=self.device)
+            logger.info(f"CachedTrainer: using class weights {class_weights}")
+        self.criterion = FocalLoss(gamma=focal_gamma, label_smoothing=label_smoothing, weight=weight)
         self.reg_criterion = nn.SmoothL1Loss()
         self.best_metric = 0.0
         self.best_epoch = -1
@@ -748,6 +753,10 @@ class CachedTrainer:
 
         epochs_without_improvement = 0
         best_val_metrics = {}
+        # EMA of val macro_f1 for early-stopping — reduces sensitivity to single noisy epochs.
+        # α=0.3 gives ~70% weight to recent epoch, ~30% to history.
+        ema_f1: float | None = None
+        ema_alpha = 0.3
 
         logger.info(f"Starting cached training (lr={learning_rate}, epochs={start_epoch}-{max_epochs})")
 
@@ -779,12 +788,20 @@ class CachedTrainer:
             val_m = self._eval_epoch()
             scheduler.step()
 
+            current_lr = optimizer.param_groups[0]["lr"]
+            # Per-class recall for quick diagnosis (LoF/WT/GoF)
+            lof_r  = val_m.get("LoF_recall", float("nan"))
+            wt_r   = val_m.get("WT_recall",  float("nan"))
+            gof_r  = val_m.get("GoF_recall", float("nan"))
             logger.info(f"  Train loss={train_m['loss']:.4f}, macro_f1={train_m['macro_f1']:.4f}" +
                         (f", spearman={train_m.get('spearman', 0):.4f}" if self.regressor else ""))
-            current_lr = optimizer.param_groups[0]["lr"]
             logger.info(f"  Val   loss={val_m['loss']:.4f}, macro_f1={val_m['macro_f1']:.4f}" +
                         (f", spearman={val_m.get('spearman', 0):.4f}" if self.regressor else "") +
                         f", lr={current_lr:.2e}")
+            logger.info(f"  Val   recall — LoF={lof_r:.3f}, WT={wt_r:.3f}, GoF={gof_r:.3f}")
+
+            # EMA smoothing for early-stopping (ignore single noisy dips)
+            ema_f1 = val_m["macro_f1"] if ema_f1 is None else ema_alpha * val_m["macro_f1"] + (1 - ema_alpha) * ema_f1
 
             # Epoch-level rollback: only on catastrophic collapse (>70% drop from best),
             # not on normal val noise. Does NOT reduce LR — LR reduction on rollback was
@@ -814,7 +831,12 @@ class CachedTrainer:
                 self._save_checkpoint(epoch, val_m)
                 epochs_without_improvement = 0
             else:
-                epochs_without_improvement += 1
+                # Count patience against EMA, not raw val — avoids stopping on a single noisy epoch
+                if ema_f1 is not None and ema_f1 > self.best_metric * 0.97:
+                    # EMA still near best — don't penalise this epoch
+                    pass
+                else:
+                    epochs_without_improvement += 1
                 if epochs_without_improvement >= patience:
                     logger.info(f"Early stopping at epoch {epoch}")
                     break
