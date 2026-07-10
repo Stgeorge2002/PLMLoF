@@ -38,7 +38,7 @@ class FocalLoss(nn.Module):
 
 
 class ClassifierHead(nn.Module):
-    """MLP classification head.
+    """MLP classification head with residual connections.
 
     Takes concatenated comparison features + nucleotide features
     and outputs class logits.
@@ -62,19 +62,36 @@ class ClassifierHead(nn.Module):
         if hidden_dims is None:
             hidden_dims = [256, 64]
 
-        layers: list[nn.Module] = []
-        prev_dim = input_size
-        for i, dim in enumerate(hidden_dims):
-            layers.append(nn.Linear(prev_dim, dim))
-            layers.append(nn.ReLU())
-            # Decrease dropout for later layers
-            drop_rate = dropout * (1 - i * 0.3)
-            layers.append(nn.Dropout(max(drop_rate, 0.1)))
-            prev_dim = dim
-
-        layers.append(nn.Linear(prev_dim, num_classes))
-
-        self.mlp = nn.Sequential(*layers)
+        self.hidden_dims = hidden_dims
+        self.dropout = dropout
+        
+        # Input projection to match first hidden dim
+        self.input_proj = nn.Linear(input_size, hidden_dims[0])
+        
+        # Hidden layers with residual connections
+        self.layers = nn.ModuleList()
+        self.layer_norms = nn.ModuleList()
+        for i in range(len(hidden_dims) - 1):
+            self.layers.append(nn.Linear(hidden_dims[i], hidden_dims[i + 1]))
+            self.layer_norms.append(nn.LayerNorm(hidden_dims[i + 1]))
+        
+        # Output layer
+        self.output = nn.Linear(hidden_dims[-1], num_classes)
+        
+        # Initialize weights
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize weights for stable training."""
+        nn.init.xavier_uniform_(self.input_proj.weight)
+        nn.init.zeros_(self.input_proj.bias)
+        
+        for layer in self.layers:
+            nn.init.xavier_uniform_(layer.weight, gain=0.5)  # Small gain for residual
+            nn.init.zeros_(layer.bias)
+        
+        nn.init.xavier_uniform_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         """
@@ -84,7 +101,28 @@ class ClassifierHead(nn.Module):
         Returns:
             Logits [batch, num_classes].
         """
-        return self.mlp(features)
+        # Initial projection
+        x = self.input_proj(features)
+        x = F.relu(x)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        
+        # Hidden layers with residual connections
+        for i, (layer, norm) in enumerate(zip(self.layers, self.layer_norms)):
+            residual = x
+            x = layer(x)
+            x = norm(x)
+            x = F.relu(x)
+            
+            # Residual connection if dimensions match
+            if x.shape == residual.shape:
+                x = x + residual
+            
+            # Decrease dropout for later layers
+            drop_rate = self.dropout * (1 - (i + 1) * 0.3)
+            x = F.dropout(x, p=max(drop_rate, 0.1), training=self.training)
+        
+        # Output layer
+        return self.output(x)
 
 
 class RegressionHead(nn.Module):

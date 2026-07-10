@@ -218,6 +218,9 @@ def main():
             curriculum_z_thresh=s1_cfg.get("curriculum_z_thresh", 0.0),
             curriculum_epochs=s1_cfg.get("curriculum_epochs", 0),
             scheduler=s1_cfg.get("scheduler", "cosine"),
+            mixup_alpha=train_cfg.get("mixup_alpha", 0.0),
+            mixup_prob=train_cfg.get("mixup_prob", 0.5),
+            noise_scale=train_cfg.get("noise_scale", 0.0),
         )
 
         logger.info("=" * 60)

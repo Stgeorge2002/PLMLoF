@@ -420,9 +420,16 @@ class CachedTrainer:
         curriculum_epochs: int = 0,
         # LR scheduler type
         scheduler: str = "cosine",
+        # Data augmentation
+        mixup_alpha: float = 0.0,
+        mixup_prob: float = 0.5,
+        noise_scale: float = 0.0,
     ):
         self.device = torch.device(device)
         self.scheduler_type = scheduler
+        self.mixup_alpha = mixup_alpha
+        self.mixup_prob = mixup_prob
+        self.noise_scale = noise_scale
         self.comparison = comparison.to(self.device)
         self.classifier = classifier.to(self.device)
         self.regressor = regressor.to(self.device) if regressor is not None else None
@@ -513,7 +520,51 @@ class CachedTrainer:
             "warmup_ratio": warmup_ratio,
             "curriculum_z_thresh": curriculum_z_thresh,
             "curriculum_epochs": curriculum_epochs,
+            "mixup_alpha": mixup_alpha,
+            "mixup_prob": mixup_prob,
+            "noise_scale": noise_scale,
         }
+
+    def _mixup_embeddings(self, batch: dict) -> dict:
+        """Apply mixup augmentation to cached embeddings.
+        
+        Mixes embeddings within the same class to improve generalization.
+        Uses beta distribution to sample mixing coefficients.
+        
+        Args:
+            batch: Dictionary with 'ref_mean', 'ref_max', 'var_mean', 'var_max', 'labels'
+        
+        Returns:
+            Augmented batch dictionary
+        """
+        if self.mixup_alpha <= 0 or not self.training:
+            return batch
+        
+        import numpy as np
+        
+        # Sample mixing coefficient from beta distribution
+        lam = np.random.beta(self.mixup_alpha, self.mixup_alpha)
+        batch_size = batch['labels'].size(0)
+        
+        # Random permutation for mixing
+        index = torch.randperm(batch_size, device=self.device)
+        
+        # Only mix within same class (safer for hard labels)
+        same_class = batch['labels'] == batch['labels'][index]
+        lam_vec = torch.where(same_class, torch.tensor(lam, device=self.device), 
+                              torch.tensor(1.0, device=self.device)).float()
+        lam_vec = lam_vec.view(-1, 1)
+        
+        # Mix embeddings (vectorized)
+        batch['ref_mean'] = lam_vec * batch['ref_mean'] + (1 - lam_vec) * batch['ref_mean'][index]
+        batch['ref_max'] = lam_vec * batch['ref_max'] + (1 - lam_vec) * batch['ref_max'][index]
+        batch['var_mean'] = lam_vec * batch['var_mean'] + (1 - lam_vec) * batch['var_mean'][index]
+        batch['var_max'] = lam_vec * batch['var_max'] + (1 - lam_vec) * batch['var_max'][index]
+        
+        # Note: labels remain unchanged (hard labels, no soft mixing)
+        # Nucleotide features also remain unchanged (engineered features)
+        
+        return batch
 
     def _forward(self, batch: dict) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Reconstruct comparison features from cached pooled embeddings and classify.
@@ -524,6 +575,13 @@ class CachedTrainer:
         # Reconstruct pooled ref/var as [mean, max] concatenation
         ref_mean, ref_max = batch["ref_mean"], batch["ref_max"]
         var_mean, var_max = batch["var_mean"], batch["var_max"]
+        
+        # Noise injection for regularization (training only)
+        if self.training and self.noise_scale > 0:
+            ref_mean = ref_mean + torch.randn_like(ref_mean) * self.noise_scale
+            ref_max = ref_max + torch.randn_like(ref_max) * self.noise_scale
+            var_mean = var_mean + torch.randn_like(var_mean) * self.noise_scale
+            var_max = var_max + torch.randn_like(var_max) * self.noise_scale
 
         # Optional cross-attention between the 4 pooled vectors
         if self.cross_attn is not None:
@@ -581,6 +639,10 @@ class CachedTrainer:
         for step, batch in enumerate(pbar):
             batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
                      for k, v in batch.items()}
+            
+            # Apply mixup augmentation with probability mixup_prob
+            if self.mixup_alpha > 0 and torch.rand(1).item() < self.mixup_prob:
+                batch = self._mixup_embeddings(batch)
 
             with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
                 logits, reg_pred = self._forward(batch)

@@ -38,11 +38,16 @@ training:
   regression_weight: 0.0       # Disabled — remove regression head in future if not needed
   regression_warmup_epochs: 3
   focal_gamma: 2.0             # Keep proven value — higher values caused instability
-  label_smoothing: 0.05        # Keep proven value — works well with focal loss
+  label_smoothing: 0.10        # Increased for better calibration (from 0.05)
 
-  # Training data is balanced (100K per class) — no class weighting needed.
-  # Focal loss handles hard examples without introducing class bias.
-  class_weights: null          # Balanced dataset — equal treatment for all classes
+  # Class weights target WT weakness (70.7% recall vs 83%+ for LoF/GoF)
+  # Boost WT (class 1) to improve macro F1 by lifting weakest class
+  class_weights: [1.0, 1.3, 1.0]  # [LoF, WT, GoF] — 30% boost for WT class
+
+  # Data augmentation
+  mixup_alpha: 0.2             # Beta distribution parameter for mixup (0=disabled)
+  mixup_prob: 0.5              # Probability of applying mixup to a batch
+  noise_scale: 0.01            # Gaussian noise std for embedding augmentation (training only)
 
   # Logging
   log_every_n_steps: 25

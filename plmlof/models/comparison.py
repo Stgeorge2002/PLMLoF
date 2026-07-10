@@ -68,6 +68,15 @@ class ComparisonModule(nn.Module):
         raw_size = self.output_size
         self._pre_norm = nn.LayerNorm(raw_size)
 
+        # Gated feature selection: learn which comparison features are important
+        # Gate outputs [0, 1] weights for each feature dimension
+        self._gate = nn.Sequential(
+            nn.Linear(raw_size, raw_size // 4),
+            nn.ReLU(),
+            nn.Linear(raw_size // 4, raw_size),
+            nn.Sigmoid(),
+        )
+
         # Two-stage projection with activation for better gradient flow
         proj_intermediate = 2 * hidden_size
         self._proj = nn.Sequential(
@@ -87,14 +96,30 @@ class ComparisonModule(nn.Module):
                 nn.init.xavier_uniform_(m.weight, gain=0.1)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+        
+        # Initialize gate to be near 1.0 initially (minimal gating early in training)
+        for m in self._gate.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.1)
+                if m.bias is not None:
+                    # Bias sigmoid(3.0) ≈ 0.95, so gate starts mostly open
+                    nn.init.constant_(m.bias, 3.0 / len(list(self._gate.modules())))
 
     def project(self, raw_comparison: torch.Tensor) -> torch.Tensor:
-        """Normalize and project raw comparison features.
+        """Normalize, gate, and project raw comparison features.
 
         Use this method in both cached and non-cached training paths
         to ensure consistent processing.
         """
-        return self._proj(self._pre_norm(raw_comparison))
+        # Normalize raw features
+        normalized = self._pre_norm(raw_comparison)
+        
+        # Apply learned gating (element-wise feature selection)
+        gates = self._gate(normalized)
+        gated_features = normalized * gates
+        
+        # Project to output size
+        return self._proj(gated_features)
 
     def _pool(
         self, embeddings: torch.Tensor, mask: torch.Tensor
