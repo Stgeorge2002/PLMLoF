@@ -271,12 +271,40 @@ class PLMLoFTrainer:
         else:
             self.model.disable_lora_training()
 
+        # Bug fix: when Stage 2 starts as a fresh trainer (--stage2-only), inherit the
+        # best metric from the existing Stage 1 checkpoint so Stage 2 can only replace
+        # the checkpoint if it actually improves on Stage 1.
+        # Guard is restricted to stage == 2 so that a fresh Stage 1 run is never
+        # incorrectly blocked from saving by a leftover checkpoint from a prior run.
+        ckpt_path = self.output_dir / "checkpoints" / "model_best.pt"
+        if stage == 2 and ckpt_path.exists() and self.best_metric == 0.0:
+            try:
+                _prev = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+                _prev_f1 = _prev.get("metrics", {}).get("macro_f1", 0.0)
+                if _prev_f1 > self.best_metric:
+                    self.best_metric = _prev_f1
+                    self.best_epoch = _prev.get("epoch", -1)
+                    logger.info(
+                        f"  Initialized best_metric={self.best_metric:.4f} from "
+                        f"existing checkpoint (epoch {self.best_epoch})"
+                    )
+            except Exception as _e:
+                logger.warning(f"  Could not read existing checkpoint metrics: {_e}")
+
         optimizer = self._build_optimizer(learning_rate, weight_decay)
-        # Linear warmup + cosine decay for stable training with randomly initialized heads
-        warmup_epochs = min(10, max(1, max_epochs // 10))
-        warmup_sched = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
-        cosine_sched = CosineAnnealingLR(optimizer, T_max=max(max_epochs - warmup_epochs, 1), eta_min=1e-6)
-        scheduler = SequentialLR(optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_epochs])
+        # Warmup proportion: round(10%) of epochs.  round() naturally gives 0 for
+        # short Stage-2 runs (e.g. 3 epochs → round(0.3)=0) so we skip the
+        # near-zero-LR warmup epoch that previously wasted 33% of Stage-2 training
+        # and caused a damaging LR jump from ~5e-7 to full LR in the next epoch.
+        # Stage-1 (many epochs) still gets a proper 10% warmup.
+        warmup_epochs = min(10, round(max_epochs * 0.1))
+        if warmup_epochs > 0:
+            warmup_sched = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
+            cosine_sched = CosineAnnealingLR(optimizer, T_max=max(max_epochs - warmup_epochs, 1), eta_min=1e-6)
+            scheduler = SequentialLR(optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_epochs])
+        else:
+            # No warmup: start at full LR and decay with cosine from epoch 1.
+            scheduler = CosineAnnealingLR(optimizer, T_max=max(max_epochs, 1), eta_min=1e-6)
 
         epochs_without_improvement = 0
         best_val_metrics = {}
@@ -310,6 +338,27 @@ class PLMLoFTrainer:
                     ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
                     if "model_state_dict" in ckpt:
                         self.model.load_state_dict(ckpt["model_state_dict"])
+                    elif ckpt.get("cached_training"):
+                        # Checkpoint is from CachedTrainer (comparison + classifier only).
+                        # Restore the submodule weights that Stage 2 builds on top of.
+                        try:
+                            self.model.comparison.load_state_dict(ckpt["comparison_state_dict"])
+                            self.model.classifier.load_state_dict(ckpt["classifier_state_dict"])
+                            if "feature_norm_state_dict" in ckpt:
+                                self.model.feature_norm.load_state_dict(ckpt["feature_norm_state_dict"])
+                            logger.info("  Rollback restored weights from CachedTrainer checkpoint.")
+                        except (RuntimeError, KeyError) as _re:
+                            logger.warning(
+                                f"  Rollback from CachedTrainer checkpoint failed: {_re}. "
+                                "Continuing without weight restoration."
+                            )
+                    else:
+                        logger.warning(
+                            "  Rollback skipped: checkpoint format unrecognised "
+                            f"(keys: {list(ckpt.keys())[:6]})."
+                        )
+                else:
+                    logger.warning("  Rollback skipped: no checkpoint file found.")
                 continue  # don't count toward patience
 
             # Check for improvement

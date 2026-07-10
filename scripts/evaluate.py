@@ -195,7 +195,16 @@ def main():
                 n_ref = batch["n_ref"]
                 nuc = batch["nucleotide_features"].to(device, non_blocking=True)
 
-                with torch.amp.autocast("cuda", dtype=torch.float16, enabled=device.type == "cuda"):
+                # Use bfloat16 on Ampere+ GPUs (compute capability ≥ 8.0) to match
+                # the dtype used by precompute_embeddings.py; otherwise fall back to
+                # float16.  A mismatch would shift the embedding distribution at
+                # evaluation time relative to training time.
+                _is_ampere = (
+                    device.type == "cuda"
+                    and torch.cuda.get_device_capability(device)[0] >= 8
+                )
+                _amp_dtype = torch.bfloat16 if _is_ampere else torch.float16
+                with torch.amp.autocast("cuda", dtype=_amp_dtype, enabled=device.type == "cuda"):
                     out = esm2(ids, attention_mask=mask).last_hidden_state
 
                 ref_out, var_out = out[:n_ref], out[n_ref:]

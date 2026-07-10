@@ -160,25 +160,27 @@ def stratified_split(
     non_test_df = remaining_df[~remaining_df["gene"].isin(test_genes)].copy()
     test_df = remaining_df[remaining_df["gene"].isin(test_genes)].reset_index(drop=True)
 
-    # Random stratified val split on the non-test data
-    from sklearn.model_selection import train_test_split as _tts
-    val_fraction = val_size / (1 - test_size)
-    try:
-        train_df, val_df = _tts(
-            non_test_df,
-            test_size=val_fraction,
-            stratify=non_test_df["label"],
-            random_state=seed,
-        )
-    except ValueError:
-        train_df, val_df = _tts(non_test_df, test_size=val_fraction, random_state=seed)
+    # Gene-level val split - holds out entire genes so that validation honestly
+    # reflects generalisation to unseen genes (mirrors the test set condition).
+    # A random-stratified val would inflate metrics because the model can memorise
+    # per-gene patterns that appear in both train and val.
+    non_test_genes = np.array(sorted(set(genes.tolist()) - test_genes))
+    rng.shuffle(non_test_genes)
 
-    train_df = train_df.reset_index(drop=True)
-    val_df = val_df.reset_index(drop=True)
+    n_val_genes = max(1, round(n_genes * val_size))
+    # Guard: leave at least half of remaining genes for training
+    max_val_genes = max(1, (len(non_test_genes) - 1) // 2)
+    n_val_genes = min(n_val_genes, max_val_genes)
+
+    val_genes = set(non_test_genes[:n_val_genes].tolist())
+    train_genes = set(non_test_genes[n_val_genes:].tolist())
+
+    train_df = non_test_df[non_test_df["gene"].isin(train_genes)].reset_index(drop=True)
+    val_df = non_test_df[non_test_df["gene"].isin(val_genes)].reset_index(drop=True)
 
     logger.info(
         f"Split: gene-level test ({n_test_genes}/{n_genes} genes), "
-        f"random-stratified train/val"
+        f"gene-level val ({n_val_genes}/{n_genes} genes)"
     )
     logger.info(f"Split: train={len(train_df)}, val={len(val_df)}, test={len(test_df)}")
     return train_df, val_df, test_df, holdout_df

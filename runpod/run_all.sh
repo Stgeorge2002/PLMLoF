@@ -206,6 +206,35 @@ if [[ "$MODE" == "full" || "$MODE" == "train" || "$MODE" == "test" ]]; then
             --output-dir "$OUTPUT_DIR" \
             $S1_EPOCH_FLAG
 
+        # ── Step 3a: Evaluate Stage 1 model before LoRA fine-tuning ──────────
+        # Run this now so Stage 2 cannot overwrite model_best.pt before we record
+        # Stage 1 baseline numbers.  Also saves a permanent Stage 1 copy.
+        echo "──────── Step 3a: Stage 1 Evaluation (pre-LoRA baseline) ────────"
+        if [[ -f "$CHECKPOINT" ]]; then
+            # Preserve Stage 1 checkpoint so the comparison is available after Stage 2
+            S1_CHECKPOINT="$OUTPUT_DIR/checkpoints/model_stage1.pt"
+            cp "$CHECKPOINT" "$S1_CHECKPOINT"
+            echo "  Saved Stage 1 checkpoint → $S1_CHECKPOINT"
+
+            echo "  Evaluating Stage 1 model on held-out test set..."
+            python scripts/evaluate.py \
+                --model "$S1_CHECKPOINT" \
+                --test-data "$DATA_DIR/test.parquet" \
+                --device "$DEVICE"
+
+            HOLDOUT_DATA="$DATA_DIR/test_holdout_species.parquet"
+            if [[ -f "$HOLDOUT_DATA" ]]; then
+                echo "  Evaluating Stage 1 model on held-out species (cross-species)..."
+                python scripts/evaluate.py \
+                    --model "$S1_CHECKPOINT" \
+                    --test-data "$HOLDOUT_DATA" \
+                    --device "$DEVICE"
+            fi
+        else
+            echo "  No Stage 1 checkpoint at $CHECKPOINT — skipping Stage 1 evaluation."
+        fi
+        echo ""
+
         # Stage 2: LoRA fine-tuning of ESM2 encoder (requires Stage 1 checkpoint)
         echo "──────── Step 3b: Stage 2 LoRA Fine-tuning ────────"
         if [[ -f "$CHECKPOINT" ]]; then
@@ -234,9 +263,9 @@ if [[ "$MODE" == "train" ]]; then
     MODE="eval_after_train"
 fi
 
-# ── STEP 4: Evaluation ──
+# ── STEP 4: Evaluation (final / best model) ──
 if [[ "$MODE" == "full" || "$MODE" == "eval" || "$MODE" == "eval_after_train" || "$MODE" == "test" ]]; then
-    echo "──────── Step 4: Evaluation ────────"
+    echo "──────── Step 4: Evaluation (final best model) ────────"
 
     if [[ "$MODE" == "test" ]]; then
         CHECKPOINT="outputs/test_run/checkpoints/model_best.pt"
@@ -250,7 +279,7 @@ if [[ "$MODE" == "full" || "$MODE" == "eval" || "$MODE" == "eval_after_train" ||
         fi
     else
         if [[ -f "$CHECKPOINT" ]]; then
-            echo "Evaluating on held-out test set..."
+            echo "Evaluating final model on held-out test set..."
             python scripts/evaluate.py \
                 --model "$CHECKPOINT" \
                 --test-data "$DATA_DIR/test.parquet" \

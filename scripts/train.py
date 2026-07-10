@@ -150,7 +150,14 @@ def main():
 
         logger.info(f"Using pre-computed embeddings from {emb_dir}")
         train_dataset = CachedEmbeddingDataset(train_cache)
-        val_dataset = CachedEmbeddingDataset(val_cache) if val_cache.exists() else train_dataset
+        if not val_cache.exists():
+            logger.error(
+                f"Validation embeddings not found: {val_cache}\n"
+                "Re-run precompute_embeddings.py with --val-data, or provide --val-data "
+                "when training without --precomputed."
+            )
+            sys.exit(1)
+        val_dataset = CachedEmbeddingDataset(val_cache)
         logger.info(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
 
         # Respect --num-workers flag (or auto-detect) in cached mode too
@@ -232,7 +239,14 @@ def main():
         val_dataset = SyntheticPLMLoFDataset(num_samples=20, seed=seed + 1)
     else:
         train_dataset = PLMLoFDataset(args.train_data)
-        val_dataset = PLMLoFDataset(args.val_data) if args.val_data else PLMLoFDataset(args.train_data)
+        if args.val_data is None:
+            logger.error(
+                "--val-data is required when --train-data is provided. "
+                "Without a separate validation set the model evaluates on training data, "
+                "metrics are inflated, and early stopping is meaningless."
+            )
+            sys.exit(1)
+        val_dataset = PLMLoFDataset(args.val_data)
 
     collator = PLMLoFCollator(tokenizer_name=esm2_name)
 

@@ -42,28 +42,32 @@ class ESM2Encoder(nn.Module):
 
         self._lora_enabled = lora_config is not None
 
-        # Enable gradient checkpointing to reduce VRAM during fine-tuning
-        if lora_config is not None:
-            self.model.enable_input_require_grads()
-            self.model.gradient_checkpointing_enable()
+        # Gradient checkpointing is only needed during LoRA fine-tuning (Stage 2).
+        # It is enabled lazily in enable_lora() to avoid the misleading
+        # "None of the inputs have requires_grad=True" warning during Stage 1.
 
     @property
     def device(self) -> torch.device:
         return next(self.model.parameters()).device
 
     def enable_lora(self) -> None:
-        """Enable gradient computation for LoRA parameters."""
+        """Enable gradient computation for LoRA parameters and gradient checkpointing."""
         if self._lora_enabled:
             for name, param in self.model.named_parameters():
                 if "lora_" in name:
                     param.requires_grad = True
+            # Enable input-requires-grad hook so gradient checkpointing propagates
+            # correctly through frozen base-model layers to LoRA parameters.
+            self.model.enable_input_require_grads()
+            self.model.gradient_checkpointing_enable()
 
     def disable_lora(self) -> None:
-        """Freeze LoRA parameters."""
+        """Freeze LoRA parameters and disable gradient checkpointing."""
         if self._lora_enabled:
             for name, param in self.model.named_parameters():
                 if "lora_" in name:
                     param.requires_grad = False
+            self.model.gradient_checkpointing_disable()
 
     def tokenize(
         self,
