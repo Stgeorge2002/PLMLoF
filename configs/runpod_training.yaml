@@ -2,13 +2,13 @@
 training:
   # Stage 1: Classification head only (ESM2 frozen)
   stage1:
-    max_epochs: 200            # Extended — model was still improving at epoch 100
-    learning_rate: 5.0e-5      # Proven optimal LR — any increase causes instability
+    max_epochs: 200            # Extended — plateau scheduler will reduce LR automatically when needed
+    learning_rate: 5.0e-5      # Proven optimal starting LR
     weight_decay: 0.01
     batch_size: 64             # A40 48 GB — cached embeddings, no ESM2 in memory
     gradient_accumulation_steps: 4   # effective batch = 256; reduces epoch-to-epoch val variance
     warmup_ratio: 0.10
-    scheduler: "cosine"
+    scheduler: "plateau"       # ReduceLROnPlateau — adapts to training dynamics instead of fixed cosine decay
     # Curriculum learning: start with high-|z| variants, progressively add near-zero
     curriculum_z_thresh: 0.0     # DISABLED — WT variants have near-zero z-score and are excluded by curriculum
     curriculum_epochs: 0         # Unused when z_thresh=0.0

@@ -9,7 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR, ReduceLROnPlateau
 from torch.utils.data import DataLoader, Sampler
 from tqdm import tqdm
 
@@ -418,8 +418,11 @@ class CachedTrainer:
         # Curriculum learning
         curriculum_z_thresh: float = 0.0,
         curriculum_epochs: int = 0,
+        # LR scheduler type
+        scheduler: str = "cosine",
     ):
         self.device = torch.device(device)
+        self.scheduler_type = scheduler
         self.comparison = comparison.to(self.device)
         self.classifier = classifier.to(self.device)
         self.regressor = regressor.to(self.device) if regressor is not None else None
@@ -734,22 +737,41 @@ class CachedTrainer:
         if self.regressor is not None:
             params += list(self.regressor.parameters())
         optimizer = AdamW(params, lr=learning_rate, weight_decay=weight_decay)
-        # Linear warmup + cosine decay — critical for large randomly-initialized layers
+        # Linear warmup + adaptive decay (cosine or plateau)
         # warmup_ratio is set in __init__ from config (default 0.1)
         warmup_epochs = max(1, round(max_epochs * self.warmup_ratio))
-        warmup_scheduler = LinearLR(
-            optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs,
-        )
-        cosine_scheduler = CosineAnnealingLR(
-            optimizer, T_max=max(max_epochs - warmup_epochs, 1), eta_min=1e-6,
-        )
-        scheduler = SequentialLR(
-            optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs],
-        )
+        
+        if self.scheduler_type == "plateau":
+            # Plateau: warmup then constant LR, reducing on plateau
+            warmup_scheduler = LinearLR(
+                optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs,
+            )
+            # ReduceLROnPlateau requires manual step() with metric, can't use SequentialLR
+            # So we'll handle warmup manually and create plateau scheduler for post-warmup
+            plateau_scheduler = ReduceLROnPlateau(
+                optimizer, mode='min', factor=0.5, patience=5, verbose=True, min_lr=1e-6
+            )
+            scheduler = {'warmup': warmup_scheduler, 'plateau': plateau_scheduler, 'warmup_epochs': warmup_epochs}
+        else:
+            # Cosine: warmup then cosine decay (default)
+            warmup_scheduler = LinearLR(
+                optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs,
+            )
+            cosine_scheduler = CosineAnnealingLR(
+                optimizer, T_max=max(max_epochs - warmup_epochs, 1), eta_min=1e-6,
+            )
+            scheduler = SequentialLR(
+                optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs],
+            )
 
         # Fast-forward scheduler if resuming from a checkpoint
-        for _ in range(1, start_epoch):
-            scheduler.step()
+        if isinstance(scheduler, dict):  # plateau scheduler
+            for _ in range(1, min(start_epoch, scheduler['warmup_epochs'])):
+                scheduler['warmup'].step()
+            # Plateau scheduler doesn't need fast-forwarding (adapts based on current performance)
+        else:
+            for _ in range(1, start_epoch):
+                scheduler.step()
 
         epochs_without_improvement = 0
         best_val_metrics = {}
@@ -786,7 +808,15 @@ class CachedTrainer:
 
             train_m = self._train_epoch(optimizer, grad_accum_steps)
             val_m = self._eval_epoch()
-            scheduler.step()
+            
+            # Step scheduler (plateau needs validation loss, cosine just steps)
+            if isinstance(scheduler, dict):  # plateau scheduler
+                if epoch <= scheduler['warmup_epochs']:
+                    scheduler['warmup'].step()
+                else:
+                    scheduler['plateau'].step(val_m['loss'])
+            else:
+                scheduler.step()
 
             current_lr = optimizer.param_groups[0]["lr"]
             # Per-class recall for quick diagnosis (LoF/WT/GoF)
