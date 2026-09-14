@@ -91,6 +91,9 @@ class PLMLoFPredictor:
             classifier_hidden_dims=model_cfg.get("classifier_hidden_dims", [256, 64]),
             classifier_dropout=model_cfg.get("classifier_dropout", 0.3),
             pool_strategy=model_cfg.get("pool_strategy", "mean_max"),
+            use_cross_attention=model_cfg.get("use_cross_attention", False),
+            cross_attn_heads=model_cfg.get("cross_attn_heads", 4),
+            cross_attn_dropout=model_cfg.get("cross_attn_dropout", 0.1),
         )
 
         if checkpoint.get("cached_training"):

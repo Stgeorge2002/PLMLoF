@@ -98,7 +98,13 @@ def main():
             hidden_size = pre_norm_shape // 8
         else:
             hidden_size = pre_norm_shape // 4
-        comparison = ComparisonModule(hidden_size=hidden_size, pool_strategy=pool_strategy)
+        comparison = ComparisonModule(
+            hidden_size=hidden_size,
+            pool_strategy=pool_strategy,
+            use_cross_attention=model_cfg.get("use_cross_attention", False),
+            cross_attn_heads=model_cfg.get("cross_attn_heads", 4),
+            cross_attn_dropout=model_cfg.get("cross_attn_dropout", 0.1),
+        )
         comparison.load_state_dict(checkpoint["comparison_state_dict"])
 
         classifier_input = comparison.output_size + NUM_NUCLEOTIDE_FEATURES
@@ -123,24 +129,10 @@ def main():
             feature_norm.load_state_dict(checkpoint["feature_norm_state_dict"])
             logger.info("Loaded feature normalization")
 
-        # Load cross-attention if used
-        cross_attn = None
-        if model_cfg.get("use_cross_attention") and "cross_attn_state_dict" in checkpoint:
-            from plmlof.models.comparison import PooledCrossAttention
-            ca_heads = model_cfg.get("cross_attn_heads", 4)
-            ca_dropout = model_cfg.get("cross_attn_dropout", 0.1)
-            cross_attn = PooledCrossAttention(
-                hidden_size=hidden_size, num_heads=ca_heads, dropout=ca_dropout,
-            )
-            cross_attn.load_state_dict(checkpoint["cross_attn_state_dict"])
-            logger.info("Loaded cross-attention module")
-
         device = torch.device(args.device)
         comparison = comparison.to(device).eval()
         classifier = classifier.to(device).eval()
         feature_norm = feature_norm.to(device).eval()
-        if cross_attn is not None:
-            cross_attn = cross_attn.to(device).eval()
         if regressor is not None:
             regressor = regressor.to(device).eval()
 
@@ -172,14 +164,7 @@ def main():
                              for k, v in batch.items()}
                     ref_mean, ref_max = batch["ref_mean"], batch["ref_max"]
                     var_mean, var_max = batch["var_mean"], batch["var_max"]
-                    if cross_attn is not None:
-                        tokens = torch.stack([ref_mean, ref_max, var_mean, var_max], dim=1)
-                        tokens = cross_attn(tokens)
-                        ref_mean, ref_max, var_mean, var_max = tokens[:, 0], tokens[:, 1], tokens[:, 2], tokens[:, 3]
-                    ref_pool = torch.cat([ref_mean, ref_max], dim=-1)
-                    var_pool = torch.cat([var_mean, var_max], dim=-1)
-                    comp = torch.cat([ref_pool - var_pool, ref_pool * var_pool, ref_pool, var_pool], dim=-1)
-                    comp = comparison.project(comp)
+                    comp = comparison.compare_pooled(ref_mean, ref_max, var_mean, var_max)
                     features = torch.cat([comp, feature_norm(batch["nucleotide_features"])], dim=-1)
                     logits = classifier(features)
                     all_preds.extend(logits.argmax(dim=-1).cpu().numpy())
@@ -265,17 +250,7 @@ def main():
                     ref_mean, ref_max = _pool(ref_out, ref_mask)
                     var_mean, var_max = _pool(var_out, var_mask)
 
-                    if cross_attn is not None:
-                        tokens = torch.stack([ref_mean, ref_max, var_mean, var_max], dim=1)
-                        tokens = cross_attn(tokens)
-                        ref_mean, ref_max, var_mean, var_max = tokens[:, 0], tokens[:, 1], tokens[:, 2], tokens[:, 3]
-
-                    ref_pool = torch.cat([ref_mean, ref_max], dim=-1)
-                    var_pool = torch.cat([var_mean, var_max], dim=-1)
-                    diff_pool = ref_pool - var_pool
-                    prod_pool = ref_pool * var_pool
-                    comp = torch.cat([diff_pool, prod_pool, ref_pool, var_pool], dim=-1)
-                    comp = comparison.project(comp)
+                    comp = comparison.compare_pooled(ref_mean, ref_max, var_mean, var_max)
                     nuc_normed = feature_norm(nuc)
                     features = torch.cat([comp, nuc_normed], dim=-1)
                     logits = classifier(features)

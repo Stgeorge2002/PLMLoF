@@ -395,7 +395,7 @@ def run_plmlof(
     timing comparison, then runs them through the trained comparison module,
     cross-attention, classifier head, and regression head.
     """
-    from plmlof.models.comparison import ComparisonModule, PooledCrossAttention
+    from plmlof.models.comparison import ComparisonModule
     from plmlof.models.classifier import ClassifierHead, RegressionHead
     from plmlof.data.features import NUM_NUCLEOTIDE_FEATURES
 
@@ -411,7 +411,13 @@ def run_plmlof(
     comparison_state = ckpt["comparison_state_dict"]
     pre_norm_shape = comparison_state["_pre_norm.weight"].shape[0]
     hidden_size = pre_norm_shape // 8 if pool_strategy == "mean_max" else pre_norm_shape // 4
-    comparison = ComparisonModule(hidden_size=hidden_size, pool_strategy=pool_strategy)
+    comparison = ComparisonModule(
+        hidden_size=hidden_size,
+        pool_strategy=pool_strategy,
+        use_cross_attention=model_cfg.get("use_cross_attention", False),
+        cross_attn_heads=model_cfg.get("cross_attn_heads", 4),
+        cross_attn_dropout=model_cfg.get("cross_attn_dropout", 0.1),
+    )
     comparison.load_state_dict(ckpt["comparison_state_dict"])
 
     classifier_input = comparison.output_size + NUM_NUCLEOTIDE_FEATURES
@@ -432,21 +438,10 @@ def run_plmlof(
     if "feature_norm_state_dict" in ckpt:
         feature_norm.load_state_dict(ckpt["feature_norm_state_dict"])
 
-    cross_attn = None
-    if model_cfg.get("use_cross_attention") and "cross_attn_state_dict" in ckpt:
-        cross_attn = PooledCrossAttention(
-            hidden_size=hidden_size,
-            num_heads=model_cfg.get("cross_attn_heads", 4),
-            dropout=model_cfg.get("cross_attn_dropout", 0.1),
-        )
-        cross_attn.load_state_dict(ckpt["cross_attn_state_dict"])
-
     dev = torch.device(device)
     comparison = comparison.to(dev).eval()
     classifier = classifier.to(dev).eval()
     feature_norm = feature_norm.to(dev).eval()
-    if cross_attn is not None:
-        cross_attn = cross_attn.to(dev).eval()
     if regressor is not None:
         regressor = regressor.to(dev).eval()
 
@@ -472,15 +467,7 @@ def run_plmlof(
             vx = var_max_t[i:j].to(dev)
             nf = nuc_t[i:j].to(dev)
 
-            if cross_attn is not None:
-                tokens = torch.stack([rm, rx, vm, vx], dim=1)
-                tokens = cross_attn(tokens)
-                rm, rx, vm, vx = tokens[:, 0], tokens[:, 1], tokens[:, 2], tokens[:, 3]
-
-            ref_pool = torch.cat([rm, rx], dim=-1)
-            var_pool = torch.cat([vm, vx], dim=-1)
-            comp = torch.cat([ref_pool - var_pool, ref_pool * var_pool, ref_pool, var_pool], dim=-1)
-            comp = comparison.project(comp)
+            comp = comparison.compare_pooled(rm, rx, vm, vx)
             features = torch.cat([comp, feature_norm(nf)], dim=-1)
             logits = classifier(features)
 

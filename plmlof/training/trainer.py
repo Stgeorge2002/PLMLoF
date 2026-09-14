@@ -447,17 +447,18 @@ class CachedTrainer:
         from plmlof.data.features import NUM_NUCLEOTIDE_FEATURES
         self.feature_norm = nn.LayerNorm(NUM_NUCLEOTIDE_FEATURES).to(self.device)
 
-        # Optional pooled cross-attention between ref/var embeddings
+        # Cross-attention (if any) is owned by the ComparisonModule itself so the
+        # same weights are used here, during Stage 2 fine-tuning, and at inference.
+        # This alias just lets the rest of this class refer to it conveniently —
+        # it is not a separately-registered module, so no double-counted params.
         self.use_cross_attention = use_cross_attention
-        self.cross_attn = None
-        if use_cross_attention:
-            from plmlof.models.comparison import PooledCrossAttention
-            # hidden_size = dim of each pooled vector (1280 for ESM2-650M)
-            hidden_size = comparison.hidden_size
-            self.cross_attn = PooledCrossAttention(
-                hidden_size=hidden_size, num_heads=cross_attn_heads,
-                dropout=cross_attn_dropout,
-            ).to(self.device)
+        self.cross_attn = self.comparison.cross_attn
+        if use_cross_attention and self.cross_attn is None:
+            logger.warning(
+                "use_cross_attention=True but the ComparisonModule passed to "
+                "CachedTrainer was built without cross-attention; construct it "
+                "with ComparisonModule(..., use_cross_attention=True) instead."
+            )
 
         # Curriculum sampler — replaces the train DataLoader when enabled.
         # Requires the dataset to expose a `dms_scores` tensor attribute.
@@ -584,20 +585,9 @@ class CachedTrainer:
             var_mean = var_mean + torch.randn_like(var_mean) * self.noise_scale
             var_max = var_max + torch.randn_like(var_max) * self.noise_scale
 
-        # Optional cross-attention between the 4 pooled vectors
-        if self.cross_attn is not None:
-            # Stack as [B, 4, D] sequence: ref_mean, ref_max, var_mean, var_max
-            tokens = torch.stack([ref_mean, ref_max, var_mean, var_max], dim=1)
-            tokens = self.cross_attn(tokens)  # [B, 4, D]
-            ref_mean, ref_max, var_mean, var_max = tokens[:, 0], tokens[:, 1], tokens[:, 2], tokens[:, 3]
-
-        ref_pool = torch.cat([ref_mean, ref_max], dim=-1)
-        var_pool = torch.cat([var_mean, var_max], dim=-1)
-
-        diff_pool = ref_pool - var_pool
-        prod_pool = ref_pool * var_pool
-        comparison = torch.cat([diff_pool, prod_pool, ref_pool, var_pool], dim=-1)
-        comparison = self.comparison.project(comparison)
+        # Cross-attention (if enabled) + diff/product/projection all happen
+        # inside ComparisonModule.compare_pooled, shared with the live-forward path.
+        comparison = self.comparison.compare_pooled(ref_mean, ref_max, var_mean, var_max)
 
         nuc_features = self.feature_norm(batch["nucleotide_features"])
         features = torch.cat([comparison, nuc_features], dim=-1)
@@ -622,11 +612,10 @@ class CachedTrainer:
         return cls_loss, cls_loss.item(), 0.0
 
     def _train_epoch(self, optimizer, grad_accum_steps: int = 1) -> dict[str, float]:
+        # self.comparison.train() also puts its cross_attn submodule (if any) into train mode
         self.comparison.train()
         self.classifier.train()
         self.feature_norm.train()
-        if self.cross_attn is not None:
-            self.cross_attn.train()
         if self.regressor is not None:
             self.regressor.train()
         total_loss = 0.0
@@ -654,11 +643,11 @@ class CachedTrainer:
 
             if (step + 1) % grad_accum_steps == 0:
                 self.scaler.unscale_(optimizer)
+                # comparison.parameters() already includes cross_attn (a submodule)
                 params = (
                     list(self.comparison.parameters())
                     + list(self.classifier.parameters())
                     + list(self.feature_norm.parameters())
-                    + (list(self.cross_attn.parameters()) if self.cross_attn else [])
                     + (list(self.regressor.parameters()) if self.regressor else [])
                 )
                 for p in params:
@@ -699,8 +688,6 @@ class CachedTrainer:
         self.comparison.eval()
         self.classifier.eval()
         self.feature_norm.eval()
-        if self.cross_attn is not None:
-            self.cross_attn.eval()
         if self.regressor is not None:
             self.regressor.eval()
         total_loss = 0.0
@@ -749,15 +736,13 @@ class CachedTrainer:
         # Save comparison + classifier + regressor state, plus model config for reconstruction
         save_dict = {
             "epoch": epoch,
-            "comparison_state_dict": self.comparison.state_dict(),
+            "comparison_state_dict": self.comparison.state_dict(),  # includes cross_attn, if any
             "classifier_state_dict": self.classifier.state_dict(),
             "feature_norm_state_dict": self.feature_norm.state_dict(),
             "model_config": self.model_config,
             "metrics": metrics,
             "cached_training": True,  # Flag indicating this needs assembly
         }
-        if self.cross_attn is not None:
-            save_dict["cross_attn_state_dict"] = self.cross_attn.state_dict()
         if self.regressor is not None:
             save_dict["regressor_state_dict"] = self.regressor.state_dict()
         torch.save(save_dict, path)
@@ -782,8 +767,6 @@ class CachedTrainer:
                     self.classifier.load_state_dict(ckpt["classifier_state_dict"])
                     if "feature_norm_state_dict" in ckpt:
                         self.feature_norm.load_state_dict(ckpt["feature_norm_state_dict"])
-                    if self.cross_attn is not None and "cross_attn_state_dict" in ckpt:
-                        self.cross_attn.load_state_dict(ckpt["cross_attn_state_dict"])
                     if self.regressor is not None and "regressor_state_dict" in ckpt:
                         self.regressor.load_state_dict(ckpt["regressor_state_dict"])
                     start_epoch = ckpt.get("epoch", 0) + 1
@@ -794,9 +777,8 @@ class CachedTrainer:
                     logger.warning(f"Could not resume from checkpoint (architecture changed): {e}")
                     logger.warning("Training from scratch.")
 
+        # comparison.parameters() already includes cross_attn (a submodule)
         params = list(self.comparison.parameters()) + list(self.classifier.parameters()) + list(self.feature_norm.parameters())
-        if self.cross_attn is not None:
-            params += list(self.cross_attn.parameters())
         if self.regressor is not None:
             params += list(self.regressor.parameters())
         optimizer = AdamW(params, lr=learning_rate, weight_decay=weight_decay)
@@ -909,8 +891,6 @@ class CachedTrainer:
                 self.classifier.load_state_dict(ckpt["classifier_state_dict"])
                 if "feature_norm_state_dict" in ckpt:
                     self.feature_norm.load_state_dict(ckpt["feature_norm_state_dict"])
-                if self.cross_attn is not None and "cross_attn_state_dict" in ckpt:
-                    self.cross_attn.load_state_dict(ckpt["cross_attn_state_dict"])
                 if self.regressor is not None and "regressor_state_dict" in ckpt:
                     self.regressor.load_state_dict(ckpt["regressor_state_dict"])
                 # Restore weights but keep LR unchanged — reducing LR on noisy val

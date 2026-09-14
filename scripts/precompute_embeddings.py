@@ -8,10 +8,18 @@ Optimisations:
   - Cross-split deduplication: each unique protein across train+val
     is embedded exactly once (shared refs get a single forward pass)
   - Length-sorted batching on unique sequences minimises padding waste
-  - fp16 autocast, pinned memory, prefetched DataLoader
-  - Vectorised scatter via tensor indexing (no per-sample Python loop)
+  - Optional bucketed batch sampling (--use-bucketing) for tighter
+    per-batch length variance and less padding
+  - Optional adaptive batch sizing (--adaptive-batch-size) targeting a
+    fixed token budget per batch instead of a fixed sample count
+  - fp16/bf16 autocast, pinned memory, prefetched DataLoader
+  - Optional SDPA/Flash-Attention backend (--attn-implementation sdpa);
+    defaults to eager since EsmModel has no SDPA support upstream yet
+  - torch.compile enabled by default in default mode (--no-compile to disable;
+    reduce-overhead/CUDA-graphs mode is avoided as it recompiles per batch
+    shape, which is counterproductive with our variable sequence lengths)
+  - Vectorised, chunked scatter via tensor indexing (bounded peak memory)
   - Embedding cache (.embedding_cache.pt) for crash resume
-  - Optional torch.compile for ESM2 forward pass
 
 Usage:
     python scripts/precompute_embeddings.py \
@@ -29,7 +37,7 @@ import logging
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModel
 
@@ -55,6 +63,65 @@ class _UniqueSeqDataset(Dataset):
         return self.sequences[idx]
 
 
+class _BucketedSeqDataset(Dataset):
+    """Sequences sorted by length and split into contiguous length buckets.
+
+    Used with _BucketBatchSampler so each batch is drawn from a single
+    bucket, keeping per-batch length variance (and padding waste) low.
+    """
+
+    def __init__(self, sequences: list[str], num_buckets: int = 8):
+        self.sequences = sorted(sequences, key=len)
+        n = len(self.sequences)
+        bucket_size = max(1, -(-n // max(num_buckets, 1)))  # ceil division
+        self.buckets: list[tuple[int, int]] = [
+            (start, min(start + bucket_size, n)) for start in range(0, n, bucket_size)
+        ]
+
+    def __len__(self):
+        return len(self.sequences)
+
+    def __getitem__(self, idx: int) -> str:
+        return self.sequences[idx]
+
+
+class _BucketBatchSampler(Sampler):
+    """Yields index batches one length-bucket at a time.
+
+    Bucket order and within-bucket order are reshuffled each epoch; the
+    last (possibly short) batch of each bucket is kept intact so
+    length-mismatched samples never share a batch.
+    """
+
+    def __init__(self, buckets: list[tuple[int, int]], batch_size: int, seed: int = 0):
+        self.buckets = buckets
+        self.batch_size = batch_size
+        self.seed = seed
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.seed)
+
+        batches: list[list[int]] = []
+        for start, end in self.buckets:
+            perm = (torch.randperm(end - start, generator=g) + start).tolist()
+            batches.extend(perm[i:i + self.batch_size] for i in range(0, len(perm), self.batch_size))
+
+        order = torch.randperm(len(batches), generator=g).tolist()
+        for b in order:
+            yield batches[b]
+
+    def __len__(self):
+        return sum(-(-(end - start) // self.batch_size) for start, end in self.buckets)
+
+
+def _compute_adaptive_batch_size(sequences: list[str], target_tokens: int, cap: int = 512) -> int:
+    """Pick a batch size so batch_size * avg_length ≈ target_tokens."""
+    avg_len = sum(len(s) for s in sequences) / max(len(sequences), 1)
+    size = int(target_tokens / max(avg_len, 1))
+    return max(16, min(cap, size))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Pre-compute ESM2 embeddings")
     parser.add_argument("--train-data", type=str, required=True)
@@ -66,8 +133,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--max-seq-length", type=int, default=1024)
-    parser.add_argument("--compile", action="store_true",
-                        help="Use torch.compile on ESM2 (requires PyTorch 2.0+, ~30%% faster)")
+    parser.add_argument("--no-compile", action="store_true",
+                        help="Disable torch.compile (enabled by default on PyTorch 2.0+, ~20-30%% faster)")
+    parser.add_argument("--attn-implementation", type=str, default="eager", choices=["sdpa", "eager"],
+                        help="Attention backend. 'sdpa' requests PyTorch's fused/Flash-Attention kernels, but "
+                             "EsmModel does not implement it as of transformers<4.55 (falls back automatically).")
+    parser.add_argument("--use-bucketing", action="store_true",
+                        help="Sample batches from a single length-bucket at a time to minimise padding waste")
+    parser.add_argument("--num-buckets", type=int, default=8,
+                        help="Number of length buckets when --use-bucketing is set")
+    parser.add_argument("--adaptive-batch-size", action="store_true",
+                        help="Derive batch size from average sequence length (targets --target-tokens per batch)")
+    parser.add_argument("--target-tokens", type=int, default=256_000,
+                        help="Target tokens per batch when --adaptive-batch-size is set")
+    parser.add_argument("--num-workers", type=int, default=4,
+                        help="DataLoader worker processes used for tokenization")
+    parser.add_argument("--scatter-chunk-size", type=int, default=100_000,
+                        help="Rows processed per chunk during scatter, to bound peak memory")
     return parser.parse_args()
 
 
@@ -97,6 +179,9 @@ def _embed_unique_sequences(
     device: torch.device,
     batch_size: int,
     max_seq_length: int,
+    num_workers: int = 4,
+    use_bucketing: bool = False,
+    num_buckets: int = 8,
     desc: str = "Embedding",
 ) -> tuple[list[str], torch.Tensor, torch.Tensor]:
     """Embed unique sequences and return indexed tensors.
@@ -104,16 +189,31 @@ def _embed_unique_sequences(
     Returns:
         (ordered_sequences, mean_tensor [N, D], max_tensor [N, D]) on CPU.
     """
-    ds = _UniqueSeqDataset(sequences)
-    loader = DataLoader(
-        ds,
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=lambda b: _collate_strings(b, tokenizer, max_seq_length),
-        num_workers=4,
-        pin_memory=True,
-        prefetch_factor=2,
-    )
+    prefetch_factor = 2 if num_workers > 0 else None
+    collate = lambda b: _collate_strings(b, tokenizer, max_seq_length)
+
+    if use_bucketing:
+        ds = _BucketedSeqDataset(sequences, num_buckets=num_buckets)
+        batch_sampler = _BucketBatchSampler(ds.buckets, batch_size=batch_size)
+        loader = DataLoader(
+            ds,
+            batch_sampler=batch_sampler,
+            collate_fn=collate,
+            num_workers=num_workers,
+            pin_memory=True,
+            prefetch_factor=prefetch_factor,
+        )
+    else:
+        ds = _UniqueSeqDataset(sequences)
+        loader = DataLoader(
+            ds,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=collate,
+            num_workers=num_workers,
+            pin_memory=True,
+            prefetch_factor=prefetch_factor,
+        )
 
     ordered_seqs: list[str] = []
     mean_chunks: list[torch.Tensor] = []
@@ -141,8 +241,9 @@ def _scatter_embeddings(
     mean_tensor: torch.Tensor,
     max_tensor: torch.Tensor,
     output_path: Path,
+    chunk_size: int = 100_000,
 ) -> None:
-    """Scatter pre-computed embeddings to per-sample tensors using vectorised indexing."""
+    """Scatter pre-computed embeddings to per-sample tensors, chunked to bound peak memory."""
     n = len(dataset)
     logger.info(f"  Building index mappings for {n} samples...")
 
@@ -153,14 +254,29 @@ def _scatter_embeddings(
     logger.info(f"  Creating index tensors...")
     ref_idx = torch.tensor([seq_to_idx[s] for s in ref_proteins], dtype=torch.long)
     var_idx = torch.tensor([seq_to_idx[s] for s in var_proteins], dtype=torch.long)
+    del ref_proteins, var_proteins
 
-    logger.info(f"  Gathering embeddings...")
-    # Vectorised gather — single C-level indexing op per tensor
+    hidden_size = mean_tensor.shape[1]
+    ref_mean = torch.empty((n, hidden_size), dtype=torch.float32)
+    ref_max = torch.empty((n, hidden_size), dtype=torch.float32)
+    var_mean = torch.empty((n, hidden_size), dtype=torch.float32)
+    var_max = torch.empty((n, hidden_size), dtype=torch.float32)
+
+    logger.info(f"  Gathering embeddings in chunks of {chunk_size}...")
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        r_idx = ref_idx[start:end]
+        v_idx = var_idx[start:end]
+        ref_mean[start:end] = mean_tensor[r_idx]
+        ref_max[start:end] = max_tensor[r_idx]
+        var_mean[start:end] = mean_tensor[v_idx]
+        var_max[start:end] = max_tensor[v_idx]
+
     data = {
-        "ref_mean": mean_tensor[ref_idx],
-        "ref_max": max_tensor[ref_idx],
-        "var_mean": mean_tensor[var_idx],
-        "var_max": max_tensor[var_idx],
+        "ref_mean": ref_mean,
+        "ref_max": ref_max,
+        "var_mean": var_mean,
+        "var_max": var_max,
         "nucleotide_features": dataset._nuc_features,
         "labels": torch.tensor(dataset._labels, dtype=torch.long),
         "dms_scores": torch.tensor(dataset._dms_scores, dtype=torch.float),
@@ -270,18 +386,43 @@ def main():
     if need_embed:
         logger.info(f"Loading ESM2: {args.esm2_model}")
         tokenizer = AutoTokenizer.from_pretrained(args.esm2_model)
-        model = AutoModel.from_pretrained(args.esm2_model).to(device)
+        try:
+            model = AutoModel.from_pretrained(
+                args.esm2_model, attn_implementation=args.attn_implementation
+            ).to(device)
+            logger.info(f"  Attention backend: {args.attn_implementation}")
+        except Exception as e:
+            logger.warning(
+                f"  '{args.attn_implementation}' attention unavailable ({e}), "
+                "falling back to the model's default backend"
+            )
+            model = AutoModel.from_pretrained(args.esm2_model).to(device)
         model.eval()
         for p in model.parameters():
             p.requires_grad = False
 
-        if args.compile and hasattr(torch, "compile"):
-            logger.info("Compiling ESM2 with torch.compile (first batch will be slow)")
-            model = torch.compile(model)
+        if not args.no_compile and hasattr(torch, "compile"):
+            try:
+                # Default mode, not reduce-overhead: batches here have highly variable
+                # sequence lengths, and reduce-overhead's CUDA graphs re-capture on every
+                # new shape instead of generalising, recompiling on nearly every batch.
+                # Default mode settles into fast dynamic-shape execution after ~2 recompiles.
+                logger.info("Compiling ESM2 with torch.compile (first couple of batches will be slow)")
+                model = torch.compile(model)
+            except RuntimeError as e:
+                logger.warning(f"  torch.compile failed ({e}), continuing uncompiled")
+
+        batch_size = args.batch_size
+        if args.adaptive_batch_size:
+            batch_size = _compute_adaptive_batch_size(list(all_unique), args.target_tokens)
+            logger.info(f"  Adaptive batch size: {batch_size} (target_tokens={args.target_tokens})")
 
         ordered_seqs, mean_tensor, max_tensor = _embed_unique_sequences(
             list(all_unique), model, tokenizer, device,
-            args.batch_size, args.max_seq_length,
+            batch_size, args.max_seq_length,
+            num_workers=args.num_workers,
+            use_bucketing=args.use_bucketing,
+            num_buckets=args.num_buckets,
             desc="Encoding all splits",
         )
 
@@ -308,7 +449,7 @@ def main():
         logger.info(f"Scattering {name} ({len(ds)} samples) [{split_idx}/{len(splits)}]...")
         sys.stdout.flush()  # Ensure logs appear immediately
         
-        _scatter_embeddings(ds, seq_to_idx, mean_tensor, max_tensor, out_path)
+        _scatter_embeddings(ds, seq_to_idx, mean_tensor, max_tensor, out_path, chunk_size=args.scatter_chunk_size)
         
         # Force garbage collection after each scatter to free memory
         gc.collect()

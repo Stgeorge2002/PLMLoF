@@ -122,7 +122,11 @@ def main():
     } if lora_cfg.get("enabled", True) else None
 
     # Build model — read pool_strategy from comparison section
-    pool_strategy = model_cfg.get("comparison", {}).get("pool_strategy", "mean_max")
+    comparison_cfg = model_cfg.get("comparison", {})
+    pool_strategy = comparison_cfg.get("pool_strategy", "mean_max")
+    use_cross_attention = comparison_cfg.get("use_cross_attention", False)
+    cross_attn_heads = comparison_cfg.get("cross_attn_heads", 4)
+    cross_attn_dropout = comparison_cfg.get("cross_attn_dropout", 0.1)
     classifier_hidden_dims = model_cfg.get("classifier", {}).get("hidden_dims", [256, 64])
     classifier_dropout = model_cfg.get("classifier", {}).get("dropout", 0.3)
 
@@ -140,6 +144,9 @@ def main():
         pool_strategy=pool_strategy,
         classifier_hidden_dims=classifier_hidden_dims,
         classifier_dropout=classifier_dropout,
+        use_cross_attention=use_cross_attention,
+        cross_attn_heads=cross_attn_heads,
+        cross_attn_dropout=cross_attn_dropout,
     )
 
     # ── Pre-computed embedding mode (fast Stage 1 only) ──────────────────
@@ -180,7 +187,13 @@ def main():
         from plmlof.models.classifier import ClassifierHead, RegressionHead
         from plmlof.data.features import NUM_NUCLEOTIDE_FEATURES
 
-        comparison = ComparisonModule(hidden_size=hidden_size, pool_strategy=pool_strategy)
+        comparison = ComparisonModule(
+            hidden_size=hidden_size,
+            pool_strategy=pool_strategy,
+            use_cross_attention=use_cross_attention,
+            cross_attn_heads=cross_attn_heads,
+            cross_attn_dropout=cross_attn_dropout,
+        )
         classifier_input = comparison.output_size + NUM_NUCLEOTIDE_FEATURES
         classifier = ClassifierHead(
             input_size=classifier_input,
@@ -208,7 +221,9 @@ def main():
             regression_weight=regression_weight,
             regression_warmup_epochs=train_cfg.get("regression_warmup_epochs", 3),
             focal_gamma=train_cfg.get("focal_gamma", 0.0),
-            use_cross_attention=model_cfg.get("comparison", {}).get("use_cross_attention", False),
+            use_cross_attention=use_cross_attention,
+            cross_attn_heads=cross_attn_heads,
+            cross_attn_dropout=cross_attn_dropout,
             esm2_model_name=esm2_name,
             pool_strategy=pool_strategy,
             classifier_hidden_dims=classifier_hidden_dims,
@@ -293,6 +308,9 @@ def main():
         "classifier_dropout": classifier_dropout,
         "pool_strategy": pool_strategy,
         "lora_config": lora_config,
+        "use_cross_attention": use_cross_attention,
+        "cross_attn_heads": cross_attn_heads,
+        "cross_attn_dropout": cross_attn_dropout,
     }
 
     # Load checkpoint if provided
@@ -305,13 +323,14 @@ def main():
         if "model_state_dict" in ckpt:
             model.load_state_dict(ckpt["model_state_dict"])
         elif ckpt.get("cached_training"):
-            # Checkpoint from CachedTrainer — load submodule weights
+            # Checkpoint from CachedTrainer — load submodule weights. Cross-attention
+            # (if enabled) is a submodule of `comparison`, so it's already included
+            # in comparison_state_dict as long as `model` was built with the same
+            # use_cross_attention/cross_attn_heads config used at cache-train time.
             model.comparison.load_state_dict(ckpt["comparison_state_dict"])
             model.classifier.load_state_dict(ckpt["classifier_state_dict"])
             if "feature_norm_state_dict" in ckpt:
                 model.feature_norm.load_state_dict(ckpt["feature_norm_state_dict"])
-            if "cross_attn_state_dict" in ckpt and hasattr(model.comparison, 'cross_attn'):
-                model.comparison.cross_attn.load_state_dict(ckpt["cross_attn_state_dict"])
         else:
             logger.error(f"Unknown checkpoint format: keys={list(ckpt.keys())}")
             sys.exit(1)

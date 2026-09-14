@@ -28,12 +28,21 @@ class FocalLoss(nn.Module):
         self.register_buffer("weight", weight)
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # Compute the unweighted per-sample CE so pt = exp(-ce) is the actual
+        # probability of the true class. If class `weight` were baked into ce
+        # here, pt would become p**w instead of p, distorting the (1-pt)^gamma
+        # focal term by an amount that depends on the class weight.
         ce_loss = F.cross_entropy(
-            logits, targets, weight=self.weight,
+            logits, targets,
             label_smoothing=self.label_smoothing, reduction="none",
         )
         pt = torch.exp(-ce_loss)  # p_t = probability of correct class
         focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+
+        if self.weight is not None:
+            sample_weight = self.weight[targets]
+            focal_loss = focal_loss * sample_weight
+            return focal_loss.sum() / sample_weight.sum()
         return focal_loss.mean()
 
 

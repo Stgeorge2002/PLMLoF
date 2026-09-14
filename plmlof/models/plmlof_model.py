@@ -31,6 +31,9 @@ class PLMLoFModel(nn.Module):
         classifier_dropout: float = 0.3,
         num_classes: int = 3,
         num_nuc_features: int = NUM_NUCLEOTIDE_FEATURES,
+        use_cross_attention: bool = False,
+        cross_attn_heads: int = 4,
+        cross_attn_dropout: float = 0.1,
     ):
         super().__init__()
 
@@ -42,10 +45,14 @@ class PLMLoFModel(nn.Module):
         )
         hidden_size = self.encoder.hidden_size
 
-        # Comparison module
+        # Comparison module (cross-attention, if enabled, lives here so it's
+        # used identically by this live-forward path and cached training/inference)
         self.comparison = ComparisonModule(
             hidden_size=hidden_size,
             pool_strategy=pool_strategy,
+            use_cross_attention=use_cross_attention,
+            cross_attn_heads=cross_attn_heads,
+            cross_attn_dropout=cross_attn_dropout,
         )
 
         # Normalize nucleotide features (scales differ by ~100x across dims)

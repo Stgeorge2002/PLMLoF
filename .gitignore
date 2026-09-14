@@ -24,3 +24,6 @@ wandb/
 # IDE
 .vscode/
 .idea/
+
+*.md
+!README.md

@@ -120,6 +120,32 @@ print('  Forward pass: OK')
 "
 echo ""
 
+# ── 7. torch.compile smoke test ──
+# precompute_embeddings.py enables torch.compile by default (opt out with
+# --no-compile). Compilation is lazy, so a broken toolchain (missing triton /
+# build tools) would otherwise only surface mid-way through the real
+# precompute run. Check it here instead, while it's cheap to fix.
+echo "Testing torch.compile (used by default in precompute_embeddings.py)..."
+python -c "
+import torch
+from transformers import AutoModel, AutoTokenizer
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+tokenizer = AutoTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
+model = AutoModel.from_pretrained('facebook/esm2_t6_8M_UR50D').to(device).eval()
+
+try:
+    compiled = torch.compile(model)
+    enc = tokenizer(['MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQAPILSRVGDGTQDNLSGAEKAVQVKVKALPDAQFEVVHSLAKWKRQTLGQHDFSAGEGLYTHMKALRPDEDRLSPLHSVYVDQWDWELVMGDGERTFTSLPFF'], return_tensors='pt').to(device)
+    with torch.no_grad():
+        compiled(**enc)
+    print('  torch.compile: OK (default precompute run will use it)')
+except Exception as e:
+    print(f'  WARNING: torch.compile failed ({e})')
+    print('  Run precompute_embeddings.py with --no-compile to avoid this.')
+"
+echo ""
+
 echo "=============================================="
 echo " Setup complete! Ready to train."
 echo ""
