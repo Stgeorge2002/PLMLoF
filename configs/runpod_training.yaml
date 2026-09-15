@@ -1,11 +1,11 @@
-# RunPod production training config — optimised for NVIDIA A40 (48 GB, Ampere)
+# RunPod production training config — optimised for NVIDIA H100 SXM (80 GB, Hopper)
 training:
   # Stage 1: Classification head only (ESM2 frozen)
   stage1:
     max_epochs: 200            # Extended — plateau scheduler will reduce LR automatically when needed
     learning_rate: 5.0e-5      # Proven optimal starting LR
     weight_decay: 0.01
-    batch_size: 64             # A40 48 GB — cached embeddings, no ESM2 in memory
+    batch_size: 128            # H100 SXM 80 GB — cached embeddings, increased for GPU utilization
     gradient_accumulation_steps: 4   # effective batch = 256; reduces epoch-to-epoch val variance
     warmup_ratio: 0.10
     scheduler: "plateau"       # ReduceLROnPlateau — adapts to training dynamics instead of fixed cosine decay
@@ -18,7 +18,7 @@ training:
     max_epochs: 5
     learning_rate: 5.0e-5
     weight_decay: 0.01
-    batch_size: 32          # A40 48 GB — ESM2-650M (~2.5 GB) + LoRA + activations fits at 32
+    batch_size: 64          # H100 SXM 80 GB — ESM2-650M (~2.5 GB) + LoRA + activations fits at 64
     gradient_accumulation_steps: 2
     warmup_ratio: 0.05
     scheduler: "cosine"

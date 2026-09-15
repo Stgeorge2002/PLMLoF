@@ -48,7 +48,7 @@ nohup python scripts/precompute_embeddings.py \
   --train-data data/processed/train.parquet \
   --val-data data/processed/val.parquet \
   --output-dir data/embeddings/ \
-  --batch-size 128 \
+  --batch-size 256 \
   --device cuda > precompute.log 2>&1 &
 
 tail -f precompute.log
