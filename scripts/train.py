@@ -150,7 +150,8 @@ def main():
     )
 
     # ── Pre-computed embedding mode (fast Stage 1 only) ──────────────────
-    if args.precomputed:
+    # If --stage2-only with --precomputed, skip cached trainer and go straight to Stage 2
+    if args.precomputed and not args.stage2_only:
         emb_dir = Path(args.precomputed)
         train_cache = emb_dir / "train_embeddings.pt"
         val_cache = emb_dir / "val_embeddings.pt"
@@ -249,9 +250,20 @@ def main():
         )
         logger.info("Training complete!")
         logger.info(f"Best model saved to {output_dir}/checkpoints/model_best.pt")
-        return
+        
+        # If Stage 2 is requested with cached embeddings, proceed to Stage 2 below
+        # Otherwise, exit after cached Stage 1
+        if not args.stage2_only:
+            return
 
     # ── Standard mode (ESM2 forward passes each batch) ────────────────────
+    # For --stage2-only with --precomputed, load checkpoint here before building Stage 2 trainer
+    if args.stage2_only and args.precomputed:
+        if not args.checkpoint:
+            logger.error("--stage2-only with --precomputed requires --checkpoint to load Stage 1 weights")
+            sys.exit(1)
+        logger.info(f"Loading Stage 1 checkpoint for Stage 2 fine-tuning: {args.checkpoint}")
+    
     # Build datasets
     if args.tiny or (args.train_data is None):
         logger.info("Using synthetic dataset for testing")
