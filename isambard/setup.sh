@@ -70,11 +70,14 @@ source "${PLMLOF_VENV}/bin/activate"
 echo "Installing PyTorch (CUDA 12.8 aarch64, cu128 index only)..."
 uv pip install --upgrade --index-url https://download.pytorch.org/whl/cu128 torch
 
-echo "Installing PLMLoF (will not upgrade torch if already satisfied)..."
+echo "Installing PLMLoF..."
+# uv has no --upgrade-strategy (that is pip-only; unknown flags exit 2).
 uv pip install -e ".[dev]" \
     --index-url https://pypi.org/simple \
-    --extra-index-url https://download.pytorch.org/whl/cu128 \
-    --upgrade-strategy only-if-needed
+    --extra-index-url https://download.pytorch.org/whl/cu128
+
+echo "Re-pinning PyTorch to cu128 in case the project install replaced it..."
+uv pip install --index-url https://download.pytorch.org/whl/cu128 torch
 
 python - <<'PY'
 import torch, sys
