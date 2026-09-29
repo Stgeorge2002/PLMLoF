@@ -1,0 +1,53 @@
+# Production training config — GH200 Hopper (sm_90, 120 GB).
+# Batch sizes are the proven values; do not raise Stage 1 batch for the extra VRAM
+# (cached-embedding generalisation got worse with larger batches).
+training:
+  # Stage 1: Classification head only (ESM2 frozen)
+  stage1:
+    max_epochs: 200
+    learning_rate: 5.0e-5
+    weight_decay: 0.01
+    batch_size: 64
+    gradient_accumulation_steps: 4   # effective batch = 256
+    warmup_ratio: 0.10
+    scheduler: "plateau"
+    curriculum_z_thresh: 0.0     # DISABLED — WT variants have near-zero z-score
+    curriculum_epochs: 0
+
+  # Stage 2: LoRA fine-tuning
+  stage2:
+    max_epochs: 5
+    learning_rate: 5.0e-5
+    weight_decay: 0.01
+    batch_size: 32
+    gradient_accumulation_steps: 2
+    warmup_ratio: 0.05
+    scheduler: "cosine"
+
+  # General
+  early_stopping_patience: 12
+  metric_for_best_model: "macro_f1"
+  mixed_precision: "bf16"     # Hopper native bf16
+  max_seq_length: 1024
+
+  use_swa: false
+  swa_start_epoch: 180
+  seed: 42
+
+  regression_weight: 0.0
+  regression_warmup_epochs: 3
+  focal_gamma: 2.0
+  label_smoothing: 0.10
+
+  class_weights: [1.0, 1.3, 1.0]  # [LoF, WT, GoF]
+
+  mixup_alpha: 0.2
+  mixup_prob: 0.5
+  noise_scale: 0.01
+
+  log_every_n_steps: 25
+  eval_every_n_steps: 200
+  save_every_n_steps: 500
+
+  output_dir: "outputs/production/"
+  checkpoint_dir: "outputs/production/checkpoints/"

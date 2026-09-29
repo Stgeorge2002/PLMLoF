@@ -1,0 +1,26 @@
+# Production model config — ESM2-650M, sized for GH200 120 GB (hyperparams unchanged)
+model:
+  esm2_model_name: "facebook/esm2_t33_650M_UR50D"
+
+  lora:
+    enabled: true
+    rank: 32
+    alpha: 64
+    dropout: 0.05
+    target_modules: ["query", "value"]
+
+  comparison:
+    use_cross_attention: false  # Disabled: cross_attn lives only in CachedTrainer (Stage 1)
+                                # and is not replicated in ComparisonModule.forward() (Stage 2).
+                                # Enabling it causes Stage 2 to get raw pooled inputs into
+                                # a project() trained on cross_attn-modified inputs → loss ~2.2.
+    pool_strategy: "mean_max"
+
+  classifier:
+    hidden_dims: [512, 128]
+    dropout: 0.2
+    num_classes: 3
+    label_smoothing: 0.05
+
+  nucleotide_features:
+    num_features: 12

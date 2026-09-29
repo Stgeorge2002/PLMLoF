@@ -5,9 +5,16 @@ __pycache__/
 venv/
 *.egg-info/
 
-# IGNORE EVERYTHING IN DATA
-data/
-aws/ 
+# Keep data/scripts/*.py and plmlof/data/*.py tracked.
+# Ignore ProteinGym products anywhere (including data/scripts/data/ from a
+# relative-path download run inside data/scripts/).
+/data/raw/
+/data/processed/
+/data/embeddings/
+data/scripts/data/
+*.parquet
+*.zip
+/aws/
 
 # IGNORE ALL OUTPUTS
 outputs/

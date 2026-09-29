@@ -1,44 +1,52 @@
 #!/usr/bin/env bash
-# Full PLMLoF pipeline — setup, data, precompute embeddings, train, evaluate.
+# PLMLoF pipeline body for Isambard-AI. Invoked by sbatch, never from a login node.
 #
-# Usage:
-#   bash runpod/run_all.sh              # Full pipeline (setup → data → embed → train → eval)
-#   bash runpod/run_all.sh --test       # Quick smoke test (ESM2-8M, synthetic, 2 epochs)
-#   bash runpod/run_all.sh --quick      # Fast validation run (30K samples, 20 S1 epochs, 2 S2 epochs)
-#   bash runpod/run_all.sh --scale 60   # Custom scale: 60K samples (default 300 for full)
-#   bash runpod/run_all.sh --s1-epochs 30 --s2-epochs 3  # Override epoch caps
-#   bash runpod/run_all.sh --data-only  # Download + curate data only
-#   bash runpod/run_all.sh --train-only # Train + eval only (assumes embeddings exist)
-#   bash runpod/run_all.sh --eval-only  # Evaluate only (assumes checkpoint exists)
-#   bash runpod/run_all.sh --skip-setup # Skip pip install + model download
+#   bash isambard/pipeline.sh
+#   bash isambard/pipeline.sh --test
+#   bash isambard/pipeline.sh --quick
+#   bash isambard/pipeline.sh --scale 60
+#   bash isambard/pipeline.sh --data-only
+#   bash isambard/pipeline.sh --train-only
+#   bash isambard/pipeline.sh --eval-only
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-cd "$PROJECT_DIR"
-
-# Auto-activate PyTorch env if present (AWS Deep Learning AMI) and python not already on PATH
-if ! command -v python &>/dev/null && [[ -f /opt/pytorch/bin/activate ]]; then
-    source /opt/pytorch/bin/activate
+if [[ -z "${SLURM_JOB_ID:-}" ]]; then
+    echo "ERROR: pipeline.sh must run under Slurm on a compute node." >&2
+    echo "  From the repo root:  bash isambard/submit.sh pipeline" >&2
+    exit 1
 fi
 
-# ── Logging setup ──
-LOG_DIR="$PROJECT_DIR/outputs/logs"
-mkdir -p "$LOG_DIR"
-LOG_FILE="$LOG_DIR/pipeline_$(date +%Y%m%d_%H%M%S).log"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=env.sh
+source "${SCRIPT_DIR}/env.sh"
+cd "$PLMLOF_ROOT"
+
+if [[ ! -f plmlof/data/dataset.py || ! -f data/scripts/download_proteingym.py ]]; then
+    echo "ERROR: plmlof/data or data/scripts is missing from this clone." >&2
+    echo "       Both must be copied to the cluster (they were previously hidden by a" >&2
+    echo "       blanket data/ gitignore). rsync the full tree or add those paths to git." >&2
+    exit 1
+fi
+
+if [[ ! -x "${PLMLOF_VENV}/bin/python" ]]; then
+    echo "ERROR: venv missing at $PLMLOF_VENV" >&2
+    echo "  Submit setup first:  bash isambard/submit.sh setup" >&2
+    exit 1
+fi
+# shellcheck disable=SC1091
+source "${PLMLOF_VENV}/bin/activate"
+
+mkdir -p "$PLMLOF_LOG_DIR"
+LOG_FILE="$PLMLOF_LOG_DIR/pipeline_${SLURM_JOB_ID}.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 echo "Logging to: $LOG_FILE"
+echo "Job: $SLURM_JOB_ID  node=$(hostname)  gpus=${SLURM_GPUS:-$SLURM_GPUS_ON_NODE}"
 
-# ── Parse arguments ──
 MODE="full"
-SKIP_SETUP=false
-# Scale controls how many thousand training samples to use.
-# Default 450 (half dataset, ~50% of bacterial data per species). --quick sets 30. --scale N overrides.
-# Use --scale 900 for full dataset if disk space allows.
 SCALE=450
-S1_EPOCHS=""   # empty = use config default
-S2_EPOCHS=""   # empty = use config default
+S1_EPOCHS=""
+S2_EPOCHS=""
 
 ARGS=("$@")
 i=0
@@ -53,91 +61,73 @@ while [[ $i -lt ${#ARGS[@]} ]]; do
         --data-only)   MODE="data" ;;
         --train-only)  MODE="train" ;;
         --eval-only)   MODE="eval" ;;
-        --skip-setup)  SKIP_SETUP=true ;;
         --help|-h)
-            echo "Usage: bash runpod/run_all.sh [--test|--quick|--scale N|--s1-epochs N|--s2-epochs N|--data-only|--train-only|--eval-only] [--skip-setup]"
-            echo ""
-            echo "  --quick          30K samples, 20 Stage-1 epochs, 2 Stage-2 epochs (~1–2 hrs)"
-            echo "  --scale N        Use N*1000 samples total (default: 450 = half dataset, use 900 for full)"
-            echo "  --s1-epochs N    Override Stage 1 max epochs (default: from config)"
-            echo "  --s2-epochs N    Override Stage 2 max epochs (default: from config)"
+            echo "Usage: bash isambard/pipeline.sh [--test|--quick|--scale N|--s1-epochs N|--s2-epochs N|--data-only|--train-only|--eval-only]"
             exit 0
+            ;;
+        *)
+            echo "Unknown argument: $arg" >&2
+            exit 1
             ;;
     esac
     i=$((i+1))
 done
 
-# ── Env setup ──
-# Default cache to $HOME/.cache so it works on both RunPod (/workspace) and EC2 (~)
-DEFAULT_CACHE_DIR="${WORKSPACE_DIR:-$HOME}/.cache"
-export HF_HOME="${HF_HOME:-$DEFAULT_CACHE_DIR/huggingface}"
-export TORCH_HOME="${TORCH_HOME:-$DEFAULT_CACHE_DIR/torch}"
-# Reduce CUDA memory fragmentation (helps with variable-length protein sequences)
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
-
-# Paths
-DATA_DIR="data/processed"
-EMB_DIR="data/embeddings"
-OUTPUT_DIR="outputs/production"
+DATA_DIR="$PLMLOF_DATA_DIR"
+EMB_DIR="$PLMLOF_EMB_DIR"
+OUTPUT_DIR="$PLMLOF_OUTPUT_DIR"
 CHECKPOINT="$OUTPUT_DIR/checkpoints/model_best.pt"
-TRAIN_CFG="configs/runpod_training.yaml"
-MODEL_CFG="configs/runpod_model.yaml"
+TRAIN_CFG="$PLMLOF_TRAIN_CFG"
+MODEL_CFG="$PLMLOF_MODEL_CFG"
 
 echo "=============================================="
 echo " PLMLoF Pipeline — Mode: $MODE | Scale: ${SCALE}K samples"
 [[ -n "$S1_EPOCHS" ]] && echo " Stage 1 epochs: $S1_EPOCHS"
 [[ -n "$S2_EPOCHS" ]] && echo " Stage 2 epochs: $S2_EPOCHS"
+echo " Data:       $DATA_DIR"
+echo " Embeddings: $EMB_DIR"
+echo " Output:     $OUTPUT_DIR"
 echo "=============================================="
 echo ""
 
-# ── STEP 0: Setup (install deps + download ESM2) ──
-if [[ "$SKIP_SETUP" == false && ("$MODE" == "full" || "$MODE" == "test") ]]; then
-    echo "──────── Step 0: Setup ────────"
-    pip install -q -r requirements.txt
-    pip install -q -e ".[dev]"
-
-    echo "Pre-downloading ESM2 weights..."
-    if [[ "$MODE" == "test" ]]; then
-        bash runpod/download_models.sh --tiny
-    else
-        bash runpod/download_models.sh
-    fi
-    echo "Setup complete."
-    echo ""
+if ! python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
+    echo "ERROR: CUDA not available. This job is not on a GH200 compute node." >&2
+    exit 1
 fi
+DEVICE="cuda"
+GPU_NAME=$(python -c "import torch; print(torch.cuda.get_device_name(0))")
+GPU_MEM=$(python -c "import torch; print(f'{torch.cuda.get_device_properties(0).total_memory / 1e9:.0f}')")
+echo "GPU: $GPU_NAME (${GPU_MEM} GB)"
+echo ""
 
-# Auto-detect device (after install so torch is available)
-DEVICE="cpu"
-if python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
-    DEVICE="cuda"
-    GPU_NAME=$(python -c "import torch; print(torch.cuda.get_device_name(0))")
-    GPU_MEM=$(python -c "import torch; print(f'{torch.cuda.get_device_properties(0).total_memory / 1e9:.0f}')")
-    echo "GPU: $GPU_NAME (${GPU_MEM} GB) — device=cuda"
+# Hopper (GH200, sm_90) and Ampere both have native bf16.
+PRECISION="bf16"
+if python -c "import torch; cap = torch.cuda.get_device_capability(); raise SystemExit(0 if cap >= (8, 0) else 1)" 2>/dev/null; then
+    echo "  Compute cap ≥ 8.0 — mixed precision $PRECISION"
 else
-    echo "No GPU detected, using CPU (will be slow)"
+    PRECISION="fp16"
+    echo "  Compute cap < 8.0 — mixed precision $PRECISION"
 fi
 echo ""
 
-# ── STEP 1: Data preparation ──
 if [[ "$MODE" == "full" || "$MODE" == "data" || "$MODE" == "test" ]]; then
     echo "──────── Step 1: Data Preparation ────────"
-
     if [[ "$MODE" == "test" ]]; then
         echo "Test mode: synthetic data generated inline by train.py --tiny"
     else
         echo "Downloading ProteinGym data..."
+        mkdir -p data/raw/proteingym data/processed
         python data/scripts/download_proteingym.py || echo "  ProteinGym download failed, continuing..."
 
         TOTAL_SAMPLES=$(( SCALE * 1000 ))
         echo "Curating dataset (${SCALE}K balanced = ${TOTAL_SAMPLES} samples)..."
         python data/scripts/curate_dataset.py --total-samples "$TOTAL_SAMPLES"
 
-        echo "Data files:"
-        wc -l "$DATA_DIR"/*.parquet 2>/dev/null || true
+        mkdir -p "$DATA_DIR"
         for f in "$DATA_DIR"/{train,val,test}.parquet; do
             if [[ -f "$f" ]]; then
                 ROWS=$(python -c "import pandas as pd; print(len(pd.read_parquet('$f')))")
-                echo "  $(basename $f): $ROWS rows"
+                echo "  $(basename "$f"): $ROWS rows"
             fi
         done
     fi
@@ -149,54 +139,44 @@ if [[ "$MODE" == "data" ]]; then
     exit 0
 fi
 
-# ── STEP 2: Precompute ESM2 embeddings ──
 if [[ "$MODE" == "full" || "$MODE" == "test" ]]; then
     echo "──────── Step 2: Precompute Embeddings ────────"
-
     if [[ "$MODE" == "test" ]]; then
         echo "Running test precompute (ESM2-8M, synthetic)..."
         python scripts/train.py \
             --tiny \
             --max-epochs 2 \
             --device "$DEVICE" \
-            --output-dir outputs/test_run/
-        # Test mode skips precompute — uses tiny inline training
+            --output-dir "${PLMLOF_OUTPUT_DIR%/production}/test_run/"
     else
-        # Skip if embeddings already exist and are newer than the data
         if [[ -f "$EMB_DIR/train_embeddings.pt" && -f "$EMB_DIR/val_embeddings.pt" && \
+              -f "$DATA_DIR/train.parquet" && \
               "$EMB_DIR/train_embeddings.pt" -nt "$DATA_DIR/train.parquet" ]]; then
             echo "Embeddings already up-to-date, skipping precompute."
         else
             mkdir -p "$EMB_DIR"
+            # GH200 120 GB: 128 is safe for ESM2-650M at max_seq_length 1024.
+            # 256 OOM'd on 48 GB A40 for long sequences; raise only after a successful 128 run.
             python scripts/precompute_embeddings.py \
                 --train-data "$DATA_DIR/train.parquet" \
                 --val-data "$DATA_DIR/val.parquet" \
                 --test-data "$DATA_DIR/test.parquet" \
                 --output-dir "$EMB_DIR" \
                 --device "$DEVICE" \
-                --batch-size 64   # Conservative for A40 — long sequences (>800 aa) OOM at 256
+                --batch-size 128 \
+                --num-workers 8
         fi
         echo "Embeddings: $(du -sh "$EMB_DIR" 2>/dev/null | cut -f1)"
     fi
     echo ""
 fi
 
-# ── STEP 3: Training (cached — comparison + classifier only) ──
 if [[ "$MODE" == "full" || "$MODE" == "train" || "$MODE" == "test" ]]; then
     echo "──────── Step 3: Training ────────"
-
     if [[ "$MODE" == "test" ]]; then
-        # Already trained inline in step 2 for test mode
         echo "Test training already done in step 2."
     else
-        echo "Training with cached embeddings (CE loss, cross-attn, LayerNorm)..."
-        # Use bf16 on A100/H100 (larger dynamic range, no overflow spikes)
-        # Use fp16 on older GPUs (V100, A40, T4)
-        PRECISION="fp16"
-        if python -c "import torch; cap = torch.cuda.get_device_capability(); exit(0 if cap >= (8,0) else 1)" 2>/dev/null; then
-            PRECISION="bf16"
-            echo "  Ampere+ GPU detected (compute cap ≥ 8.0) — using bf16"
-        fi
+        echo "Training with cached embeddings..."
         S1_EPOCH_FLAG=""
         [[ -n "$S1_EPOCHS" ]] && S1_EPOCH_FLAG="--max-epochs $S1_EPOCHS"
         python scripts/train.py \
@@ -206,14 +186,11 @@ if [[ "$MODE" == "full" || "$MODE" == "train" || "$MODE" == "test" ]]; then
             --device "$DEVICE" \
             --mixed-precision "$PRECISION" \
             --output-dir "$OUTPUT_DIR" \
+            --num-workers 8 \
             $S1_EPOCH_FLAG
 
-        # ── Step 3a: Evaluate Stage 1 model before LoRA fine-tuning ──────────
-        # Run this now so Stage 2 cannot overwrite model_best.pt before we record
-        # Stage 1 baseline numbers.  Also saves a permanent Stage 1 copy.
         echo "──────── Step 3a: Stage 1 Evaluation (pre-LoRA baseline) ────────"
         if [[ -f "$CHECKPOINT" ]]; then
-            # Preserve Stage 1 checkpoint so the comparison is available after Stage 2
             S1_CHECKPOINT="$OUTPUT_DIR/checkpoints/model_stage1.pt"
             cp "$CHECKPOINT" "$S1_CHECKPOINT"
             echo "  Saved Stage 1 checkpoint → $S1_CHECKPOINT"
@@ -225,12 +202,11 @@ if [[ "$MODE" == "full" || "$MODE" == "train" || "$MODE" == "test" ]]; then
                 --embeddings "$EMB_DIR/test_embeddings.pt" \
                 --device "$DEVICE"
 
-            # Per-species evaluation: E. coli, M. tuberculosis, S. aureus, Klebsiella, S. pneumoniae
             for SPECIES_TAG in ecoli myctu stau klepn strpn; do
                 SPECIES_PARQUET="$DATA_DIR/test_${SPECIES_TAG}.parquet"
                 SPECIES_EMB="$EMB_DIR/test_${SPECIES_TAG}_embeddings.pt"
                 if [[ -f "$SPECIES_PARQUET" ]]; then
-                    echo "  Evaluating Stage 1 — ${SPECIES_TAG} species..."
+                    echo "  Evaluating Stage 1 — ${SPECIES_TAG}..."
                     python scripts/evaluate.py \
                         --model "$S1_CHECKPOINT" \
                         --test-data "$SPECIES_PARQUET" \
@@ -243,7 +219,6 @@ if [[ "$MODE" == "full" || "$MODE" == "train" || "$MODE" == "test" ]]; then
         fi
         echo ""
 
-        # Stage 2: LoRA fine-tuning of ESM2 encoder (requires Stage 1 checkpoint)
         echo "──────── Step 3b: Stage 2 LoRA Fine-tuning ────────"
         if [[ -f "$CHECKPOINT" ]]; then
             S2_EPOCH_FLAG=""
@@ -258,6 +233,7 @@ if [[ "$MODE" == "full" || "$MODE" == "train" || "$MODE" == "test" ]]; then
                 --device "$DEVICE" \
                 --mixed-precision "$PRECISION" \
                 --output-dir "$OUTPUT_DIR" \
+                --num-workers 8 \
                 $S2_EPOCH_FLAG
         else
             echo "  No Stage 1 checkpoint at $CHECKPOINT — skipping Stage 2."
@@ -267,16 +243,13 @@ if [[ "$MODE" == "full" || "$MODE" == "train" || "$MODE" == "test" ]]; then
 fi
 
 if [[ "$MODE" == "train" ]]; then
-    # Also run eval after training
     MODE="eval_after_train"
 fi
 
-# ── STEP 4: Evaluation (final / best model) ──
 if [[ "$MODE" == "full" || "$MODE" == "eval" || "$MODE" == "eval_after_train" || "$MODE" == "test" ]]; then
     echo "──────── Step 4: Evaluation (final best model) ────────"
-
     if [[ "$MODE" == "test" ]]; then
-        CHECKPOINT="outputs/test_run/checkpoints/model_best.pt"
+        CHECKPOINT="${PLMLOF_OUTPUT_DIR%/production}/test_run/checkpoints/model_best.pt"
         if [[ -f "$CHECKPOINT" ]]; then
             python scripts/evaluate.py \
                 --model "$CHECKPOINT" \
@@ -294,12 +267,11 @@ if [[ "$MODE" == "full" || "$MODE" == "eval" || "$MODE" == "eval_after_train" ||
                 --embeddings "$EMB_DIR/test_embeddings.pt" \
                 --device "$DEVICE"
 
-            # Per-species evaluation: E. coli, M. tuberculosis, S. aureus, Klebsiella, S. pneumoniae
             for SPECIES_TAG in ecoli myctu stau klepn strpn; do
                 SPECIES_PARQUET="$DATA_DIR/test_${SPECIES_TAG}.parquet"
                 SPECIES_EMB="$EMB_DIR/test_${SPECIES_TAG}_embeddings.pt"
                 if [[ -f "$SPECIES_PARQUET" ]]; then
-                    echo "Evaluating final model — ${SPECIES_TAG} species..."
+                    echo "Evaluating final model — ${SPECIES_TAG}..."
                     python scripts/evaluate.py \
                         --model "$CHECKPOINT" \
                         --test-data "$SPECIES_PARQUET" \
@@ -316,36 +288,7 @@ fi
 
 echo "=============================================="
 echo " Pipeline complete!"
-echo ""
 echo " Log:          $LOG_FILE"
 echo " Checkpoint:   $CHECKPOINT"
 echo " Predict:      python scripts/predict.py --model $CHECKPOINT --reference <ref.fasta> --variants <var.fasta> --device $DEVICE"
-echo "==============================================" 
-
-# ── STEP 5: Sync outputs to S3 ──
-if [[ -n "${S3_BUCKET:-}" ]]; then
-    echo ""
-    echo "──────── Step 5: Sync to S3 ────────"
-
-    # Validate AWS CLI is installed
-    if ! command -v aws &>/dev/null; then
-        echo "ERROR: S3_BUCKET is set but 'aws' CLI is not installed. Skipping S3 sync."
-        echo "  Install with: pip install awscli  or  apt-get install awscli"
-    else
-        # Validate credentials are working before attempting sync
-        if ! aws sts get-caller-identity &>/dev/null; then
-            echo "ERROR: AWS credentials are invalid or not configured. Skipping S3 sync."
-            echo "  Set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_DEFAULT_REGION in runpod/env.sh"
-        else
-            S3_DEST="s3://${S3_BUCKET}/plmlof-runs/$(date +%Y%m%d_%H%M%S)"
-            echo "Syncing outputs → $S3_DEST"
-            aws s3 sync "$OUTPUT_DIR" "$S3_DEST" \
-                --exclude '*.tmp' \
-                --no-progress
-            echo "S3 sync complete: $S3_DEST"
-        fi
-    fi
-else
-    echo ""
-    echo "Tip: set S3_BUCKET=your-bucket-name in runpod/env.sh to auto-sync outputs to AWS."
-fi
+echo "=============================================="

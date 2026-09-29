@@ -1,176 +1,156 @@
-# PLMLoF — Protein Language Model Loss/Gain-of-Function Variant Classifier
+# PLMLoF
 
-ESM2-based classifier for bacterial gene variants: **Loss-of-Function (LoF)**, **Wildtype (WT)**, or **Gain-of-Function (GoF)**.
+Bacterial variant classifier: **LoF / WT / GoF**. Runs on **Isambard-AI Phase 2** (1 GH200 per job).
 
----
-
-## Table of Contents
-
-- [RunPod Quick Start](#runpod-quick-start)
-- [Architecture](#architecture)
-- [Local Install](#local-install)
-- [Testing](#testing)
-- [Troubleshooting](#troubleshooting)
+Do not run setup, pip, ProteinGym, or training on a login node. Do not put the repo or caches in `$HOME` (100 GiB; filling it can block SSH).
 
 ---
 
-## RunPod Quick Start
+## 1. WSL — copy the repo onto project space
 
-### 1. First-Time Setup
+Replace `HOST` with the Clifton SSH host you already use.
 
 ```bash
-cd /workspace
-git clone https://github.com/Stgeorge2002/PLMLoF.git
-cd PLMLoF
-bash runpod/setup.sh
-bash runpod/run_all.sh
-bash runpod/setup.sh
+clifton auth
+clifton ssh-config write
+
+ssh tbea20.b6bh@HOST 'mkdir -p /projects/b6bh/tbea20.b6bh/PLMLoF'
+
+rsync -avz --progress \
+  --exclude '.git' \
+  --exclude '.venv' \
+  --exclude '__pycache__' \
+  --exclude '*.pyc' \
+  --exclude 'data/raw' \
+  --exclude 'data/processed' \
+  --exclude 'data/embeddings' \
+  --exclude 'data/scripts/data' \
+  --exclude 'outputs' \
+  --exclude 'wandb' \
+  --exclude '*.log' \
+  --exclude '*.pt' \
+  --exclude 'runpod' \
+  /home/theoa/PLMLoF/ \
+  tbea20.b6bh@HOST:/projects/b6bh/tbea20.b6bh/PLMLoF/
 ```
 
-`setup.sh` installs dependencies, pre-downloads ESM2-8M and ESM2-650M (~2.6 GB) to `/workspace/.cache/`, and runs smoke tests.
-
-### 2. Prepare Data (ProteinGym only)
+Then log in:
 
 ```bash
-python data/scripts/download_proteingym.py
-python data/scripts/curate_dataset.py
+ssh tbea20.b6bh@HOST
 ```
 
-Outputs: `data/processed/train.parquet`, `val.parquet`, `test.parquet` (~50K balanced samples, equal thirds LoF/WT/GoF).
+---
 
-### 3. Pre-compute Embeddings (run ESM2 once)
-
-This runs ESM2-650M over all data once and saves pooled embeddings to disk. Training then becomes MLP-only — minutes instead of hours.
-
-> **Takes ~40 min on A40.** Use `nohup` so it survives SSH disconnections. Reconnect and run `tail -f precompute.log` to check progress.
+## 2. Login node — check, then submit
 
 ```bash
-nohup python scripts/precompute_embeddings.py \
-  --train-data data/processed/train.parquet \
-  --val-data data/processed/val.parquet \
-  --output-dir data/embeddings/ \
-  --batch-size 256 \
-  --device cuda > precompute.log 2>&1 &
+echo "$HOME"
+echo "$PROJECTDIR"
+echo "$SCRATCHDIR"
+# expect:
+# /home/b6bh/tbea20.b6bh
+# /projects/b6bh
+# /scratch/b6bh/tbea20.b6bh
 
-tail -f precompute.log
+cd /projects/b6bh/tbea20.b6bh/PLMLoF
+ls plmlof/data/dataset.py data/scripts/download_proteingym.py isambard/submit.sh
 ```
 
-Outputs: `data/embeddings/train_embeddings.pt` and `val_embeddings.pt`.
-
-### 4. Train (fast cached mode)
+Optional (avoids HuggingFace 429s):
 
 ```bash
- 
+export HF_TOKEN=hf_YOUR_TOKEN
 ```
 
-Checkpoint saved to `outputs/production/checkpoints/model_best.pt` on best validation macro-F1.
-
-For A100/H100, use `--mixed-precision bf16`.
-
-### 5. Evaluate
+First time — venv + ESM2 download (2 h, 1 GPU):
 
 ```bash
-python scripts/evaluate.py \
-  --model outputs/production/checkpoints/model_best.pt \
-  --test-data data/processed/test.parquet \
-  --device cuda
+bash isambard/submit.sh setup
+squeue --me
+tail -f "$SCRATCHDIR/plmlof/logs/"plmlof-setup-*.out
 ```
 
-### 6. Predict
+Wait until the log says `Setup complete.`
+
+Smoke test (30 min):
 
 ```bash
-# Paired FASTA → TSV
+bash isambard/submit.sh test
+squeue --me
+tail -f "$SCRATCHDIR/plmlof/logs/"plmlof-test-*.out
+```
+
+Full pipeline after setup has succeeded (24 h, 1 GPU). Check remaining **b6bh** NHR on https://portal.isambard.ac.uk first.
+
+```bash
+bash isambard/submit.sh pipeline
+squeue --me
+tail -f "$SCRATCHDIR/plmlof/logs/"plmlof-pipeline-*.out
+```
+
+Checkpoint when finished:
+
+```text
+/projects/b6bh/tbea20.b6bh/PLMLoF/outputs/production/checkpoints/model_best.pt
+```
+
+---
+
+## 3. Later runs (login node)
+
+Setup is already done. From `/projects/b6bh/tbea20.b6bh/PLMLoF`:
+
+```bash
+bash isambard/submit.sh pipeline                  # data → embeddings → train → eval
+bash isambard/submit.sh data                      # download + curate only
+bash isambard/submit.sh pipeline --train-only     # embeddings already exist
+bash isambard/submit.sh pipeline --eval-only
+bash isambard/submit.sh pipeline --quick          # 30K samples, short epochs
+bash isambard/submit.sh pipeline --scale 900      # 900K samples
+```
+
+Cancel your jobs:
+
+```bash
+squeue --me
+scancel JOBID
+```
+
+---
+
+## 4. Predict (compute node)
+
+After a checkpoint exists:
+
+```bash
+cd /projects/b6bh/tbea20.b6bh/PLMLoF
+srun --nodes=1 --gpus=1 --time=01:00:00 --pty bash --login
+source isambard/env.sh
+source "$PLMLOF_VENV/bin/activate"
 python scripts/predict.py \
   --reference ref_genes.fasta \
   --variants var_genes.fasta \
-  --model outputs/production/checkpoints/model_best.pt \
-  --output predictions.tsv \
+  --model "$PLMLOF_OUTPUT_DIR/checkpoints/model_best.pt" \
+  --output "$PLMLOF_SCRATCH/predictions.tsv" \
   --device cuda
-
-# VCF input
-python scripts/predict.py \
-  --reference ref_genes.fasta \
-  --vcf variants.vcf \
-  --model outputs/production/checkpoints/model_best.pt \
-  --output predictions.json \
-  --format json \
-  --device cuda
-```
-
-### 7. Returning to an Existing Pod
-
-```bash
-cd /workspace/PLMLoF
-git pull
-python scripts/train.py --config configs/runpod_training.yaml --model-config configs/runpod_model.yaml \
-  --precomputed data/embeddings/ --output-dir outputs/production/
 ```
 
 ---
 
-## Architecture
+## Do not
 
-```
-Reference protein ──► ┌──────────────────┐
-                      │   Shared ESM2    │
-                      │   Encoder        │──► Comparison ──► ┌─────────────┐
-Variant protein  ──►  │   (+ LoRA        │    Module         │  Classifier │──► LoF / WT / GoF
-                      │    adapters)      │    diff/product   │  Head (MLP) │
-                      └──────────────────┘    mean+max pool  │             │
-                                                             │  Regression │──► DMS z-score
-                              12-dim engineered ────────────►│  Head (MLP) │    (multi-task)
-                              features                       └─────────────┘
-                              (length change, premature stop,
-                               met-start lost, missense density,
-                               truncation, region, sequence identity...)
-```
+- Copy into `$HOME` or copy a WSL `.venv`
+- Run `isambard/setup.sh` or `isambard/pipeline.sh` on the login node (use `submit.sh`)
+- Add `--exclusive` to jobs (bills 4 GPUs)
 
-**Pre-compute workflow:** ESM2 runs once to save pooled `[mean, max]` embeddings per sequence. The `CachedTrainer` then trains only the Comparison projection + Classifier MLP + Regression MLP using those cached tensors — no ESM2 forward pass per epoch.
-
-**Multi-task training:** Classification loss (cross-entropy) + regression loss (Huber/SmoothL1 on DMS fitness z-scores) are jointly optimised with linear warmup. The regression head predicts the continuous fitness effect; weight is configurable via `regression_weight` in the training config.
+One GPU-hour = **0.25 NHR**. Mix nodes can still take `--gpus=1`.
 
 ---
 
-## Local Install
+## Local tests (WSL only)
 
 ```bash
-git clone https://github.com/Stgeorge2002/PLMLoF.git
-cd PLMLoF
 pip install -e ".[dev]"
-```
-
-Requires Python 3.10+, PyTorch 2.0+, CUDA 11.8+ (CPU inference supported).
-
----
-
-## Testing
-
-All tests are CPU-compatible and use the tiny ESM2-8M model. No GPU or real data required.
-
-```bash
 pytest tests/ -v
 ```
-
----
-
-## Troubleshooting
-
-**Out of Memory (OOM)**
-- Reduce `--batch-size`
-- ESM2-650M Stage 2 (full training) requires ~18 GB VRAM minimum
-- For the cached workflow (`--precomputed`), any GPU with 4 GB+ is sufficient
-
-**pip appears frozen during setup**
-Torch is ~2 GB. It will look frozen for 5–10 minutes. Wait.
-
-**ProteinGym download returns 0 records**
-External URLs change periodically — check the script's log output for the count.
-
-**CUDA errors**
-```bash
-python -c "import torch; print(torch.__version__, torch.version.cuda)"
-CUDA_LAUNCH_BLOCKING=1 python scripts/train.py ...
-```
-
-**Slow training**
-Use the `--precomputed` flag to run ESM2 once and cache embeddings. Training becomes MLP-only (minutes, not hours).
