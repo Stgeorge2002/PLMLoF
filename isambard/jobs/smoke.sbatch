@@ -12,8 +12,10 @@ set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:?}"
 source isambard/env.sh
 
-if [[ ! -x "${PLMLOF_VENV}/bin/python" ]]; then
-    echo "No venv yet — tiny setup (PyTorch + ESM2-8M only)..."
+# A venv that only has torch (failed mid-setup) must not skip the rest of install.
+if [[ ! -x "${PLMLOF_VENV}/bin/python" ]] \
+    || ! "${PLMLOF_VENV}/bin/python" -c "import yaml, numpy, plmlof, torch; assert torch.cuda.is_available()" 2>/dev/null; then
+    echo "Tiny setup (PyTorch cu128 + PLMLoF deps + ESM2-8M)..."
     bash isambard/setup.sh --tiny
 fi
 
