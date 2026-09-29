@@ -65,22 +65,28 @@ unset _venv_arch
 # shellcheck disable=SC1091
 source "${PLMLOF_VENV}/bin/activate"
 
-echo "Installing PyTorch + PLMLoF (CUDA 12.8 aarch64 wheels) ..."
-# Single resolve so -e ".[dev]" cannot replace the CUDA wheel with a CPU build from PyPI.
-uv pip install \
-    torch \
-    -e ".[dev]" \
-    --index-url https://download.pytorch.org/whl/cu128 \
-    --extra-index-url https://pypi.org/simple \
-    --index-strategy unsafe-best-match
+# GH200 nodes need the official aarch64 CUDA 12.8 wheel. Mixing PyPI / cu130
+# can install 2.14+cu130 which reports cuda=13.0 but is_available() is False.
+echo "Installing PyTorch (CUDA 12.8 aarch64, cu128 index only)..."
+uv pip install --upgrade --index-url https://download.pytorch.org/whl/cu128 torch
+
+echo "Installing PLMLoF (will not upgrade torch if already satisfied)..."
+uv pip install -e ".[dev]" \
+    --index-url https://pypi.org/simple \
+    --extra-index-url https://download.pytorch.org/whl/cu128 \
+    --upgrade-strategy only-if-needed
 
 python - <<'PY'
 import torch, sys
-print(f"  torch {torch.__version__}  cuda={torch.version.cuda}  arch={torch.cuda.get_arch_list() if torch.cuda.is_available() else 'no-gpu'}")
+print(f"  torch {torch.__version__}  built_cuda={torch.version.cuda}")
 if not torch.cuda.is_available():
-    sys.exit("CUDA is not available. Setup must run on a GH200 compute node, not a login node.")
+    sys.exit(
+        "CUDA is not available after the cu128 install. "
+        "Delete .venv and resubmit smoke; do not run pipeline."
+    )
 print(f"  GPU: {torch.cuda.get_device_name(0)}")
 print(f"  capability: {torch.cuda.get_device_capability(0)}")
+print(f"  arch list: {torch.cuda.get_arch_list()}")
 PY
 
 echo ""
