@@ -13,6 +13,7 @@ from __future__ import annotations
 import io
 import logging
 import ssl
+import sys
 import zipfile
 from pathlib import Path
 from urllib.error import URLError
@@ -22,17 +23,15 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# ProteinGym reference file (try multiple known paths)
+# Official ProteinGym v1.3 reference (taxon column: Human / Eukaryote / Prokaryote / Virus)
 PROTEINGYM_REFERENCE_URLS = [
-    "https://marks.hms.harvard.edu/proteingym/ProteinGym_v1.3/DMS_substitutions.csv",
-    "https://huggingface.co/datasets/OATML-Markslab/ProteinGym_v0.1/resolve/main/ProteinGym_reference_file_substitutions.csv",
     "https://raw.githubusercontent.com/OATML-Markslab/ProteinGym/main/reference_files/DMS_substitutions.csv",
+    "https://marks.hms.harvard.edu/proteingym/ProteinGym_v1.3/DMS_substitutions.csv",
 ]
 
-# ProteinGym substitution scores ZIP (try multiple paths)
+# Substitution DMS CSVs (~43 MB). HuggingFace v0.1 zip path 404s; Harvard is canonical.
 PROTEINGYM_SUBS_URLS = [
     "https://marks.hms.harvard.edu/proteingym/ProteinGym_v1.3/DMS_ProteinGym_substitutions.zip",
-    "https://huggingface.co/datasets/OATML-Markslab/ProteinGym_v0.1/resolve/main/ProteinGym_substitutions/DMS_ProteinGym_substitutions.zip",
 ]
 
 OUTPUT_DIR = Path("data/raw/proteingym/")
@@ -257,32 +256,31 @@ def download_proteingym_scores(output_dir: Path = OUTPUT_DIR) -> Path:
 
 
 def filter_bacterial_assays(ref_path: Path) -> pd.DataFrame:
-    """Filter the ProteinGym reference for bacterial protein assays."""
+    """Keep every ProteinGym substitution assay with taxon == Prokaryote.
+
+    ProteinGym does not have a 'Bacteria' taxon. Prokaryote is the official
+    label for bacterial (and a few archaeal) DMS assays.
+    """
     if not ref_path.exists() or ref_path.stat().st_size < 100:
         logger.warning("ProteinGym reference file empty or missing.")
         return pd.DataFrame()
 
     df = pd.read_csv(ref_path)
+    if "taxon" not in df.columns:
+        logger.error("Reference file has no 'taxon' column; cannot select Prokaryote assays.")
+        return pd.DataFrame()
+
     logger.info(f"ProteinGym reference contains {len(df)} assays")
+    logger.info(f"Taxon counts:\n{df['taxon'].astype(str).str.strip().value_counts().to_string()}")
 
-    bacterial_mask = pd.Series(False, index=df.index)
-
-    # Match on DMS_id or UniProt_ID columns
-    id_cols = [c for c in ["DMS_id", "UniProt_ID"] if c in df.columns]
-    for col in id_cols:
-        for assay_id in BACTERIAL_DMS_IDS:
-            bacterial_mask |= df[col].str.contains(assay_id, case=False, na=False)
-        for kw in BACTERIAL_KEYWORDS:
-            bacterial_mask |= df[col].str.contains(kw, case=False, na=False)
-
-    # Also check any organism/species columns
-    for col in df.columns:
-        if any(x in col.lower() for x in ["organism", "species", "taxon"]):
-            for kw in BACTERIAL_KEYWORDS:
-                bacterial_mask |= df[col].astype(str).str.contains(kw, case=False, na=False)
-
-    bacterial_df = df[bacterial_mask]
-    logger.info(f"Found {len(bacterial_df)} bacterial-related assays")
+    prokaryote = df["taxon"].astype(str).str.strip().str.lower() == "prokaryote"
+    bacterial_df = df.loc[prokaryote].copy()
+    logger.info(f"Keeping {len(bacterial_df)} Prokaryote assays")
+    if "source_organism" in bacterial_df.columns:
+        logger.info(
+            "Organisms:\n"
+            + bacterial_df["source_organism"].fillna("(unknown)").value_counts().to_string()
+        )
     return bacterial_df
 
 
@@ -298,32 +296,41 @@ def process_dms_scores(
     """
     records = []
 
-    # Try to get target_seq from the reference file
-    ref_seqs = {}
-    if "target_seq" in bacterial_assays.columns:
-        for _, row in bacterial_assays.iterrows():
-            dms_id = row.get("DMS_id", "")
-            seq = row.get("target_seq", "")
-            if dms_id and isinstance(seq, str) and len(seq) > 10:
-                ref_seqs[dms_id] = seq
+    wanted_names = set()
+    if "DMS_filename" in bacterial_assays.columns:
+        wanted_names = set(bacterial_assays["DMS_filename"].dropna().astype(str))
+    wanted_ids = set()
+    if "DMS_id" in bacterial_assays.columns:
+        wanted_ids = set(bacterial_assays["DMS_id"].dropna().astype(str))
 
-    # Find score CSV files
+    ref_seqs: dict[str, str] = {}
+    organism_by_key: dict[str, str] = {}
+    for _, row in bacterial_assays.iterrows():
+        seq = row.get("target_seq", "")
+        org = str(row.get("source_organism") or "").strip()
+        keys = [row.get("DMS_id"), row.get("DMS_filename")]
+        if isinstance(row.get("DMS_filename"), str):
+            keys.append(Path(row["DMS_filename"]).stem)
+        for key in keys:
+            if not key or (isinstance(key, float) and pd.isna(key)):
+                continue
+            key_s = str(key)
+            if isinstance(seq, str) and len(seq) > 10:
+                ref_seqs[key_s] = seq
+            if org:
+                organism_by_key[key_s] = org
+
+    wanted_stems = {Path(n).stem for n in wanted_names} | wanted_ids
+
     score_files = list(scores_dir.rglob("*.csv"))
     logger.info(f"Found {len(score_files)} score files in {scores_dir}")
 
-    bacterial_ids = set()
-    if "DMS_id" in bacterial_assays.columns:
-        bacterial_ids = set(bacterial_assays["DMS_id"].dropna().tolist())
-
+    n_matched = 0
     for csv_path in score_files:
-        # Check if this file is a bacterial assay
         stem = csv_path.stem
-        is_bacterial = any(bid in stem for bid in bacterial_ids) if bacterial_ids else False
-        if not is_bacterial:
-            # Also check by keyword
-            is_bacterial = any(kw in stem.lower() for kw in BACTERIAL_KEYWORDS)
-        if not is_bacterial:
+        if csv_path.name not in wanted_names and stem not in wanted_stems:
             continue
+        n_matched += 1
 
         try:
             df = pd.read_csv(csv_path)
@@ -352,7 +359,7 @@ def process_dms_scores(
             continue
 
         # Get reference sequence
-        ref_protein = ref_seqs.get(stem, "")
+        ref_protein = ref_seqs.get(stem, "") or ref_seqs.get(csv_path.name, "")
         if not ref_protein and "mutated_sequence" in df.columns:
             # Try to infer from wildtype rows
             wt_mask = df[score_col].between(-0.1, 0.1)
@@ -393,7 +400,7 @@ def process_dms_scores(
             if var_protein and var_protein != ref_protein:
                 records.append({
                     "gene": stem,
-                    "species": _guess_species(stem),
+                    "species": organism_by_key.get(stem) or organism_by_key.get(csv_path.name) or _guess_species(stem),
                     "ref_protein": ref_protein,
                     "var_protein": var_protein,
                     "ref_dna": "",
@@ -403,6 +410,8 @@ def process_dms_scores(
                     "dms_zscore": float(z),
                     "source": "ProteinGym",
                 })
+
+    logger.info(f"Matched {n_matched} Prokaryote assay CSV files")
 
     df_out = pd.DataFrame(records)
     if not df_out.empty:
@@ -515,13 +524,13 @@ def main():
         if scores_dir.exists() and any(scores_dir.rglob("*.csv")):
             result_df = process_dms_scores(scores_dir, bacterial)
 
-    # If we got data from the actual download, use it
-    if not result_df.empty:
-        logger.info(f"Processed {len(result_df)} variants from ProteinGym DMS data")
-    else:
-        # Fall back to curated TEM-1 mutations
-        logger.warning("No ProteinGym DMS data available. Using curated fallback.")
-        result_df = _generate_fallback_data()
+    if result_df.empty or (
+        "source" in result_df.columns and (result_df["source"] == "ProteinGym_curated").all()
+    ):
+        logger.error("No real ProteinGym DMS rows. Refusing TEM-1 fallback.")
+        sys.exit(1)
+
+    logger.info(f"Processed {len(result_df)} variants from ProteinGym DMS data")
 
     out_path = Path("data/processed/proteingym_bacterial.parquet")
     out_path.parent.mkdir(parents=True, exist_ok=True)

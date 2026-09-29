@@ -11,6 +11,11 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     exit 1
 fi
 
+TINY=false
+if [[ "${1:-}" == "--tiny" ]]; then
+    TINY=true
+fi
+
 if [[ "$(uname -m)" != "aarch64" ]]; then
     echo "ERROR: Isambard-AI GH200 nodes are aarch64; this host is $(uname -m)." >&2
     echo "       An x86_64 venv or Docker image from WSL/RunPod will not run here." >&2
@@ -79,8 +84,13 @@ print(f"  capability: {torch.cuda.get_device_capability(0)}")
 PY
 
 echo ""
-echo "Pre-downloading ESM2 weights into $HF_HOME ..."
-bash "${SCRIPT_DIR}/download_models.sh"
+if [[ "$TINY" == true ]]; then
+    echo "Pre-downloading ESM2-8M only (no 650M)..."
+    bash "${SCRIPT_DIR}/download_models.sh" --tiny
+else
+    echo "Pre-downloading ESM2 weights into $HF_HOME ..."
+    bash "${SCRIPT_DIR}/download_models.sh"
+fi
 
 echo ""
 echo "GPU tensor smoke test ..."
@@ -118,6 +128,7 @@ with torch.no_grad():
 print(f"  logits {tuple(logits.shape)}  preds={logits.argmax(-1).tolist()}")
 PY
 
+if [[ "$TINY" != true ]]; then
 echo ""
 echo "torch.compile (precompute uses this by default) ..."
 python - <<'PY'
@@ -140,10 +151,15 @@ except Exception as e:
     print(f"  WARNING: torch.compile failed ({e})")
     print("  Precompute with --no-compile if this persists.")
 PY
+fi
 
 echo ""
 echo "=============================================="
 echo " Setup complete."
-echo " Next:  bash isambard/submit.sh pipeline"
-echo " Test:  bash isambard/submit.sh test"
+if [[ "$TINY" == true ]]; then
+    echo " Tiny setup only (ESM2-8M). Full weights: bash isambard/submit.sh setup"
+else
+    echo " Next:  bash isambard/submit.sh smoke   # cheap GPU check"
+    echo " Then:  bash isambard/submit.sh pipeline"
+fi
 echo "=============================================="

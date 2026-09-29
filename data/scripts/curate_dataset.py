@@ -160,6 +160,20 @@ def merge_datasets(total_samples: int = DEFAULT_TOTAL_SAMPLES) -> pd.DataFrame:
         f"{len(other_df):,} other = {len(combined):,} total"
     )
 
+    # --total-samples 0 (or negative): keep every LoF / WT / GoF row, no cap.
+    if total_samples <= 0:
+        merged = combined.sample(frac=1, random_state=42).reset_index(drop=True)
+        logger.info(f"Keeping ALL variants (no class cap): {len(merged):,} records")
+        label_counts = merged["label"].value_counts()
+        logger.info(
+            f"Label distribution: LoF={label_counts.get(0, 0)}, "
+            f"WT={label_counts.get(1, 0)}, GoF={label_counts.get(2, 0)}"
+        )
+        logger.info("Species breakdown (full set):")
+        for sp, cnt in merged["species"].fillna("").value_counts().items():
+            logger.info(f"  {sp or '(unknown)'}: {cnt:,}")
+        return merged
+
     # ── Class balance ─────────────────────────────────────────────────────────
     samples_per_class = total_samples // 3
     balanced_dfs = []
@@ -235,8 +249,8 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--total-samples", type=int, default=DEFAULT_TOTAL_SAMPLES,
-        help=f"Total balanced samples across LoF/WT/GoF (default: {DEFAULT_TOTAL_SAMPLES:,})",
+        "--total-samples", type=int, default=0,
+        help="Cap on balanced samples. 0 = keep every Prokaryote LoF/WT/GoF row (default).",
     )
     args = parser.parse_args()
 

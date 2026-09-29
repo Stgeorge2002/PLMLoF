@@ -44,15 +44,17 @@ echo "Logging to: $LOG_FILE"
 echo "Job: $SLURM_JOB_ID  node=$(hostname)  gpus=${SLURM_GPUS:-$SLURM_GPUS_ON_NODE}"
 
 MODE="full"
-SCALE=450
+SCALE=0
 S1_EPOCHS=""
 S2_EPOCHS=""
+SMOKE=false
 
 ARGS=("$@")
 i=0
 while [[ $i -lt ${#ARGS[@]} ]]; do
     arg="${ARGS[$i]}"
     case $arg in
+        --smoke)       MODE="test"; SMOKE=true ;;
         --test)        MODE="test" ;;
         --quick)       SCALE=30; S1_EPOCHS=20; S2_EPOCHS=2 ;;
         --scale)       i=$((i+1)); SCALE="${ARGS[$i]}" ;;
@@ -62,7 +64,7 @@ while [[ $i -lt ${#ARGS[@]} ]]; do
         --train-only)  MODE="train" ;;
         --eval-only)   MODE="eval" ;;
         --help|-h)
-            echo "Usage: bash isambard/pipeline.sh [--test|--quick|--scale N|--s1-epochs N|--s2-epochs N|--data-only|--train-only|--eval-only]"
+            echo "Usage: bash isambard/pipeline.sh [--smoke|--test|--quick|--scale N|--s1-epochs N|--s2-epochs N|--data-only|--train-only|--eval-only]"
             exit 0
             ;;
         *)
@@ -81,7 +83,11 @@ TRAIN_CFG="$PLMLOF_TRAIN_CFG"
 MODEL_CFG="$PLMLOF_MODEL_CFG"
 
 echo "=============================================="
-echo " PLMLoF Pipeline — Mode: $MODE | Scale: ${SCALE}K samples"
+if [[ "$MODE" == "test" ]]; then
+    echo " PLMLoF Pipeline — Mode: $MODE (ESM2-8M, synthetic; no ProteinGym, no 650M)"
+else
+    echo " PLMLoF Pipeline — Mode: $MODE | Scale: $([[ "$SCALE" -eq 0 ]] && echo 'ALL Prokaryote variants' || echo "${SCALE}K samples")"
+fi
 [[ -n "$S1_EPOCHS" ]] && echo " Stage 1 epochs: $S1_EPOCHS"
 [[ -n "$S2_EPOCHS" ]] && echo " Stage 2 epochs: $S2_EPOCHS"
 echo " Data:       $DATA_DIR"
@@ -117,11 +123,16 @@ if [[ "$MODE" == "full" || "$MODE" == "data" || "$MODE" == "test" ]]; then
     else
         echo "Downloading ProteinGym data..."
         mkdir -p data/raw/proteingym data/processed
-        python data/scripts/download_proteingym.py || echo "  ProteinGym download failed, continuing..."
+        python data/scripts/download_proteingym.py
 
         TOTAL_SAMPLES=$(( SCALE * 1000 ))
-        echo "Curating dataset (${SCALE}K balanced = ${TOTAL_SAMPLES} samples)..."
-        python data/scripts/curate_dataset.py --total-samples "$TOTAL_SAMPLES"
+        if [[ "$SCALE" -eq 0 ]]; then
+            echo "Curating dataset (ALL Prokaryote LoF/WT/GoF variants, no cap)..."
+            python data/scripts/curate_dataset.py --total-samples 0
+        else
+            echo "Curating dataset (${SCALE}K balanced = ${TOTAL_SAMPLES} samples)..."
+            python data/scripts/curate_dataset.py --total-samples "$TOTAL_SAMPLES"
+        fi
 
         mkdir -p "$DATA_DIR"
         for f in "$DATA_DIR"/{train,val,test}.parquet; do
@@ -142,10 +153,12 @@ fi
 if [[ "$MODE" == "full" || "$MODE" == "test" ]]; then
     echo "──────── Step 2: Precompute Embeddings ────────"
     if [[ "$MODE" == "test" ]]; then
-        echo "Running test precompute (ESM2-8M, synthetic)..."
+        TEST_EPOCHS=2
+        [[ "$SMOKE" == true ]] && TEST_EPOCHS=1
+        echo "Running tiny train (ESM2-8M, synthetic, ${TEST_EPOCHS} epoch(s))..."
         python scripts/train.py \
             --tiny \
-            --max-epochs 2 \
+            --max-epochs "$TEST_EPOCHS" \
             --device "$DEVICE" \
             --output-dir "${PLMLOF_OUTPUT_DIR%/production}/test_run/"
     else

@@ -2,10 +2,11 @@
 # Submit PLMLoF jobs from an Isambard-AI login node.
 # Run this from the clone on $PROJECTDIR — never from $HOME.
 #
+#   bash isambard/submit.sh smoke            # cheap GPU check (~minutes, ESM2-8M only)
 #   bash isambard/submit.sh setup
 #   bash isambard/submit.sh pipeline
 #   bash isambard/submit.sh all              # setup, then pipeline after setup succeeds
-#   bash isambard/submit.sh test
+#   bash isambard/submit.sh test             # smoke train if venv already exists
 #   bash isambard/submit.sh pipeline --train-only
 #   bash isambard/submit.sh data             # pipeline --data-only
 
@@ -35,6 +36,10 @@ submit_one() {
 }
 
 case "$ACTION" in
+    smoke)
+        submit_one smoke.sbatch
+        echo "Submitted smoke (max 20 min, 1 GPU). This is the cheap check — not the full pipeline."
+        ;;
     setup)
         submit_one setup.sbatch
         ;;
@@ -57,7 +62,7 @@ case "$ACTION" in
         sed -n '2,14p' "$0"
         ;;
     *)
-        echo "Unknown action: $ACTION (expected setup|pipeline|data|test|all)" >&2
+        echo "Unknown action: $ACTION (expected smoke|setup|pipeline|data|test|all)" >&2
         exit 1
         ;;
 esac
