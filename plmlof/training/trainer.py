@@ -793,8 +793,9 @@ class CachedTrainer:
             )
             # ReduceLROnPlateau requires manual step() with metric, can't use SequentialLR
             # So we'll handle warmup manually and create plateau scheduler for post-warmup
+            # verbose= was removed in PyTorch 2.2+ (GH200 is 2.11).
             plateau_scheduler = ReduceLROnPlateau(
-                optimizer, mode='min', factor=0.5, patience=5, verbose=True, min_lr=1e-6
+                optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6
             )
             scheduler = {'warmup': warmup_scheduler, 'plateau': plateau_scheduler, 'warmup_epochs': warmup_epochs}
         else:
