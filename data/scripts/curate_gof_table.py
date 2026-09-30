@@ -50,8 +50,9 @@ OUT_PATH = REPO / "data" / "processed" / "gof_growth_amr.parquet"
 
 CARD_URL = "https://card.mcmaster.ca/latest/data"
 AMRFINDER_MUTATION_URLS = [
-    "https://ftp.ncbi.nlm.nih.gov/pathogen/Antimicrobial_resistance/AMRFinderPlus/database/latest/AMRProt-mutation",
+    "https://ftp.ncbi.nlm.nih.gov/pathogen/Antimicrobial_resistance/AMRFinderPlus/database/latest/AMRProt-mutation.tsv",
 ]
+MAVEDB_SEARCH = "https://api.mavedb.org/api/v1/score-sets/search"
 MAVEDB_SCORESETS = "https://api.mavedb.org/api/v1/score-sets"
 SNP_RE = re.compile(r"^[ACDEFGHIKLMNPQRSTVWY]\d+[ACDEFGHIKLMNPQRSTVWY]$")
 GROWTH_TOKENS = (
@@ -78,18 +79,25 @@ def _ssl() -> ssl.SSLContext:
         return ssl.create_default_context()
 
 
-def _get(url: str, dest: Path | None = None, timeout: int = 180) -> bytes | None:
-    req = Request(url, headers={"User-Agent": "PLMLoF/1.0"})
+def _request(url: str, dest: Path | None = None, timeout: int = 180, data: bytes | None = None) -> bytes | None:
+    headers = {"User-Agent": "PLMLoF/1.0"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    req = Request(url, data=data, headers=headers, method="POST" if data is not None else "GET")
     try:
         with urlopen(req, timeout=timeout, context=_ssl()) as resp:  # noqa: S310
-            data = resp.read()
+            body = resp.read()
     except (URLError, HTTPError, TimeoutError) as exc:
-        logger.warning("GET failed %s: %s", url, exc)
+        logger.warning("HTTP failed %s: %s", url, exc)
         return None
     if dest is not None:
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(data)
-    return data
+        dest.write_bytes(body)
+    return body
+
+
+def _get(url: str, dest: Path | None = None, timeout: int = 180) -> bytes | None:
+    return _request(url, dest=dest, timeout=timeout)
 
 
 def _row(
@@ -356,19 +364,25 @@ def amrfinder_gof(card_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def mavedb_gof(limit_sets: int = 40) -> pd.DataFrame:
-    blob = _get(f"{MAVEDB_SCORESETS}?size=100", timeout=60)
-    if not blob:
+    items: list = []
+    for query in ("Escherichia coli", "Klebsiella", "Salmonella", "Pseudomonas", "Mycobacterium"):
+        blob = _request(
+            MAVEDB_SEARCH,
+            timeout=60,
+            data=json.dumps({"text": query, "limit": 25, "offset": 0}).encode(),
+        )
+        if not blob:
+            continue
+        try:
+            payload = json.loads(blob.decode("utf-8"))
+        except json.JSONDecodeError:
+            continue
+        chunk = payload.get("scoreSets") or payload.get("items") or payload
+        if isinstance(chunk, list):
+            items.extend(chunk)
+    if not items:
         logger.warning("MaveDB API unavailable — skipping")
         return pd.DataFrame()
-    try:
-        payload = json.loads(blob.decode("utf-8"))
-    except json.JSONDecodeError:
-        logger.warning("MaveDB JSON parse failed")
-        return pd.DataFrame()
-
-    items = payload.get("items") or payload.get("scoreSets") or payload.get("data") or []
-    if isinstance(payload, list):
-        items = payload
 
     rows = []
     used = 0
