@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "plmlof"
-version = "0.1.0"
-description = "PLM-based Loss-of-Function / Gain-of-Function variant classifier for bacterial genomes"
+version = "0.2.0"
+description = "Graded bacterial LoF score plus conservative growth/AMR GoF flags"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -29,6 +29,7 @@ dependencies = [
 [project.optional-dependencies]
 tracking = ["wandb>=0.15"]
 attribution = ["captum>=0.7"]
+hmmer = ["pyhmmer>=0.10.4"]
 dev = [
     "pytest>=7.4",
     "pytest-cov>=4.1",

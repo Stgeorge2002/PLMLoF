@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# PLMLoF pipeline body for Isambard-AI. Invoked by sbatch, never from a login node.
+# PLMLoF v2 pipeline for Isambard-AI compute nodes.
+# Training tables are prepared on a laptop (scripts/prepare_v2_local.sh) and
+# copied to data/processed/v2/. This job NEVER downloads ProteinGym/CARD/GBFF.
 #
-#   bash isambard/pipeline.sh
-#   bash isambard/pipeline.sh --test
-#   bash isambard/pipeline.sh --quick
-#   bash isambard/pipeline.sh --scale 60
-#   bash isambard/pipeline.sh --data-only
-#   bash isambard/pipeline.sh --train-only
-#   bash isambard/pipeline.sh --eval-only
+#   bash isambard/submit.sh pipeline
+#   bash isambard/submit.sh pipeline --train-only
+#   bash isambard/submit.sh pipeline --eval-only
+#   bash isambard/submit.sh pipeline --task lof
+#   bash isambard/submit.sh smoke          # still ESM2-8M env check (not v2)
 
 set -euo pipefail
 
@@ -22,10 +22,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/env.sh"
 cd "$PLMLOF_ROOT"
 
-if [[ ! -f plmlof/data/dataset.py || ! -f data/scripts/download_proteingym.py ]]; then
-    echo "ERROR: plmlof/data or data/scripts is missing from this clone." >&2
-    echo "       Both must be copied to the cluster (they were previously hidden by a" >&2
-    echo "       blanket data/ gitignore). rsync the full tree or add those paths to git." >&2
+if [[ ! -f plmlof/v2/model.py ]]; then
+    echo "ERROR: plmlof/v2 is missing from this clone." >&2
     exit 1
 fi
 
@@ -44,10 +42,10 @@ echo "Logging to: $LOG_FILE"
 echo "Job: $SLURM_JOB_ID  node=$(hostname)  gpus=${SLURM_GPUS:-$SLURM_GPUS_ON_NODE}"
 
 MODE="full"
-SCALE=0
-S1_EPOCHS=""
-S2_EPOCHS=""
+TASK="all"
 SMOKE=false
+MAX_EPOCHS=""
+SEEDS="0 1 2 3 4"
 
 ARGS=("$@")
 i=0
@@ -56,15 +54,14 @@ while [[ $i -lt ${#ARGS[@]} ]]; do
     case $arg in
         --smoke)       MODE="test"; SMOKE=true ;;
         --test)        MODE="test" ;;
-        --quick)       SCALE=30; S1_EPOCHS=20; S2_EPOCHS=2 ;;
-        --scale)       i=$((i+1)); SCALE="${ARGS[$i]}" ;;
-        --s1-epochs)   i=$((i+1)); S1_EPOCHS="${ARGS[$i]}" ;;
-        --s2-epochs)   i=$((i+1)); S2_EPOCHS="${ARGS[$i]}" ;;
-        --data-only)   MODE="data" ;;
         --train-only)  MODE="train" ;;
         --eval-only)   MODE="eval" ;;
+        --embed-only)  MODE="embed" ;;
+        --task)        i=$((i+1)); TASK="${ARGS[$i]}" ;;
+        --seeds)       i=$((i+1)); SEEDS="${ARGS[$i]}" ;;
+        --max-epochs)  i=$((i+1)); MAX_EPOCHS="${ARGS[$i]}" ;;
         --help|-h)
-            echo "Usage: bash isambard/pipeline.sh [--smoke|--test|--quick|--scale N|--s1-epochs N|--s2-epochs N|--data-only|--train-only|--eval-only]"
+            echo "Usage: bash isambard/pipeline.sh [--smoke|--test|--train-only|--eval-only|--embed-only|--task lof|growth_gof|amr_gof|all|--max-epochs N]"
             exit 0
             ;;
         *)
@@ -75,233 +72,199 @@ while [[ $i -lt ${#ARGS[@]} ]]; do
     i=$((i+1))
 done
 
-DATA_DIR="$PLMLOF_DATA_DIR"
-EMB_DIR="$PLMLOF_EMB_DIR"
-OUTPUT_DIR="$PLMLOF_OUTPUT_DIR"
-CHECKPOINT="$OUTPUT_DIR/checkpoints/model_best.pt"
-TRAIN_CFG="$PLMLOF_TRAIN_CFG"
-MODEL_CFG="$PLMLOF_MODEL_CFG"
+V2_DATA="${PLMLOF_V2_DATA_DIR:-$PLMLOF_ROOT/data/processed/v2}"
+V2_EMB="${PLMLOF_V2_EMB_DIR:-$PLMLOF_EMB_DIR/v2}"
+V2_OUT="${PLMLOF_V2_OUTPUT_DIR:-$PLMLOF_ROOT/outputs/v2}"
+TRAIN_CFG="${PLMLOF_TRAIN_CFG}"
+MODEL_CFG="${PLMLOF_MODEL_CFG}"
 
 echo "=============================================="
-if [[ "$MODE" == "test" ]]; then
-    echo " PLMLoF Pipeline — Mode: $MODE (ESM2-8M, synthetic; no ProteinGym, no 650M)"
-else
-    echo " PLMLoF Pipeline — Mode: $MODE | Scale: $([[ "$SCALE" -eq 0 ]] && echo 'ALL Prokaryote variants' || echo "${SCALE}K samples")"
-fi
-[[ -n "$S1_EPOCHS" ]] && echo " Stage 1 epochs: $S1_EPOCHS"
-[[ -n "$S2_EPOCHS" ]] && echo " Stage 2 epochs: $S2_EPOCHS"
-echo " Data:       $DATA_DIR"
-echo " Embeddings: $EMB_DIR"
-echo " Output:     $OUTPUT_DIR"
+echo " PLMLoF v2  mode=$MODE  task=$TASK"
+echo " Data:       $V2_DATA"
+echo " Embeddings: $V2_EMB"
+echo " Output:     $V2_OUT"
 echo "=============================================="
-echo ""
 
 if ! python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
-    echo "ERROR: CUDA not available. This job is not on a GH200 compute node." >&2
+    echo "ERROR: CUDA not available." >&2
     exit 1
 fi
 DEVICE="cuda"
-GPU_NAME=$(python -c "import torch; print(torch.cuda.get_device_name(0))")
-GPU_MEM=$(python -c "import torch; print(f'{torch.cuda.get_device_properties(0).total_memory / 1e9:.0f}')")
-echo "GPU: $GPU_NAME (${GPU_MEM} GB)"
-echo ""
+echo "GPU: $(python -c "import torch; print(torch.cuda.get_device_name(0))")"
 
-# Hopper (GH200, sm_90) and Ampere both have native bf16.
 PRECISION="bf16"
 if python -c "import torch; cap = torch.cuda.get_device_capability(); raise SystemExit(0 if cap >= (8, 0) else 1)" 2>/dev/null; then
-    echo "  Compute cap ≥ 8.0 — mixed precision $PRECISION"
+    echo "  mixed precision $PRECISION"
 else
     PRECISION="fp16"
-    echo "  Compute cap < 8.0 — mixed precision $PRECISION"
-fi
-echo ""
-
-if [[ "$MODE" == "full" || "$MODE" == "data" || "$MODE" == "test" ]]; then
-    echo "──────── Step 1: Data Preparation ────────"
-    if [[ "$MODE" == "test" ]]; then
-        echo "Test mode: synthetic data generated inline by train.py --tiny"
-    else
-        echo "Downloading ProteinGym data..."
-        mkdir -p data/raw/proteingym data/processed
-        python data/scripts/download_proteingym.py
-
-        TOTAL_SAMPLES=$(( SCALE * 1000 ))
-        if [[ "$SCALE" -eq 0 ]]; then
-            echo "Curating dataset (ALL Prokaryote LoF/WT/GoF variants, no cap)..."
-            python data/scripts/curate_dataset.py --total-samples 0
-        else
-            echo "Curating dataset (${SCALE}K balanced = ${TOTAL_SAMPLES} samples)..."
-            python data/scripts/curate_dataset.py --total-samples "$TOTAL_SAMPLES"
-        fi
-
-        mkdir -p "$DATA_DIR"
-        for f in "$DATA_DIR"/{train,val,test}.parquet; do
-            if [[ -f "$f" ]]; then
-                ROWS=$(python -c "import pandas as pd; print(len(pd.read_parquet('$f')))")
-                echo "  $(basename "$f"): $ROWS rows"
-            fi
-        done
-    fi
-    echo ""
+    echo "  mixed precision $PRECISION"
 fi
 
-if [[ "$MODE" == "data" ]]; then
-    echo "Data-only mode complete."
+# ── Smoke: original tiny 3-class env check (no v2 data, no 650M) ──────────
+if [[ "$MODE" == "test" ]]; then
+    TEST_EPOCHS=2
+    [[ "$SMOKE" == true ]] && TEST_EPOCHS=1
+    echo "Smoke/tiny train (ESM2-8M, synthetic 3-class — env check only)"
+    python scripts/train.py \
+        --tiny \
+        --max-epochs "$TEST_EPOCHS" \
+        --device "$DEVICE" \
+        --output-dir "${PLMLOF_OUTPUT_DIR%/production}/test_run/"
+    echo "Smoke complete."
     exit 0
 fi
 
-if [[ "$MODE" == "full" || "$MODE" == "test" ]]; then
-    echo "──────── Step 2: Precompute Embeddings ────────"
-    if [[ "$MODE" == "test" ]]; then
-        TEST_EPOCHS=2
-        [[ "$SMOKE" == true ]] && TEST_EPOCHS=1
-        echo "Running tiny train (ESM2-8M, synthetic, ${TEST_EPOCHS} epoch(s))..."
-        python scripts/train.py \
-            --tiny \
-            --max-epochs "$TEST_EPOCHS" \
-            --device "$DEVICE" \
-            --output-dir "${PLMLOF_OUTPUT_DIR%/production}/test_run/"
-    else
-        if [[ -f "$EMB_DIR/train_embeddings.pt" && -f "$EMB_DIR/val_embeddings.pt" && \
-              -f "$DATA_DIR/train.parquet" && \
-              "$EMB_DIR/train_embeddings.pt" -nt "$DATA_DIR/train.parquet" ]]; then
-            echo "Embeddings already up-to-date, skipping precompute."
-        else
-            mkdir -p "$EMB_DIR"
-            # GH200 120 GB: 128 is safe for ESM2-650M at max_seq_length 1024.
-            # 256 OOM'd on 48 GB A40 for long sequences; raise only after a successful 128 run.
-            python scripts/precompute_embeddings.py \
-                --train-data "$DATA_DIR/train.parquet" \
-                --val-data "$DATA_DIR/val.parquet" \
-                --test-data "$DATA_DIR/test.parquet" \
-                --output-dir "$EMB_DIR" \
-                --device "$DEVICE" \
-                --batch-size 128 \
-                --num-workers 8
-        fi
-        echo "Embeddings: $(du -sh "$EMB_DIR" 2>/dev/null | cut -f1)"
+require_task() {
+    local t="$1"
+    if [[ ! -f "$V2_DATA/$t/train.parquet" || ! -f "$V2_DATA/$t/val.parquet" ]]; then
+        echo "ERROR: missing $V2_DATA/$t/{train,val}.parquet" >&2
+        echo "Prepare tables on a laptop, then rsync data/processed/v2/ here:" >&2
+        echo "  bash scripts/prepare_v2_local.sh" >&2
+        exit 1
     fi
-    echo ""
+}
+
+TASKS=()
+if [[ "$TASK" == "all" ]]; then
+    for t in lof growth_gof amr_gof; do
+        if [[ -f "$V2_DATA/$t/train.parquet" ]]; then
+            n=$(python -c "import pandas as pd; print(len(pd.read_parquet('$V2_DATA/$t/train.parquet')))")
+            if [[ "$n" -gt 0 ]]; then
+                TASKS+=("$t")
+            else
+                echo "Skipping empty task $t"
+            fi
+        else
+            echo "Skipping missing task $t"
+        fi
+    done
+else
+    require_task "$TASK"
+    TASKS=("$TASK")
 fi
 
-if [[ "$MODE" == "full" || "$MODE" == "train" || "$MODE" == "test" ]]; then
-    echo "──────── Step 3: Training ────────"
-    if [[ "$MODE" == "test" ]]; then
-        echo "Test training already done in step 2."
+if [[ ${#TASKS[@]} -eq 0 ]]; then
+    echo "ERROR: no v2 tasks with training parquet under $V2_DATA" >&2
+    echo "This pipeline does not download data. Run on a laptop:" >&2
+    echo "  bash scripts/prepare_v2_local.sh" >&2
+    echo "Then rsync data/processed/v2/ onto this clone." >&2
+    exit 1
+fi
+require_task "lof"
+
+# ── Embed (once, all tasks) ──────────────────────────────────────────────
+if [[ "$MODE" == "full" || "$MODE" == "embed" || "$MODE" == "train" ]]; then
+    NEED_EMBED=0
+    for t in "${TASKS[@]}"; do
+        if [[ ! -f "$V2_EMB/$t/train_embeddings.pt" || ! -f "$V2_EMB/$t/val_embeddings.pt" ]]; then
+            NEED_EMBED=1
+        elif [[ "$V2_DATA/$t/train.parquet" -nt "$V2_EMB/$t/train_embeddings.pt" ]]; then
+            NEED_EMBED=1
+        fi
+    done
+    if [[ "$NEED_EMBED" -eq 1 ]]; then
+        echo "──────── Precompute v2 embeddings (no downloads) ────────"
+        mkdir -p "$V2_EMB"
+        python scripts/precompute_v2.py \
+            --data-dir "$V2_DATA" \
+            --output-dir "$V2_EMB" \
+            --device "$DEVICE" \
+            --batch-size 128 \
+            --num-workers 8 \
+            --tasks "${TASKS[@]}"
     else
-        echo "Training with cached embeddings..."
-        S1_EPOCH_FLAG=""
-        [[ -n "$S1_EPOCHS" ]] && S1_EPOCH_FLAG="--max-epochs $S1_EPOCHS"
-        python scripts/train.py \
+        echo "Embeddings up to date, skipping precompute."
+    fi
+fi
+
+if [[ "$MODE" == "embed" ]]; then
+    echo "Embed-only complete."
+    exit 0
+fi
+
+EPOCH_FLAG=""
+[[ -n "$MAX_EPOCHS" ]] && EPOCH_FLAG="--max-epochs $MAX_EPOCHS"
+
+train_task() {
+    local t="$1"
+    echo "──────── Train $t  (seeds: $SEEDS) ────────"
+    mkdir -p "$V2_OUT/$t"
+    local members=()
+    for seed in $SEEDS; do
+        local out="$V2_OUT/$t/seed${seed}"
+        python scripts/train_v2.py \
+            --task "$t" \
+            --seed "$seed" \
+            --precomputed "$V2_EMB" \
+            --output-dir "$out" \
             --config "$TRAIN_CFG" \
             --model-config "$MODEL_CFG" \
-            --precomputed "$EMB_DIR" \
             --device "$DEVICE" \
             --mixed-precision "$PRECISION" \
-            --output-dir "$OUTPUT_DIR" \
             --num-workers 8 \
-            $S1_EPOCH_FLAG
-
-        echo "──────── Step 3a: Stage 1 Evaluation (pre-LoRA baseline) ────────"
-        if [[ -f "$CHECKPOINT" ]]; then
-            S1_CHECKPOINT="$OUTPUT_DIR/checkpoints/model_stage1.pt"
-            cp "$CHECKPOINT" "$S1_CHECKPOINT"
-            echo "  Saved Stage 1 checkpoint → $S1_CHECKPOINT"
-
-            echo "  Evaluating Stage 1 model on held-out test set..."
-            python scripts/evaluate.py \
-                --model "$S1_CHECKPOINT" \
-                --test-data "$DATA_DIR/test.parquet" \
-                --embeddings "$EMB_DIR/test_embeddings.pt" \
-                --device "$DEVICE"
-
-            for SPECIES_TAG in ecoli myctu stau klepn strpn; do
-                SPECIES_PARQUET="$DATA_DIR/test_${SPECIES_TAG}.parquet"
-                SPECIES_EMB="$EMB_DIR/test_${SPECIES_TAG}_embeddings.pt"
-                if [[ -f "$SPECIES_PARQUET" ]]; then
-                    echo "  Evaluating Stage 1 — ${SPECIES_TAG}..."
-                    python scripts/evaluate.py \
-                        --model "$S1_CHECKPOINT" \
-                        --test-data "$SPECIES_PARQUET" \
-                        --embeddings "$SPECIES_EMB" \
-                        --device "$DEVICE"
-                fi
-            done
-        else
-            echo "  No Stage 1 checkpoint at $CHECKPOINT — skipping Stage 1 evaluation."
-        fi
-        echo ""
-
-        echo "──────── Step 3b: Stage 2 LoRA Fine-tuning ────────"
-        if [[ -f "$CHECKPOINT" ]]; then
-            S2_EPOCH_FLAG=""
-            [[ -n "$S2_EPOCHS" ]] && S2_EPOCH_FLAG="--s2-max-epochs $S2_EPOCHS"
-            python scripts/train.py \
-                --config "$TRAIN_CFG" \
-                --model-config "$MODEL_CFG" \
-                --train-data "$DATA_DIR/train.parquet" \
-                --val-data "$DATA_DIR/val.parquet" \
-                --stage2-only \
-                --checkpoint "$CHECKPOINT" \
-                --device "$DEVICE" \
-                --mixed-precision "$PRECISION" \
-                --output-dir "$OUTPUT_DIR" \
-                --num-workers 8 \
-                $S2_EPOCH_FLAG
-        else
-            echo "  No Stage 1 checkpoint at $CHECKPOINT — skipping Stage 2."
-        fi
-    fi
-    echo ""
-fi
-
-if [[ "$MODE" == "train" ]]; then
-    MODE="eval_after_train"
-fi
-
-if [[ "$MODE" == "full" || "$MODE" == "eval" || "$MODE" == "eval_after_train" || "$MODE" == "test" ]]; then
-    echo "──────── Step 4: Evaluation (final best model) ────────"
-    if [[ "$MODE" == "test" ]]; then
-        CHECKPOINT="${PLMLOF_OUTPUT_DIR%/production}/test_run/checkpoints/model_best.pt"
-        if [[ -f "$CHECKPOINT" ]]; then
-            python scripts/evaluate.py \
-                --model "$CHECKPOINT" \
-                --tiny \
-                --device "$DEVICE"
-        else
-            echo "No test checkpoint found. Skipping."
-        fi
+            $EPOCH_FLAG
+        members+=("seed${seed}/checkpoints/model_best.pt")
+    done
+    python -c "
+import json
+from pathlib import Path
+task_dir = Path('$V2_OUT/$t')
+members = [str(p.relative_to(task_dir)) for p in sorted(task_dir.glob('seed*/checkpoints/model_best.pt'))]
+(task_dir / 'ensemble.json').write_text(json.dumps({'task': '$t', 'members': members}, indent=2))
+print('ensemble.json', members)
+gal = task_dir / 'seed0' / 'train_gallery.pt'
+dest = task_dir / 'train_gallery.pt'
+if gal.exists() and not dest.exists():
+    dest.write_bytes(gal.read_bytes())
+cfg = task_dir / 'seed0' / 'model_config.json'
+root_cfg = Path('$V2_OUT') / 'model_config.json'
+if cfg.exists():
+    root_cfg.write_bytes(cfg.read_bytes())
+"
+    if [[ -f "$V2_EMB/$t/null_embeddings.pt" ]]; then
+        python scripts/score_nulls.py \
+            --task "$t" \
+            --ensemble-dir "$V2_OUT/$t" \
+            --embeddings "$V2_EMB/$t/null_embeddings.pt" \
+            --device "$DEVICE"
     else
-        if [[ -f "$CHECKPOINT" ]]; then
-            echo "Evaluating final model on held-out test set..."
-            python scripts/evaluate.py \
-                --model "$CHECKPOINT" \
-                --test-data "$DATA_DIR/test.parquet" \
-                --embeddings "$EMB_DIR/test_embeddings.pt" \
-                --device "$DEVICE"
-
-            for SPECIES_TAG in ecoli myctu stau klepn strpn; do
-                SPECIES_PARQUET="$DATA_DIR/test_${SPECIES_TAG}.parquet"
-                SPECIES_EMB="$EMB_DIR/test_${SPECIES_TAG}_embeddings.pt"
-                if [[ -f "$SPECIES_PARQUET" ]]; then
-                    echo "Evaluating final model — ${SPECIES_TAG}..."
-                    python scripts/evaluate.py \
-                        --model "$CHECKPOINT" \
-                        --test-data "$SPECIES_PARQUET" \
-                        --embeddings "$SPECIES_EMB" \
-                        --device "$DEVICE"
-                fi
-            done
-        else
-            echo "No checkpoint at $CHECKPOINT. Skipping evaluation."
-        fi
+        echo "No null embeddings for $t — empirical p will be skipped until null.parquet is embedded."
     fi
-    echo ""
+}
+
+if [[ "$MODE" == "full" || "$MODE" == "train" ]]; then
+    for t in "${TASKS[@]}"; do
+        train_task "$t"
+    done
+fi
+
+eval_task() {
+    local t="$1"
+    local split="$2"
+    local emb="$V2_EMB/$t/${split}_embeddings.pt"
+    if [[ ! -f "$emb" ]]; then
+        echo "No $emb — skip $t $split eval"
+        return
+    fi
+    echo "──────── Eval $t / $split ────────"
+    python scripts/evaluate_v2.py \
+        --task "$t" \
+        --ensemble-dir "$V2_OUT/$t" \
+        --embeddings "$emb" \
+        --device "$DEVICE" \
+        --json-out "$V2_OUT/$t/metrics_${split}.json"
+}
+
+if [[ "$MODE" == "full" || "$MODE" == "eval" || "$MODE" == "train" ]]; then
+    for t in "${TASKS[@]}"; do
+        eval_task "$t" test
+        eval_task "$t" val
+    done
 fi
 
 echo "=============================================="
-echo " Pipeline complete!"
-echo " Log:          $LOG_FILE"
-echo " Checkpoint:   $CHECKPOINT"
-echo " Predict:      python scripts/predict.py --model $CHECKPOINT --reference <ref.fasta> --variants <var.fasta> --device $DEVICE"
+echo " v2 pipeline complete"
+echo " Checkpoints: $V2_OUT"
+echo " Predict: python scripts/predict.py --model $V2_OUT --reference ref.fasta --variants var.fasta --device cuda"
+echo " Dewachter: python scripts/evaluate_dewachter.py --model-dir $V2_OUT --reference ... --variants ... --scores ..."
 echo "=============================================="

@@ -2,13 +2,18 @@
 # Submit PLMLoF jobs from an Isambard-AI login node.
 # Run this from the clone on $PROJECTDIR — never from $HOME.
 #
-#   bash isambard/submit.sh smoke            # cheap GPU check (~minutes, ESM2-8M only)
+#   bash isambard/submit.sh smoke            # cheap GPU check (ESM2-8M only)
 #   bash isambard/submit.sh setup
-#   bash isambard/submit.sh pipeline
+#   bash isambard/submit.sh pipeline         # v2 embed + train + eval (tables must already be on disk)
+#   bash isambard/submit.sh pipeline --train-only
+#   bash isambard/submit.sh pipeline --eval-only
+#   bash isambard/submit.sh embed
 #   bash isambard/submit.sh all              # setup, then pipeline after setup succeeds
 #   bash isambard/submit.sh test             # smoke train if venv already exists
-#   bash isambard/submit.sh pipeline --train-only
-#   bash isambard/submit.sh data             # pipeline --data-only
+#
+# Training data is NOT downloaded here. On a laptop:
+#   bash scripts/prepare_v2_local.sh
+#   rsync -avP data/processed/v2/ HOST:$PROJECTDIR/$USER/PLMLoF/data/processed/v2/
 
 set -euo pipefail
 
@@ -38,16 +43,22 @@ submit_one() {
 case "$ACTION" in
     smoke)
         submit_one smoke.sbatch
-        echo "Submitted smoke (max 20 min, 1 GPU). This is the cheap check — not the full pipeline."
+        echo "Submitted smoke (max 20 min, 1 GPU). Env check only — not v2 training."
         ;;
     setup)
         submit_one setup.sbatch
         ;;
-    pipeline)
+    pipeline|v2)
         submit_one pipeline.sbatch "$@"
         ;;
+    embed)
+        submit_one pipeline.sbatch --embed-only
+        ;;
     data)
-        submit_one pipeline.sbatch --data-only
+        echo "Training data is prepared on a laptop, not on Isambard." >&2
+        echo "  bash scripts/prepare_v2_local.sh" >&2
+        echo "  rsync -avP data/processed/v2/ HOST:\$PROJECTDIR/\$USER/PLMLoF/data/processed/v2/" >&2
+        exit 1
         ;;
     test)
         submit_one test.sbatch
@@ -59,10 +70,10 @@ case "$ACTION" in
             "${ROOT}/isambard/jobs/pipeline.sbatch" "$@"
         ;;
     help|-h|--help)
-        sed -n '2,14p' "$0"
+        sed -n '2,20p' "$0"
         ;;
     *)
-        echo "Unknown action: $ACTION (expected smoke|setup|pipeline|data|test|all)" >&2
+        echo "Unknown action: $ACTION (expected smoke|setup|pipeline|embed|test|all)" >&2
         exit 1
         ;;
 esac

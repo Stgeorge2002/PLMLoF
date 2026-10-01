@@ -1,0 +1,5 @@
+# Shell scripts must be LF. CRLF makes bash fail with `$'\r': command not found`.
+*.sh text eol=lf
+*.sbatch text eol=lf
+isambard/** text eol=lf
+scripts/*.sh text eol=lf
