@@ -22,7 +22,7 @@ GBFF_DIR="${ROOT}/data/raw/refseq_gbff"
 HMM_PATH="${ROOT}/data/raw/pfam/Pfam-A.hmm.gz"
 DOMAINS_PATH="${ROOT}/data/processed/pfam_domains.parquet"
 N_GENOMES=150
-CPUS="${CPUS:-4}"
+CPUS="${CPUS:-20}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -87,7 +87,8 @@ else
                 --gbff-dir "$GBFF_DIR" \
                 --hmm "$HMM_PATH" \
                 --out "$DOMAINS_PATH" \
-                --cpus "$CPUS"
+                --cpus "$CPUS" \
+                --max-proteins 25000
         else
             echo "  pyhmmer/hmmscan missing — last 10% of each ORF is the tail proxy" >&2
             echo "  pip install pyhmmer   # or install HMMER 3" >&2

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import logging
 import shutil
 import subprocess
@@ -14,6 +15,41 @@ logger = logging.getLogger(__name__)
 
 # Inclusive domain i-Evalue if gathering cutoffs are unavailable.
 DOM_EVALUE = 1e-5
+MIN_HMM_BYTES = 50_000_000
+
+
+def _uncompressed_hmm(hmm: Path) -> Path:
+    """hmmscan/hmmpress cannot read .gz. Decompress once next to the download."""
+    name = hmm.name
+    if name.endswith(".hmm.gz"):
+        dest = hmm.with_name(name[:-3])
+    elif hmm.suffix == ".gz":
+        dest = hmm.with_suffix("")
+    else:
+        return hmm
+    if dest.exists() and dest.stat().st_size >= MIN_HMM_BYTES:
+        logger.info("Using uncompressed HMM %s", dest)
+        return dest
+    logger.info("Decompressing %s → %s (one-time, several GB)", hmm, dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(hmm, "rb") as src, dest.open("wb") as dst:
+        shutil.copyfileobj(src, dst)
+    return dest
+
+
+def _pressed_hmm(hmm: Path) -> Path:
+    plain = _uncompressed_hmm(hmm)
+    marker = Path(str(plain) + ".h3m")
+    if marker.exists():
+        return plain
+    press = shutil.which("hmmpress")
+    if not press:
+        raise FileNotFoundError(
+            "hmmpress not on PATH. Either install HMMER 3, or:  pip install pyhmmer"
+        )
+    logger.info("hmmpress %s (one-time)", plain)
+    subprocess.run([press, str(plain)], check=True)
+    return plain
 
 
 def write_fasta(pairs: list[tuple[str, str]], dest: Path) -> None:
@@ -54,18 +90,16 @@ def _scan_hmmscan(fasta: Path, hmm: Path, cpus: int) -> list[dict]:
     exe = shutil.which("hmmscan")
     if not exe:
         raise FileNotFoundError("hmmscan not on PATH")
-    hmm_arg = str(hmm)
-    if hmm.suffix == ".gz":
-        raise ValueError("hmmscan needs an uncompressed HMM (gunzip Pfam-A.hmm.gz, then hmmpress)")
+    db = _pressed_hmm(hmm)
     with tempfile.NamedTemporaryFile(prefix="plmlof_domtbl_", suffix=".txt", delete=False) as tmp:
         domtbl = Path(tmp.name)
     cmd = [
         exe, "--cpu", str(max(1, cpus)), "--cut_ga", "--noali",
-        "--domtblout", str(domtbl), hmm_arg, str(fasta),
+        "--domtblout", str(domtbl), str(db), str(fasta),
     ]
     logger.info("Running %s", " ".join(cmd))
     try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        subprocess.run(cmd, check=True)
         return parse_domtblout(domtbl)
     finally:
         if domtbl.exists():
@@ -136,7 +170,7 @@ def _scan_pyhmmer(pairs: list[tuple[str, str]], hmm: Path, cpus: int) -> list[di
     return rows
 
 
-def annotate_proteins(pairs: list[tuple[str, str]], hmm: Path, cpus: int = 4) -> list[dict]:
+def annotate_proteins(pairs: list[tuple[str, str]], hmm: Path, cpus: int = 20) -> list[dict]:
     """pairs: (protein_id, sequence). Prefers pyhmmer; falls back to hmmscan."""
     if not pairs:
         return []

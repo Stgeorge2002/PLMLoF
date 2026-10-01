@@ -14,8 +14,9 @@ from pathlib import Path
 
 import pandas as pd
 
+from plmlof.v2.domains import protein_id
 from plmlof.v2.gbff import iter_cds
-from plmlof.v2.hmmer import annotate_proteins, unique_protein_pairs
+from plmlof.v2.hmmer import annotate_proteins
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +27,13 @@ def main() -> None:
     p.add_argument("--gbff-dir", type=Path, required=True)
     p.add_argument("--hmm", type=Path, required=True, help="Pfam-A.hmm or Pfam-A.hmm.gz")
     p.add_argument("--out", type=Path, default=Path("data/processed/pfam_domains.parquet"))
-    p.add_argument("--cpus", type=int, default=4)
-    p.add_argument("--max-proteins", type=int, default=0, help="0 = all unique CDS")
+    p.add_argument("--cpus", type=int, default=20)
+    p.add_argument(
+        "--max-proteins",
+        type=int,
+        default=25_000,
+        help="Unique WT CDS to scan (0 = all). 150 genomes is ~5e5 unique; that is days of hmmscan.",
+    )
     args = p.parse_args()
 
     if not args.hmm.exists():
@@ -37,15 +43,19 @@ def main() -> None:
     if not files:
         raise SystemExit(f"No GBFFs in {args.gbff_dir}")
 
-    records = []
+    seen: dict[str, str] = {}
     for i, gbff in enumerate(files, 1):
         cds = iter_cds(gbff)
-        logger.info("[%s/%s] %s CDS=%s", i, len(files), gbff.name, len(cds))
-        records.extend(cds)
+        logger.info("[%s/%s] %s CDS=%s unique=%s", i, len(files), gbff.name, len(cds), len(seen))
+        for _, _, prot, _ in cds:
+            seen.setdefault(protein_id(prot), prot)
+            if args.max_proteins and len(seen) >= args.max_proteins:
+                break
+        if args.max_proteins and len(seen) >= args.max_proteins:
+            logger.info("Hit --max-proteins %s", args.max_proteins)
+            break
 
-    pairs = unique_protein_pairs(records)
-    if args.max_proteins:
-        pairs = pairs[: args.max_proteins]
+    pairs = list(seen.items())
     logger.info("Unique proteins to scan: %s", len(pairs))
 
     hits = annotate_proteins(pairs, args.hmm, cpus=args.cpus)

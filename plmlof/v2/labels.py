@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from plmlof.v2 import LOF_STRONG, LOF_WEAK, LOF_WRECK
+from plmlof.v2 import LOF_STRONG, LOF_WEAK, LOF_WRECK, LOF_WT
 from plmlof.v2.domains import (
     PRIOR_DOMAIN_DROP,
     PRIOR_EXTRA_MISSENSE,
