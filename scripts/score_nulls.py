@@ -39,10 +39,12 @@ def main() -> None:
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             parts = []
             for net in nets:
-                raw = net.forward_from_pooled(
+                raw = net.forward_from_cache(
                     batch["ref_mean"], batch["ref_max"],
                     batch["var_mean"], batch["var_max"],
                     batch["nucleotide_features"],
+                    site_ref=batch.get("site_ref"),
+                    site_var=batch.get("site_var"),
                 )
                 parts.append(net.probability(raw).float().cpu())
             acc.append(torch.stack(parts, dim=0).mean(0))

@@ -16,13 +16,13 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from plmlof.constants import REGRESSION_TASKS
 from plmlof.dataset import CachedDataset
 from plmlof.metrics import (
     collapse_is_fail,
     gene_prior_collapse,
     gof_metrics,
     lof_metrics,
+    mlof_metrics,
     within_gene_auroc,
 )
 from plmlof.predictor import _load_net, discover_ensemble
@@ -31,18 +31,28 @@ from plmlof.stats import empirical_p
 logger = logging.getLogger(__name__)
 
 
+def _str_list(value) -> list[str]:
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value]
+    return [str(v) for v in list(value)]
+
+
 def ensemble_predict(nets, loader, device) -> tuple[np.ndarray, np.ndarray, dict]:
     means, sds = [], []
-    extra: dict[str, list] = {"target": [], "z": [], "wreck": [], "missense": [], "gene": []}
+    extra: dict[str, list] = {
+        "target": [], "z": [], "wreck": [], "missense": [], "gene": [], "protein_id": [],
+    }
     with torch.no_grad():
         for batch in loader:
             tensors = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             parts = []
             for net in nets:
-                raw = net.forward_from_pooled(
+                raw = net.forward_from_cache(
                     tensors["ref_mean"], tensors["ref_max"],
                     tensors["var_mean"], tensors["var_max"],
                     tensors["nucleotide_features"],
+                    site_ref=tensors.get("site_ref"),
+                    site_var=tensors.get("site_var"),
                 )
                 parts.append(net.probability(raw).float().cpu())
             stacked = torch.stack(parts, dim=0)
@@ -52,15 +62,13 @@ def ensemble_predict(nets, loader, device) -> tuple[np.ndarray, np.ndarray, dict
             extra["z"].append(batch["dms_zscore"].numpy())
             extra["wreck"].append(batch["is_wreck"].numpy())
             extra["missense"].append(batch["is_missense"].numpy())
-            genes = batch.get("gene", [])
-            if isinstance(genes, (list, tuple)):
-                extra["gene"].extend(genes)
-            else:
-                extra["gene"].extend(list(genes))
+            extra["gene"].extend(_str_list(batch.get("gene", [])))
+            extra["protein_id"].extend(_str_list(batch.get("protein_id", [])))
     pred = np.concatenate(means)
     sd = np.concatenate(sds)
-    packed = {k: np.concatenate(v) for k, v in extra.items() if v and k != "gene"}
+    packed = {k: np.concatenate(v) for k, v in extra.items() if v and k not in {"gene", "protein_id"}}
     packed["gene"] = extra["gene"]
+    packed["protein_id"] = extra["protein_id"]
     return pred, sd, packed
 
 
@@ -85,23 +93,31 @@ def main() -> None:
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False)
     pred, sd, packed = ensemble_predict(nets, loader, device)
     genes = packed["gene"] if packed["gene"] else list(ds.genes)
+    pids = packed["protein_id"] if packed["protein_id"] else list(ds.protein_ids)
+    groups = pids if any(pids) else genes
 
     print("=" * 60)
     print(f"{args.task}  n={len(pred)}  members={len(nets)}  mean_sd={float(sd.mean()):.4f}")
-    if args.task in REGRESSION_TASKS:
+    if args.task == "mlof":
+        metrics = mlof_metrics(
+            pred, packed["target"], packed["z"], packed["missense"],
+            gene=genes, protein_id=pids,
+        )
+    elif args.task == "lof":
         metrics = lof_metrics(pred, packed["target"], packed["z"], packed["wreck"], packed["missense"])
-        diversity = packed["z"] if args.task == "mlof" else packed["target"]
-        collapse = gene_prior_collapse(pred, genes, diversity)
+        metrics.update(gene_prior_collapse(pred, groups, packed["target"]))
     else:
-        metrics = gof_metrics(pred, packed["target"], threshold=args.gof_threshold)
-        metrics.update(within_gene_auroc(pred, packed["target"], genes))
-        collapse = gene_prior_collapse(pred, genes, packed["target"])
-    metrics.update(collapse)
+        metrics = gof_metrics(pred, packed["target"], threshold=args.gof_threshold, gene=genes)
+        if "within_gene_auroc" not in metrics:
+            metrics.update(within_gene_auroc(pred, packed["target"], genes))
+        metrics.update(gene_prior_collapse(pred, genes, packed["target"]))
     for k, v in metrics.items():
         print(f"  {k:28s} {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
 
-    if collapse_is_fail(collapse):
+    if collapse_is_fail(metrics):
         print("FAIL: gene-prior collapse (most genes have near-constant scores).")
+    if args.task in {"growth_gof", "amr_gof"} and float(metrics.get("caller_ready", 0)) < 1:
+        print("NOTE: GoF is not caller-ready (need ≥3 genes with within-gene AUROC ≥ 0.60).")
 
     null_path = args.ensemble_dir / "null_scores.pt"
     if null_path.exists():

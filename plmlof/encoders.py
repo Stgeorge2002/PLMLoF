@@ -25,9 +25,9 @@ def esm2_for_task(task: str, model_cfg: dict | None = None) -> str:
     return str(cfg.get("esm2_model_name") or ESM2_PAIR)
 
 
-def write_encoder_meta(task_dir: Path, esm2_model_name: str, hidden_size: int) -> None:
+def write_encoder_meta(task_dir: Path, esm2_model_name: str, hidden_size: int, **extra) -> None:
     task_dir.mkdir(parents=True, exist_ok=True)
-    payload = {"esm2_model_name": esm2_model_name, "hidden_size": int(hidden_size)}
+    payload = {"esm2_model_name": esm2_model_name, "hidden_size": int(hidden_size), **extra}
     (task_dir / "encoder.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 

@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 from plmlof.data.features import extract_nucleotide_features
+from plmlof.sites import aligned_site_index
 
 
 REQUIRED_COLUMNS = {"ref_protein", "var_protein", "target", "sample_weight"}
@@ -24,7 +27,7 @@ def lof_train_keep_indices(
     seed: int = 0,
     identity_per_missense: float = 1.0,
 ) -> list[int]:
-    """LoF train rows: drop sure wrecks; cap identity WT to ~1× missense count.
+    """LoF/MLoF train rows: drop sure wrecks; cap identity WT to ~1× missense count.
 
     Inference still applies wreck_grade. Training on sure wrecks teaches length.
     Identity WT is `channel == wt` and not missense when channels exist; otherwise
@@ -47,6 +50,65 @@ def lof_train_keep_indices(
         g.manual_seed(int(seed))
         ident_idx = ident_idx[torch.randperm(ident_idx.numel(), generator=g)[:cap]]
     return torch.cat([other, ident_idx]).sort().values.tolist()
+
+
+class ProteinGroupBatchSampler(Sampler[list[int]]):
+    """Yield batches that keep many variants of the same protein together.
+
+    RankNet needs in-batch pairs from one gene. A shuffled 256-row batch of
+    174 proteins is ~1.5 rows/gene — no pairs. Chunk each protein, then pack
+    ``n_proteins_per_batch`` chunks into a batch.
+    """
+
+    def __init__(
+        self,
+        protein_ids: Sequence[str],
+        batch_size: int,
+        n_proteins_per_batch: int = 4,
+        seed: int = 0,
+    ):
+        if batch_size < 2:
+            raise ValueError("batch_size must be >= 2 for ranking")
+        self.protein_ids = [str(p) for p in protein_ids]
+        self.batch_size = int(batch_size)
+        self.n_proteins_per_batch = max(1, int(n_proteins_per_batch))
+        self.seed = int(seed)
+        self.epoch = 0
+        self.by_prot: dict[str, list[int]] = {}
+        for i, pid in enumerate(self.protein_ids):
+            self.by_prot.setdefault(pid, []).append(i)
+        self._len = max(1, (len(self.protein_ids) + self.batch_size - 1) // self.batch_size)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __len__(self) -> int:
+        return self._len
+
+    def __iter__(self) -> Iterator[list[int]]:
+        rng = np.random.RandomState(self.seed + self.epoch * 10007)
+        take = max(8, self.batch_size // self.n_proteins_per_batch)
+        chunks: list[list[int]] = []
+        proteins = list(self.by_prot)
+        rng.shuffle(proteins)
+        for pid in proteins:
+            idxs = list(self.by_prot[pid])
+            rng.shuffle(idxs)
+            for start in range(0, len(idxs), take):
+                chunks.append(idxs[start:start + take])
+        rng.shuffle(chunks)
+        batch: list[int] = []
+        n_out = 0
+        for chunk in chunks:
+            if batch and len(batch) + len(chunk) > self.batch_size:
+                yield batch
+                n_out += 1
+                batch = []
+            batch.extend(chunk)
+        if batch:
+            yield batch
+            n_out += 1
+        self._len = max(1, n_out)
 
 
 class PairDataset(Dataset):
@@ -90,12 +152,35 @@ class PairDataset(Dataset):
         else:
             self._is_missense = ["missense" in c for c in self._channel]
 
+        stored = self.df["site_index"] if "site_index" in self.df.columns else None
+        self._site_index = []
+        for i, (ref, var) in enumerate(zip(self._ref, self._var)):
+            if stored is not None and pd.notna(stored.iloc[i]) and int(stored.iloc[i]) >= 0:
+                self._site_index.append(int(stored.iloc[i]))
+            else:
+                self._site_index.append(aligned_site_index(ref, var))
+
         self._nuc = torch.stack([
             extract_nucleotide_features(r, v) for r, v in zip(self._ref, self._var)
         ])
 
     def __len__(self) -> int:
         return len(self._ref)
+
+    def residue_requests(self) -> dict[str, set[int]]:
+        """Seq → residue indices needed for (left, centre, right) site windows."""
+        need: dict[str, set[int]] = {}
+        for ref, var, center in zip(self._ref, self._var, self._site_index):
+            if center < 0:
+                continue
+            for seq, length in ((ref, len(ref)), (var, len(var))):
+                bucket = need.setdefault(seq, set())
+                bucket.add(center)
+                if center > 0:
+                    bucket.add(center - 1)
+                if center + 1 < length:
+                    bucket.add(center + 1)
+        return need
 
     def __getitem__(self, idx: int) -> dict:
         return {
@@ -111,11 +196,16 @@ class PairDataset(Dataset):
             "gene": self._genes[idx],
             "species": self._species[idx],
             "protein_id": self._protein_id[idx],
+            "site_index": self._site_index[idx],
         }
 
 
+def _empty_sites(n: int, hidden: int) -> torch.Tensor:
+    return torch.zeros(n, 3, hidden, dtype=torch.float32)
+
+
 class CachedDataset(Dataset):
-    """Pre-pooled ESM2 embeddings plus targets/weights/channels."""
+    """Precomputed ESM2 embeddings plus targets/weights/channels."""
 
     def __init__(self, cache_path: str | Path):
         path = Path(cache_path)
@@ -135,6 +225,10 @@ class CachedDataset(Dataset):
         self.genes = data.get("genes", [""] * len(self.targets))
         self.protein_ids = data.get("protein_ids", [""] * len(self.targets))
         self.channels = data.get("channels", ["unknown"] * len(self.targets))
+        hidden = int(self.ref_mean.shape[1])
+        self.site_ref = data.get("site_ref", _empty_sites(len(self.targets), hidden))
+        self.site_var = data.get("site_var", _empty_sites(len(self.targets), hidden))
+        self.has_sites = bool(data.get("has_sites", False))
 
     def __len__(self) -> int:
         return len(self.targets)
@@ -146,6 +240,8 @@ class CachedDataset(Dataset):
             "var_mean": self.var_mean[idx],
             "var_max": self.var_max[idx],
             "nucleotide_features": self.nuc_features[idx],
+            "site_ref": self.site_ref[idx],
+            "site_var": self.site_var[idx],
             "target": self.targets[idx],
             "sample_weight": self.weights[idx],
             "dms_zscore": self.z[idx],

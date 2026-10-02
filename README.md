@@ -21,7 +21,7 @@ This:
 1. Downloads ProteinGym substitutions → `data/processed/proteingym_substitutions.parquet`
 2. Builds CARD/OF GoF source → `data/processed/gof_growth_amr.parquet`
 3. Downloads ~150 complete bacterial GBFFs and writes synthetic wrecks → `data/processed/synthetic_lof.parquet`
-4. Writes **protein-held-out / residue-held-out / family-held-out** tables under `data/processed/{lof,mlof,growth_gof,amr_gof}/`
+4. Writes **residue-held-out** tables (MLoF also writes `protein_test.parquet` for never-trained genes) under `data/processed/{lof,mlof,growth_gof,amr_gof}/`
 
 To grade synthetic wrecks with Pfam coordinates (~1 GB HMM download, needs `pyhmmer` or `hmmscan`):
 
@@ -121,7 +121,7 @@ Alignment-free LoF (no reference pair; loads ESM2-35M only):
 python scripts/predict.py --model "$PLMLOF_OUTPUT_DIR" --proteins alleles.faa --device cuda
 ```
 
-Columns include `lof_score`, `lof_sd`, `lof_p`, `lof_q`, `mlof_score`, `in_family`, wreck flags, and growth/AMR GoF probabilities + calls.
+Columns include `lof_score`, `lof_sd`, `lof_p`, `lof_q`, `mlof_score`, `mlof_bin` (0 / 0.40 / 0.70 display), `in_family`, wreck flags, and growth/AMR GoF probabilities + calls.
 
 Held-out Dewachter exam (never in training):
 
@@ -140,10 +140,14 @@ python scripts/evaluate_dewachter.py \
 
 | Head | Encoder | Target | Call |
 |------|---------|--------|------|
-| LoF | ESM2-35M | `lof_score` ∈ [0, 1] (early/in-domain wrecks=1, in-domain missense=0.7, tail wreck≈0.4, WT=0) | daily score |
-| MLoF | ESM2-650M | missense-damage rank on all ProteinGym substitution genes | score, not a wreck caller |
-| Growth GoF | ESM2-650M | P(z ≥ +2 on OrganismalFitness growth) | only if p≥0.90 **and** in-family **and** empirical p<0.05 |
-| AMR GoF | ESM2-650M | P(CARD-like resistance SNP) | same conservative rule |
+| LoF | ESM2-35M (pooled allele) | wreck `lof_score` ∈ [0, 1]; checkpoint on wreck AUROC | daily score; `wreck_grade` is the overlay |
+| MLoF | ESM2-650M **at the mutated residue** | continuous damage from DMS z; RankNet within protein | score + `mlof_bin`; not a wreck caller |
+| Growth GoF | ESM2-650M pooled | P(z ≥ +2 on OrganismalFitness growth) | only if p≥0.90 **and** in-family **and** empirical p<0.05, and only if eval is caller-ready |
+| AMR GoF | ESM2-650M pooled | P(CARD-like resistance SNP on a **known** family) | same conservative rule |
+
+MLoF `test` is new sites of proteins seen in train. `protein_test` is held-out proteins. Checkpoint on **within-gene Spearman**; gene-prior collapse is a hard fail.
+
+After changing tables or the site embedder, delete `$PLMLOF_EMB_DIR` (or the task subdir) so precompute does not reuse pooled-only caches.
 
 GB1 binding and Tsuboyama stability are **not** GoF training labels; they are MLoF missense-damage signal.
 
@@ -164,5 +168,6 @@ pytest tests/ -v
 - Copy the repo or HuggingFace cache into `$HOME`
 - Run `setup.sh` / `pipeline.sh` on a login node
 - Train on Dewachter
+- Reuse old MLoF embedding caches (pooled-only). Delete `$PLMLOF_EMB_DIR/mlof` after this change
 - Treat empirical p as P(the protein is dead)
 - Score Panaroo serotype swaps or missing plasmids as missense LoF

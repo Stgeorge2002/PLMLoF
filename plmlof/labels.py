@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 
 from plmlof.constants import LOF_STRONG, LOF_WEAK, LOF_WRECK, LOF_WT
@@ -60,6 +61,25 @@ def lof_score_from_z(
         return LOF_WT
     if z > Z_GOF_LOOSE:
         return None if drop_gain else LOF_WT
+    return LOF_WT
+
+
+def damage_from_z(z: float) -> float:
+    """Smooth missense damage in (0, 1). Lower fitness z → higher damage.
+
+    Logistic centred at z = -1: z=-2 → ~0.73, z=-1 → 0.50, z=0 → ~0.27.
+    Identity WT is 0.0, not this map. Display bins (0 / 0.40 / 0.70) are
+    ``display_bin``, applied at predict time, not as a training target.
+    """
+    return float(1.0 / (1.0 + math.exp(float(z) + 1.0)))
+
+
+def display_bin(score: float) -> float:
+    """Map a continuous damage score onto the product bins."""
+    if score >= LOF_STRONG:
+        return LOF_STRONG
+    if score >= LOF_WEAK:
+        return LOF_WEAK
     return LOF_WT
 
 

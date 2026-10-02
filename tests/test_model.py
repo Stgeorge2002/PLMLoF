@@ -37,3 +37,19 @@ class TestComparisonModule:
             torch.randn(b, d), torch.randn(b, d),
         )
         assert out.shape == (b, comp.output_size)
+
+
+class TestSiteCompare:
+    def test_delta_changes_output(self):
+        from plmlof.model import SiteCompare
+
+        torch.manual_seed(0)
+        cmp = SiteCompare(hidden_size=8)
+        cmp.eval()
+        ref = torch.randn(2, 3, 8)
+        var = ref.clone()
+        var[:, 1] = var[:, 1] + 1.0
+        with torch.no_grad():
+            same = cmp(ref, ref)
+            diff = cmp(ref, var)
+        assert not torch.allclose(same, diff)

@@ -8,6 +8,8 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
+from plmlof.sites import token_index
+
 logger = logging.getLogger(__name__)
 
 
@@ -40,7 +42,9 @@ def embed_unique_sequences(
     batch_size: int,
     max_length: int,
     num_workers: int = 4,
-) -> tuple[list[str], torch.Tensor, torch.Tensor]:
+    residue_requests: dict[str, set[int]] | None = None,
+) -> tuple[list[str], torch.Tensor, torch.Tensor, dict[tuple[str, int], torch.Tensor]]:
+    """Pool unique sequences; optionally bank residue tokens at requested indices."""
     ds = _LenSortedSeqs(sequences)
 
     def collate(batch: list[str]) -> dict:
@@ -55,6 +59,7 @@ def embed_unique_sequences(
         num_workers=num_workers, pin_memory=(device.type == "cuda"),
     )
     means, maxes, ordered = [], [], []
+    site_bank: dict[tuple[str, int], torch.Tensor] = {}
     use_amp = device.type == "cuda"
     amp_dtype = torch.bfloat16
     if use_amp:
@@ -69,5 +74,14 @@ def embed_unique_sequences(
         mean_p, max_p = _pool(hidden, mask)
         means.append(mean_p.float().cpu())
         maxes.append(max_p.float().cpu())
-        ordered.extend(batch["sequences"])
-    return ordered, torch.cat(means), torch.cat(maxes)
+        seqs = batch["sequences"]
+        ordered.extend(seqs)
+        if residue_requests:
+            hidden_cpu = hidden.float().cpu()
+            n_tok = hidden_cpu.size(1)
+            for b, seq in enumerate(seqs):
+                for residue in residue_requests.get(seq, ()):
+                    tok = token_index(int(residue))
+                    if 0 <= tok < n_tok:
+                        site_bank[(seq, int(residue))] = hidden_cpu[b, tok].contiguous()
+    return ordered, torch.cat(means), torch.cat(maxes), site_bank

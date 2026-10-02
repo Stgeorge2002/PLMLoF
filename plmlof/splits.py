@@ -1,4 +1,4 @@
-"""Deterministic table splits: proteins (LoF), sites (growth GoF), families (AMR)."""
+"""Deterministic table splits: proteins (LoF), sites (MLoF / GoF)."""
 
 from __future__ import annotations
 
@@ -121,6 +121,52 @@ def split_proteins(protein_ids: Sequence[str], seed: int = 42) -> dict[str, str]
     mapping = {p: ("test" if p in test else "val" if p in val else "train") for p in uniq}
     logger.info("Protein split train=%s val=%s test=%s", len(train), len(val), len(test))
     return mapping
+
+
+def split_mlof_nested(
+    protein_ids: Sequence[str],
+    ref_proteins: Sequence[str],
+    var_proteins: Sequence[str],
+    seed: int = 42,
+    protein_test_frac: float = 0.20,
+) -> list[str]:
+    """Hold out some proteins entirely; residue-split sites on the rest.
+
+    Labels:
+      * ``train`` / ``val`` / ``test`` — new sites of proteins seen in train
+        (Panaroo default: new allele of a known gene).
+      * ``protein_test`` — every variant of a never-trained protein
+        (new gene at test time).
+    """
+    if not (len(protein_ids) == len(ref_proteins) == len(var_proteins)):
+        raise ValueError("protein_ids, ref_proteins, and var_proteins must be aligned")
+    rng = np.random.RandomState(seed)
+    uniq = sorted(set(str(p) for p in protein_ids))
+    rng.shuffle(uniq)
+    n_hold = max(1, int(round(len(uniq) * protein_test_frac))) if uniq else 0
+    if n_hold >= len(uniq) and len(uniq) > 1:
+        n_hold = len(uniq) - 1
+    held = set(uniq[:n_hold])
+    splits = ["train"] * len(protein_ids)
+    rest_idx = [i for i, p in enumerate(protein_ids) if str(p) not in held]
+    for i, p in enumerate(protein_ids):
+        if str(p) in held:
+            splits[i] = "protein_test"
+    if rest_idx:
+        site_splits = split_residues_within_protein(
+            [protein_ids[i] for i in rest_idx],
+            [ref_proteins[i] for i in rest_idx],
+            [var_proteins[i] for i in rest_idx],
+            seed=seed,
+        )
+        for i, lab in zip(rest_idx, site_splits):
+            splits[i] = lab
+    logger.info(
+        "MLoF nested rows train=%s val=%s test=%s protein_test=%s | held-out proteins=%s/%s",
+        splits.count("train"), splits.count("val"), splits.count("test"),
+        splits.count("protein_test"), len(held), len(uniq),
+    )
+    return splits
 
 
 def split_species(species: Sequence[str], seed: int = 42) -> dict[str, str]:

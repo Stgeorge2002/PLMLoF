@@ -1,7 +1,8 @@
 """Pre-compute ESM2 embeddings for task splits.
 
-LoF uses ESM2-35M. MLoF and both GoF heads share ESM2-650M.
-One unique-sequence pass per encoder.
+LoF uses ESM2-35M (pooled allele). MLoF/GoF share ESM2-650M; MLoF also
+banks residue tokens at the substitution so the ranker never sees gene identity
+from a pooled ref vector.
 
     python scripts/precompute.py \
         --data-dir data/processed \
@@ -24,20 +25,59 @@ from plmlof.constants import TASKS
 from plmlof.dataset import PairDataset
 from plmlof.embed import embed_unique_sequences
 from plmlof.encoders import ESM2_PAIR, esm2_for_task, read_encoder_meta, write_encoder_meta
+from plmlof.sites import neighbor_indices
 
 logger = logging.getLogger(__name__)
 
+SPLITS = ("train", "val", "test", "protein_test", "null")
 
-def scatter(dataset: PairDataset, seq_to_idx: dict[str, int], mean_t: torch.Tensor, max_t: torch.Tensor, out: Path) -> None:
+
+def _site_window(seq: str, center: int, site_bank: dict[tuple[str, int], torch.Tensor], dim: int) -> torch.Tensor:
+    window = torch.zeros(3, dim, dtype=torch.float32)
+    if center < 0 or not seq:
+        return window
+    left, mid, right = neighbor_indices(center, len(seq))
+    for slot, residue in enumerate((left, mid, right)):
+        if residue < 0:
+            continue
+        vec = site_bank.get((seq, residue))
+        if vec is not None:
+            window[slot] = vec
+    return window
+
+
+def scatter(
+    dataset: PairDataset,
+    seq_to_idx: dict[str, int],
+    mean_t: torch.Tensor,
+    max_t: torch.Tensor,
+    out: Path,
+    site_bank: dict[tuple[str, int], torch.Tensor] | None = None,
+    store_sites: bool = False,
+) -> None:
     n = len(dataset)
     hidden = mean_t.shape[1]
     ref_idx = torch.tensor([seq_to_idx[s] for s in dataset._ref], dtype=torch.long)
     var_idx = torch.tensor([seq_to_idx[s] for s in dataset._var], dtype=torch.long)
+    if store_sites:
+        bank = site_bank or {}
+        site_ref = torch.stack([
+            _site_window(seq, c, bank, hidden) for seq, c in zip(dataset._ref, dataset._site_index)
+        ])
+        site_var = torch.stack([
+            _site_window(seq, c, bank, hidden) for seq, c in zip(dataset._var, dataset._site_index)
+        ])
+    else:
+        site_ref = torch.zeros(n, 3, hidden, dtype=torch.float32)
+        site_var = torch.zeros(n, 3, hidden, dtype=torch.float32)
     data = {
         "ref_mean": mean_t[ref_idx].contiguous(),
         "ref_max": max_t[ref_idx].contiguous(),
         "var_mean": mean_t[var_idx].contiguous(),
         "var_max": max_t[var_idx].contiguous(),
+        "site_ref": site_ref.contiguous(),
+        "site_var": site_var.contiguous(),
+        "has_sites": bool(store_sites),
         "nucleotide_features": dataset._nuc,
         "targets": torch.tensor(dataset._target, dtype=torch.float32),
         "weights": torch.tensor(dataset._weight, dtype=torch.float32),
@@ -51,7 +91,7 @@ def scatter(dataset: PairDataset, seq_to_idx: dict[str, int], mean_t: torch.Tens
     }
     out.parent.mkdir(parents=True, exist_ok=True)
     torch.save(data, out)
-    logger.info("Wrote %s  rows=%s  D=%s", out, n, hidden)
+    logger.info("Wrote %s  rows=%s  D=%s  sites=%s", out, n, hidden, store_sites)
 
 
 def _load_model_cfg(path: Path | None) -> dict:
@@ -66,9 +106,13 @@ def _fresh(parquet: Path, dest: Path, wanted: str, task: str) -> bool:
     if not dest.exists() or parquet.stat().st_mtime > dest.stat().st_mtime:
         return False
     meta = read_encoder_meta(dest.parent)
-    if meta:
-        return meta.get("esm2_model_name") == wanted
-    return task != "lof" and wanted == ESM2_PAIR
+    if not meta:
+        return False
+    if meta.get("esm2_model_name") != wanted:
+        return False
+    if task == "mlof" and not meta.get("site_embeddings"):
+        return False
+    return True
 
 
 def main() -> None:
@@ -98,7 +142,7 @@ def main() -> None:
     for task in args.tasks:
         wanted = esm2_for_task(task, model_cfg)
         tdir = args.data_dir / task
-        for split in ("train", "val", "test", "null"):
+        for split in SPLITS:
             parquet = tdir / f"{split}.parquet"
             if not parquet.exists() or parquet.stat().st_size < 100:
                 continue
@@ -118,9 +162,14 @@ def main() -> None:
 
     for esm_name, jobs in by_encoder.items():
         unique: set[str] = set()
-        for _, _, ds, _ in jobs:
+        residue_requests: dict[str, set[int]] = defaultdict(set)
+        need_sites = any(task == "mlof" for task, _, _, _ in jobs)
+        for task, _, ds, _ in jobs:
             unique.update(ds._ref)
             unique.update(ds._var)
+            if task == "mlof":
+                for seq, residues in ds.residue_requests().items():
+                    residue_requests[seq].update(residues)
         logger.info("Embedding %s unique sequences with %s", len(unique), esm_name)
         tokenizer = AutoTokenizer.from_pretrained(esm_name)
         model = AutoModel.from_pretrained(esm_name).to(device)
@@ -133,9 +182,10 @@ def main() -> None:
             except RuntimeError as exc:
                 logger.warning("torch.compile skipped: %s", exc)
 
-        ordered, mean_t, max_t = embed_unique_sequences(
+        ordered, mean_t, max_t, site_bank = embed_unique_sequences(
             list(unique), model, tokenizer, device,
             args.batch_size, args.max_seq_length, num_workers=args.num_workers,
+            residue_requests=dict(residue_requests) if need_sites else None,
         )
         del model
         if device.type == "cuda":
@@ -145,9 +195,15 @@ def main() -> None:
         stamped: set[str] = set()
         for task, split, ds, dest in jobs:
             logger.info("Scatter %s/%s", task, split)
-            scatter(ds, seq_to_idx, mean_t, max_t, dest)
+            scatter(
+                ds, seq_to_idx, mean_t, max_t, dest,
+                site_bank=site_bank, store_sites=(task == "mlof"),
+            )
             if task not in stamped:
-                write_encoder_meta(dest.parent, esm_name, hidden)
+                write_encoder_meta(
+                    dest.parent, esm_name, hidden,
+                    site_embeddings=(task == "mlof"),
+                )
                 stamped.add(task)
 
     logger.info("Embeddings complete → %s", args.output_dir)

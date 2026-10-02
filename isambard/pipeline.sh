@@ -270,6 +270,7 @@ if [[ "$MODE" == "full" || "$MODE" == "eval" || "$MODE" == "train" ]]; then
     for t in "${TASKS[@]}"; do
         eval_task "$t" test
         eval_task "$t" val
+        eval_task "$t" protein_test
     done
 fi
 

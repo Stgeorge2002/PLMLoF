@@ -16,7 +16,7 @@ import yaml
 from torch.utils.data import DataLoader, Subset
 
 from plmlof.applicability import save_gallery
-from plmlof.dataset import CachedDataset, lof_train_keep_indices
+from plmlof.dataset import CachedDataset, ProteinGroupBatchSampler, lof_train_keep_indices
 from plmlof.encoders import HIDDEN_SIZE, esm2_for_task, read_encoder_meta
 from plmlof.model import TaskNet
 from plmlof.trainer import Trainer
@@ -63,6 +63,10 @@ def main() -> None:
         )
     train_full = CachedDataset(task_emb / "train_embeddings.pt")
     val_ds = CachedDataset(task_emb / "val_embeddings.pt")
+    if args.task == "mlof" and not train_full.has_sites:
+        raise SystemExit(
+            f"{task_emb} has pooled embeddings only. Delete that dir and re-run scripts/precompute.py"
+        )
     if args.task == "mlof":
         keep = lof_train_keep_indices(
             train_full.is_wreck, train_full.is_missense, train_full.targets,
@@ -85,13 +89,27 @@ def main() -> None:
     logger.info("%s seed=%s train=%s val=%s D=%s encoder=%s", args.task, args.seed, len(train_ds), len(val_ds), hidden, esm_name)
 
     batch = int(train_cfg.get("batch_size", 256))
-    train_loader = DataLoader(
-        train_ds, batch_size=batch, shuffle=True,
-        num_workers=args.num_workers, pin_memory=(device == "cuda"),
-    )
+    pin = device == "cuda"
+    if args.task == "mlof":
+        pids = [train_full.protein_ids[i] for i in train_ds.indices]
+        sampler = ProteinGroupBatchSampler(
+            pids,
+            batch_size=batch,
+            n_proteins_per_batch=int(train_cfg.get("mlof_proteins_per_batch", 4)),
+            seed=args.seed,
+        )
+        train_loader = DataLoader(
+            train_ds, batch_sampler=sampler,
+            num_workers=args.num_workers, pin_memory=pin,
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds, batch_size=batch, shuffle=True,
+            num_workers=args.num_workers, pin_memory=pin,
+        )
     val_loader = DataLoader(
         val_ds, batch_size=batch, shuffle=False,
-        num_workers=args.num_workers, pin_memory=(device == "cuda"),
+        num_workers=args.num_workers, pin_memory=pin,
     )
 
     net = TaskNet(
@@ -114,6 +132,8 @@ def main() -> None:
         esm2_model_name=esm_name,
         pool_strategy=model_cfg.get("pool_strategy", "mean_max"),
         seed=args.seed,
+        rank_loss_weight=float(train_cfg.get("rank_loss_weight", 0.7)),
+        regression_loss_weight=float(train_cfg.get("regression_loss_weight", 0.3)),
     )
     trainer.train(
         max_epochs=args.max_epochs or int(train_cfg.get("max_epochs", 20)),

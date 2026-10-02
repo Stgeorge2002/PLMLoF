@@ -8,12 +8,12 @@ Reads:
   data/processed/synthetic_lof.parquet
 
 Writes under data/processed/{lof,mlof,growth_gof,amr_gof}/
-  train.parquet val.parquet test.parquet null.parquet
+  train.parquet val.parquet test.parquet [protein_test.parquet] null.parquet
 
 MLoF is a missense-damage ranker on every ProteinGym substitution gene.
 Wreck LoF stays synthetic. Growth/AMR GoF stay prokaryote OrganismalFitness.
-Splits: LoF synthetics by species, MLoF missense by protein, growth GoF by
-residue-within-protein (every gene stays in train), AMR by gene family.
+Splits: LoF synthetics by species; MLoF nested (residue-within-protein plus
+held-out proteins); growth and AMR GoF by residue-within-protein.
 """
 
 from __future__ import annotations
@@ -30,7 +30,6 @@ import pandas as pd
 
 from plmlof.constants import LOF_WT
 from plmlof.domains import SURE_MIN, protein_id as pid
-from plmlof.splits import parse_tasks, split_families, split_proteins, split_residues_within_protein, split_species
 from plmlof.labels import (
     EXTRA_MISSENSE_TYPES,
     INDOMAIN_MISSENSE_TYPES,
@@ -40,9 +39,12 @@ from plmlof.labels import (
     Z_WEAK,
     Z_WT,
     channel_for_lof,
+    damage_from_z,
     lof_score_for_pair,
     lof_score_from_z,
 )
+from plmlof.sites import aligned_site_index
+from plmlof.splits import parse_tasks, split_mlof_nested, split_residues_within_protein, split_species
 
 logger = logging.getLogger(__name__)
 
@@ -71,11 +73,16 @@ COLS = [
     "ref_protein", "var_protein", "ref_dna", "var_dna", "gene", "species", "source",
     "protein_id", "task", "split", "wreck_type", "channel", "target", "sample_weight",
     "lof_score", "dms_score", "dms_zscore", "is_wreck", "is_missense", "label",
+    "site_index",
 ]
 
 
 def _std_row(**kwargs) -> dict:
-    row = {c: "" if c not in {"target", "sample_weight", "lof_score", "dms_score", "dms_zscore", "is_wreck", "is_missense", "label"} else 0 for c in COLS}
+    numeric = {
+        "target", "sample_weight", "lof_score", "dms_score", "dms_zscore",
+        "is_wreck", "is_missense", "label", "site_index",
+    }
+    row = {c: (0 if c in numeric else "") for c in COLS}
     row.update({
         "dms_score": float("nan"),
         "dms_zscore": float("nan"),
@@ -85,8 +92,13 @@ def _std_row(**kwargs) -> dict:
         "is_wreck": False,
         "is_missense": False,
         "label": 0,
+        "site_index": -1,
     })
     row.update(kwargs)
+    if "site_index" not in kwargs:
+        ref = str(row.get("ref_protein") or "")
+        var = str(row.get("var_protein") or "")
+        row["site_index"] = aligned_site_index(ref, var)
     return row
 
 
@@ -306,10 +318,12 @@ def write_task(df: pd.DataFrame, task_dir: Path) -> None:
     task_dir.mkdir(parents=True, exist_ok=True)
     for col in COLS:
         if col not in df.columns:
-            df[col] = "" if col not in {"target", "sample_weight", "lof_score", "label", "is_wreck", "is_missense"} else 0
+            df[col] = 0 if col in {"target", "sample_weight", "lof_score", "label", "is_wreck", "is_missense", "site_index"} else ""
     df = df[COLS]
-    for split in ("train", "val", "test"):
+    for split in ("train", "val", "test", "protein_test"):
         sub = df[df["split"] == split]
+        if split == "protein_test" and sub.empty:
+            continue
         path = task_dir / f"{split}.parquet"
         sub.to_parquet(path, index=False)
         logger.info("  %s %s rows genes=%s proteins=%s", path.name, len(sub), sub["gene"].nunique(), sub["protein_id"].nunique())
@@ -441,22 +455,27 @@ def build_lof(syn: pd.DataFrame, species_split: dict[str, str], args) -> pd.Data
     return lof
 
 
-def build_mlof(dms: pd.DataFrame, protein_split: dict[str, str], args) -> pd.DataFrame:
+def build_mlof(dms: pd.DataFrame, args) -> pd.DataFrame:
     """Pairwise missense-damage ranker. Every ProteinGym substitution gene.
 
-    `dms` is already single-site missense with mean z per pair (load_mlof_dms).
-    Beneficial tail (z > +1) is WT, not dropped.
+    Target is continuous ``damage_from_z(z)``, not 0/0.40/0.70 bins.
+    Nested split: residue hold-out on most proteins plus a protein_test set.
+    Beneficial tail stays in the table (damage near 0), not dropped.
     """
     dms = _stratify_mlof_per_protein(dms, args.mlof_per_protein, args.seed)
+    nested = split_mlof_nested(
+        dms["protein_id"].tolist(),
+        dms["ref_protein"].tolist(),
+        dms["var_protein"].tolist(),
+        seed=args.seed,
+    ) if not dms.empty else []
     rows = []
-    for rec in dms.itertuples(index=False):
+    for rec, split in zip(dms.itertuples(index=False), nested):
         z = rec.dms_zscore
         if not np.isfinite(z):
             continue
-        score = lof_score_from_z(float(z), is_wreck=False, drop_gain=False)
-        if score is None:
-            continue
-        ch = channel_for_lof(score, None, float(z))
+        score = damage_from_z(float(z))
+        ch = channel_for_lof(lof_score_from_z(float(z), is_wreck=False, drop_gain=False) or LOF_WT, None, float(z))
         src = str(getattr(rec, "source", "") or "ProteinGym")
         rows.append(_std_row(
             ref_protein=rec.ref_protein,
@@ -466,7 +485,7 @@ def build_mlof(dms: pd.DataFrame, protein_split: dict[str, str], args) -> pd.Dat
             source=src,
             protein_id=rec.protein_id,
             task="mlof",
-            split=protein_split.get(rec.protein_id, "train"),
+            split=split,
             wreck_type="none",
             channel=ch,
             target=score,
@@ -475,13 +494,14 @@ def build_mlof(dms: pd.DataFrame, protein_split: dict[str, str], args) -> pd.Dat
             dms_zscore=float(z),
             is_wreck=False,
             is_missense=True,
-            sample_weight=0.5 if ch == "weak_missense" else 1.0,
+            sample_weight=1.0,
             label=0 if score >= 0.4 else 1,
         ))
     of_df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=COLS)
 
     id_rows = []
     seen: set[str] = set()
+    held = set(of_df.loc[of_df["split"] == "protein_test", "protein_id"]) if not of_df.empty else set()
     for rec in of_df.itertuples(index=False):
         if rec.protein_id in seen:
             continue
@@ -494,7 +514,7 @@ def build_mlof(dms: pd.DataFrame, protein_split: dict[str, str], args) -> pd.Dat
             source="mlof_identity",
             protein_id=rec.protein_id,
             task="mlof",
-            split=rec.split,
+            split="protein_test" if rec.protein_id in held else "train",
             wreck_type="identity",
             channel="wt",
             target=LOF_WT,
@@ -503,6 +523,7 @@ def build_mlof(dms: pd.DataFrame, protein_split: dict[str, str], args) -> pd.Dat
             is_missense=False,
             sample_weight=1.0,
             label=1,
+            site_index=0,
         ))
     id_df = pd.DataFrame(id_rows) if id_rows else pd.DataFrame(columns=COLS)
     mlof = pd.concat([of_df, id_df], ignore_index=True) if not of_df.empty or not id_df.empty else pd.DataFrame(columns=COLS)
@@ -598,79 +619,93 @@ def build_growth_gof(of: pd.DataFrame, syn: pd.DataFrame, args) -> pd.DataFrame:
 
 
 def build_amr_gof(of: pd.DataFrame, gof_src: pd.DataFrame, syn: pd.DataFrame, args) -> pd.DataFrame:
-    rows_pos, rows_neg = [], []
+    """Resistance SNPs on known AMR genes. Residue hold-out, not family hold-out.
+
+    Family transfer is not a ship bar — CARD families are different enzymes.
+    """
+    missense_rows: list[dict] = []
+    id_rows: list[dict] = []
+    wreck_rows: list[dict] = []
     rng = np.random.RandomState(args.seed)
 
     card = gof_src[gof_src["source"].astype(str).str.contains("CARD|AMRFinder", case=False, na=False)].copy() if not gof_src.empty else pd.DataFrame()
     if not card.empty:
         card["protein_id"] = card["ref_protein"].map(pid)
-        card["family"] = card["gene"].map(family_of)
-        fam_split = split_families(card["family"].tolist(), args.seed)
         for rec in card.itertuples(index=False):
-            fam = rec.family
-            rows_pos.append(_std_row(
+            missense_rows.append(_std_row(
                 ref_protein=rec.ref_protein, var_protein=rec.var_protein, gene=rec.gene,
                 species=getattr(rec, "species", "") or "", source=str(getattr(rec, "source", "CARD_AMR")),
-                protein_id=rec.protein_id, task="amr_gof", split=fam_split.get(fam, "train"),
+                protein_id=rec.protein_id, task="amr_gof", split="train",
                 channel="gof_pos", target=1.0, is_missense=True, wreck_type="none", label=1,
                 dms_zscore=float(getattr(rec, "dms_zscore", 3.0) or 3.0),
             ))
-            # WT identity negative
-            rows_neg.append(_std_row(
+            id_rows.append(_std_row(
                 ref_protein=rec.ref_protein, var_protein=rec.ref_protein, gene=rec.gene,
                 species=getattr(rec, "species", "") or "", source="amr_wt",
-                protein_id=rec.protein_id, task="amr_gof", split=fam_split.get(fam, "train"),
+                protein_id=rec.protein_id, task="amr_gof", split="train",
                 channel="gof_neg", target=0.0, is_missense=False, wreck_type="identity", label=0,
+                site_index=0,
             ))
             for var in random_missense(str(rec.ref_protein), rng, n=2):
                 if var == rec.var_protein:
                     continue
-                rows_neg.append(_std_row(
+                missense_rows.append(_std_row(
                     ref_protein=rec.ref_protein, var_protein=var, gene=rec.gene,
                     species=getattr(rec, "species", "") or "", source="amr_random_missense",
-                    protein_id=rec.protein_id, task="amr_gof", split=fam_split.get(fam, "train"),
+                    protein_id=rec.protein_id, task="amr_gof", split="train",
                     channel="gof_neg", target=0.0, is_missense=True, wreck_type="none", label=0,
                 ))
 
-    # MIC-up OF (TEM/VIM/KKA2 etc.) — AMR, never growth
     mic = of.loc[of["is_amr_assay"]].copy()
     if not mic.empty:
-        mic["family"] = mic["gene"].map(family_of)
-        extra_fams = split_families(mic["family"].tolist(), args.seed + 1)
         for rec in mic.itertuples(index=False):
             z = rec.dms_zscore
             if not np.isfinite(z) or z < Z_GOF_STRICT:
                 continue
-            split = extra_fams.get(rec.family, "train")
-            rows_pos.append(_std_row(
+            missense_rows.append(_std_row(
                 ref_protein=rec.ref_protein, var_protein=rec.var_protein, gene=rec.gene,
                 species=getattr(rec, "species", "") or "", source="ProteinGym_MIC",
-                protein_id=rec.protein_id, task="amr_gof", split=split,
+                protein_id=rec.protein_id, task="amr_gof", split="train",
                 channel="gof_pos", target=1.0, is_missense=True, label=1, dms_zscore=float(z),
             ))
 
-    # Wrecks of AMR proteins
-    amr_refs = {r["ref_protein"] for r in rows_pos}
-    if syn is not None and not syn.empty and amr_refs:
-        # Use generic wrecks as "truncation is not resistance"
-        syn_cap = cap_synthetic(syn, min(2000, max(len(rows_pos), 100)), args.seed)
+    if missense_rows:
+        site_splits = split_residues_within_protein(
+            [r["protein_id"] for r in missense_rows],
+            [r["ref_protein"] for r in missense_rows],
+            [r["var_protein"] for r in missense_rows],
+            seed=args.seed,
+        )
+        for row, split in zip(missense_rows, site_splits):
+            row["split"] = split
+
+    if syn is not None and not syn.empty and missense_rows:
+        syn_cap = cap_synthetic(syn, min(2000, max(len(missense_rows), 100)), args.seed)
         for rec in syn_cap.itertuples(index=False):
-            rows_neg.append(_std_row(
+            wreck_rows.append(_std_row(
                 ref_protein=rec.ref_protein, var_protein=rec.var_protein, gene=rec.gene,
                 species=rec.species, source="synthetic_lof", protein_id=pid(rec.ref_protein),
                 task="amr_gof", split="train", wreck_type=getattr(rec, "wreck_type", "stop"),
                 channel="gof_neg", target=0.0, is_wreck=True, label=0,
             ))
 
-    pos = pd.DataFrame(rows_pos).drop_duplicates(subset=["ref_protein", "var_protein"]) if rows_pos else pd.DataFrame()
-    neg = pd.DataFrame(rows_neg).drop_duplicates(subset=["ref_protein", "var_protein"]) if rows_neg else pd.DataFrame()
-    if pos.empty:
+    pos = [r for r in missense_rows if r["channel"] == "gof_pos"]
+    of_neg = [r for r in missense_rows if r["channel"] == "gof_neg"] + id_rows
+    if not pos:
         logger.warning("No AMR GoF positives")
         return pd.DataFrame(columns=COLS)
-    merged = balance_gof(pos, neg, args.gof_neg_ratio, args.seed)
-    null = neg.copy()
-    null["split"] = "null"
-    return pd.concat([merged, null], ignore_index=True)
+    n_wreck = max(0, int(len(pos) * args.gof_neg_ratio) - len(of_neg))
+    if wreck_rows and len(wreck_rows) > n_wreck:
+        wreck_rows = list(pd.DataFrame(wreck_rows).sample(n=n_wreck, random_state=args.seed).to_dict("records"))
+    logger.info("AMR GoF pos=%s of_neg=%s wreck_neg=%s", len(pos), len(of_neg), len(wreck_rows))
+    merged = pd.DataFrame(pos + of_neg + wreck_rows)
+    merged = merged.drop_duplicates(subset=["ref_protein", "var_protein"]).reset_index(drop=True)
+    null = pd.DataFrame(of_neg + wreck_rows)
+    if not null.empty:
+        null = null.drop_duplicates(subset=["ref_protein", "var_protein"]).copy()
+        null["split"] = "null"
+        return pd.concat([merged, null], ignore_index=True)
+    return merged
 
 
 def main() -> None:
@@ -734,12 +769,10 @@ def main() -> None:
         logger.warning("No prokaryote OrganismalFitness rows — GoF tables skipped if requested")
 
     mlof_src = pd.DataFrame()
-    protein_split: dict[str, str] = {}
     if "mlof" in want:
         mlof_src = load_mlof_dms(pg)
         if mlof_src.empty:
             raise SystemExit("No single-site missense rows in the ProteinGym substitutions parquet")
-        protein_split = split_proteins(mlof_src["protein_id"].tolist(), args.seed)
 
     syn_path = args.processed / "synthetic_lof.parquet"
     if syn_path.exists():
@@ -769,8 +802,8 @@ def main() -> None:
         manifest["lof_rows"] = int(len(lof))
 
     if "mlof" in want:
-        logger.info("── MLoF (missense damage, all ProteinGym genes) ──")
-        mlof = build_mlof(mlof_src, protein_split, args)
+        logger.info("── MLoF (site ranker; nested residue + protein hold-out) ──")
+        mlof = build_mlof(mlof_src, args)
         write_task(mlof, out / "mlof")
         manifest["mlof_rows"] = int(len(mlof))
         manifest["mlof_proteins"] = int(mlof_src["protein_id"].nunique())
@@ -782,7 +815,7 @@ def main() -> None:
         manifest["growth_gof_rows"] = int(len(growth))
 
     if "amr_gof" in want:
-        logger.info("── AMR GoF ──")
+        logger.info("── AMR GoF (residue hold-out on known families) ──")
         amr = build_amr_gof(of, gof_src, syn, args)
         write_task(amr, out / "amr_gof")
         manifest["amr_gof_rows"] = int(len(amr))

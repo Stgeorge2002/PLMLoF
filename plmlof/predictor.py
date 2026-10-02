@@ -16,7 +16,9 @@ from plmlof.data.features import extract_nucleotide_features
 from plmlof.embed import _pool
 from plmlof.encoders import esm2_for_task
 from plmlof.inference.vcf_handler import VariantRecord, parse_fasta_pairs, parse_protein_fasta
+from plmlof.labels import display_bin
 from plmlof.model import TaskNet
+from plmlof.sites import aligned_site_index, gather_site_windows
 from plmlof.stats import benjamini_hochberg, empirical_p
 from plmlof.wreck import wreck_grade
 
@@ -116,7 +118,7 @@ class Predictor:
         return self._encoders[esm_name]
 
     @torch.no_grad()
-    def _embed_seqs(self, seqs: list[str], esm_name: str) -> tuple[torch.Tensor, torch.Tensor]:
+    def _embed_hidden(self, seqs: list[str], esm_name: str):
         tokenizer, encoder = self._get_encoder(esm_name)
         enc = tokenizer(
             seqs, padding=True, truncation=True,
@@ -125,26 +127,39 @@ class Predictor:
         ids = enc["input_ids"].to(self.device)
         mask = enc["attention_mask"].to(self.device)
         hidden = encoder(ids, attention_mask=mask).last_hidden_state
-        return _pool(hidden, mask)
+        mean_p, max_p = _pool(hidden, mask)
+        return hidden, mean_p, max_p
+
+    @torch.no_grad()
+    def _embed_seqs(self, seqs: list[str], esm_name: str) -> tuple[torch.Tensor, torch.Tensor]:
+        _, mean_p, max_p = self._embed_hidden(seqs, esm_name)
+        return mean_p, max_p
 
     @torch.no_grad()
     def _embed_pairs(
         self, refs: list[str], vars_: list[str], esm_name: str,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, ...]:
         nuc = torch.stack([
             extract_nucleotide_features(r, v) for r, v in zip(refs, vars_)
         ]).to(self.device)
-        mean_p, max_p = self._embed_seqs(refs + vars_, esm_name)
+        hidden, mean_p, max_p = self._embed_hidden(refs + vars_, esm_name)
         n = len(refs)
-        return mean_p[:n], max_p[:n], mean_p[n:], max_p[n:], nuc
+        centers = [aligned_site_index(r, v) for r, v in zip(refs, vars_)]
+        site_ref = gather_site_windows(hidden[:n], refs, centers)
+        site_var = gather_site_windows(hidden[n:], vars_, centers)
+        return mean_p[:n], max_p[:n], mean_p[n:], max_p[n:], nuc, site_ref, site_var
 
     @torch.no_grad()
     def _ensemble_measure(
         self, task: str, ref_mean, ref_max, var_mean, var_max, nuc,
+        site_ref=None, site_var=None,
     ) -> tuple[np.ndarray, np.ndarray]:
         measures = []
         for net in self.ensembles[task]:
-            raw = net.forward_from_pooled(ref_mean, ref_max, var_mean, var_max, nuc)
+            raw = net.forward_from_cache(
+                ref_mean, ref_max, var_mean, var_max, nuc,
+                site_ref=site_ref, site_var=site_var,
+            )
             measures.append(net.probability(raw).float().cpu())
         stacked = torch.stack(measures, dim=0)
         return stacked.mean(0).numpy(), stacked.std(0).numpy()
@@ -171,7 +186,7 @@ class Predictor:
                 lof_esm = self.task_esm["lof"]
                 var_mean, var_max = self._embed_seqs(vars_, lof_esm)
                 zeros = torch.zeros(len(batch), 12, device=self.device)
-                pooled["lof"] = (var_mean, var_max, var_mean, var_max, zeros)
+                pooled["lof"] = (var_mean, var_max, var_mean, var_max, zeros, None, None)
             if pair_tasks:
                 pair_esm = self.task_esm[pair_tasks[0]]
                 pooled["_pair"] = self._embed_pairs(refs, vars_, pair_esm)
@@ -180,10 +195,13 @@ class Predictor:
             family: dict[str, tuple[np.ndarray, list[str], np.ndarray]] = {}
             for task in tasks:
                 if task == "lof":
-                    ref_mean, ref_max, var_mean, var_max, nuc = pooled["lof"]
+                    ref_mean, ref_max, var_mean, var_max, nuc, site_ref, site_var = pooled["lof"]
                 else:
-                    ref_mean, ref_max, var_mean, var_max, nuc = pooled["_pair"]
-                measures[task] = self._ensemble_measure(task, ref_mean, ref_max, var_mean, var_max, nuc)
+                    ref_mean, ref_max, var_mean, var_max, nuc, site_ref, site_var = pooled["_pair"]
+                measures[task] = self._ensemble_measure(
+                    task, ref_mean, ref_max, var_mean, var_max, nuc,
+                    site_ref=site_ref, site_var=site_var,
+                )
                 if task in self.galleries:
                     query = var_mean if task == "lof" else ref_mean
                     family[task] = in_family_flags(query.cpu(), self.galleries[task], self.in_family_threshold)
@@ -220,6 +238,7 @@ class Predictor:
                     "lof_p": float(pvals["lof"][i]) if "lof" in pvals else float("nan"),
                     "lof_q": float(qvals["lof"][i]) if "lof" in qvals else float("nan"),
                     "mlof_score": float(mlof_mean[i]),
+                    "mlof_bin": float(display_bin(float(mlof_mean[i]))) if np.isfinite(mlof_mean[i]) else float("nan"),
                     "mlof_sd": float(mlof_sd[i]),
                     "mlof_p": float(pvals["mlof"][i]) if "mlof" in pvals else float("nan"),
                     "mlof_q": float(qvals["mlof"][i]) if "mlof" in qvals else float("nan"),

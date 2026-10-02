@@ -8,14 +8,16 @@ import numpy as np
 import torch
 
 from plmlof.data.features import LOF_LEAK_NUC_INDICES
-from plmlof.dataset import lof_train_keep_indices
+from plmlof.dataset import ProteinGroupBatchSampler, lof_train_keep_indices
 from plmlof.domains import lof_prior, sample_events
 from plmlof.encoders import ESM2_LOF, ESM2_PAIR, esm2_for_task
 from plmlof.hmmer import parse_domtblout
-from plmlof.labels import channel_for_lof, lof_score_for_pair, lof_score_from_z
-from plmlof.metrics import collapse_is_fail, gof_metrics, lof_metrics, within_gene_auroc
-from plmlof.model import TaskNet
-from plmlof.splits import parse_tasks, split_residues_within_protein, substitution_sites
+from plmlof.labels import channel_for_lof, damage_from_z, display_bin, lof_score_for_pair, lof_score_from_z
+from plmlof.metrics import collapse_is_fail, gof_metrics, lof_metrics, mlof_metrics, within_gene_auroc
+from plmlof.model import SiteCompare, TaskNet
+from plmlof.rank import ranknet_loss
+from plmlof.sites import aligned_site_index, gather_site_windows
+from plmlof.splits import parse_tasks, split_mlof_nested, split_residues_within_protein, substitution_sites
 from plmlof.stats import benjamini_hochberg, empirical_p
 from plmlof.wreck import wreck_call, wreck_grade
 
@@ -185,31 +187,51 @@ class TestEmpiricalP:
 
 
 class TestMetrics:
-    def test_lof_ranked(self):
-        z = np.array([-3.0, -2.5, 0.0, 0.1, 0.2])
-        pred = np.array([0.8, 0.7, 0.1, 0.1, 0.05])
-        target = np.array([0.7, 0.7, 0.0, 0.0, 0.0])
-        wreck = np.zeros(5, dtype=bool)
-        miss = np.ones(5, dtype=bool)
+    def test_lof_selects_wreck_auroc(self):
+        z = np.array([-3.0, 0.0, 0.1, 0.2, np.nan, np.nan])
+        pred = np.array([0.8, 0.1, 0.1, 0.05, 0.99, 0.01])
+        target = np.array([0.7, 0.0, 0.0, 0.0, 1.0, 0.0])
+        wreck = np.array([False, False, False, False, True, False])
+        miss = np.array([True, True, True, True, False, False])
         m = lof_metrics(pred, target, z, wreck, miss)
-        assert m["missense_spearman"] > 0.5
-        expected = 0.6 * (m["missense_spearman"] + 1.0) / 2.0 + 0.4 * m["strong_vs_wt_auroc"]
-        assert abs(m["selection"] - expected) < 1e-9
+        assert m["wreck_auroc"] > 0.9
+        assert m["selection"] == m["wreck_auroc"]
 
-    def test_selection_ignores_wreck_auroc(self):
+    def test_lof_selection_ignores_missense_rank(self):
         z = np.array([-3.0, 0.0, 0.1, 0.2])
-        pred = np.array([0.8, 0.1, 0.1, 0.05])
+        good_miss = np.array([0.9, 0.1, 0.1, 0.05])
+        bad_miss = np.array([0.05, 0.9, 0.8, 0.7])
         target = np.array([0.7, 0.0, 0.0, 0.0])
-        wreck = np.array([False, False, False, False])
+        wreck = np.zeros(4, dtype=bool)
         miss = np.ones(4, dtype=bool)
-        honest = lof_metrics(pred, target, z, wreck, miss)
-        wreck_pred = np.array([0.8, 0.1, 0.1, 0.05, 0.99, 0.01])
-        wreck_z = np.array([-3.0, 0.0, 0.1, 0.2, np.nan, np.nan])
-        wreck_t = np.array([0.7, 0.0, 0.0, 0.0, 1.0, 0.0])
-        wreck_flag = np.array([False, False, False, False, True, False])
-        miss2 = np.array([True, True, True, True, False, False])
-        padded = lof_metrics(wreck_pred, wreck_t, wreck_z, wreck_flag, miss2)
-        assert abs(padded["selection"] - honest["selection"]) < 1e-9
+        a = lof_metrics(good_miss, target, z, wreck, miss)
+        b = lof_metrics(bad_miss, target, z, wreck, miss)
+        assert a["selection"] == b["selection"] == 0.0
+
+    def test_mlof_selects_within_gene(self):
+        zs, preds, pids = [], [], []
+        for name in ("c", "d", "e"):
+            z = np.linspace(-3.0, 0.0, 10)
+            zs.append(z)
+            preds.append(-z / 3.0)
+            pids.extend([name] * 10)
+        z = np.concatenate(zs)
+        pred = np.concatenate(preds)
+        miss = np.ones(z.size, dtype=bool)
+        m = mlof_metrics(pred, pred, z, miss, protein_id=pids)
+        assert m["n_genes_ranked"] == 3
+        assert m["within_gene_spearman"] > 0.9
+        assert m["selection"] == m["within_gene_spearman"]
+        assert m["collapse_fraction"] == 0.0
+
+    def test_mlof_collapse_zeros_selection(self):
+        z = np.concatenate([np.linspace(-3, 0, 10)] * 4)
+        pred = np.ones_like(z) * 0.4
+        miss = np.ones(z.size, dtype=bool)
+        pids = ["w"] * 10 + ["x"] * 10 + ["y"] * 10 + ["z"] * 10
+        m = mlof_metrics(pred, pred, z, miss, protein_id=pids)
+        assert m["collapse_fraction"] == 1.0
+        assert m["selection"] == 0.0
 
     def test_gof_precision(self):
         y = np.array([1, 1, 0, 0, 0, 0])
@@ -217,14 +239,23 @@ class TestMetrics:
         m = gof_metrics(p, y, threshold=0.90)
         assert m["n_calls"] == 2
         assert m["precision_at_thr"] == 1.0
+        assert m["caller_ready"] == 0.0
 
     def test_within_gene_auroc(self):
-        pred = np.array([0.9, 0.1, 0.8, 0.2])
-        y = np.array([1, 0, 1, 0])
-        genes = ["a"] * 4
+        pred = np.array([0.9, 0.1, 0.8, 0.2, 0.95, 0.05, 0.7, 0.15])
+        y = np.array([1, 0, 1, 0, 1, 0, 1, 0])
+        genes = ["a"] * 8
         m = within_gene_auroc(pred, y, genes)
         assert m["n_genes_with_auroc"] == 1
         assert m["within_gene_auroc"] == 1.0
+
+    def test_gof_selects_within_gene(self):
+        pred = np.array([0.9, 0.1, 0.8, 0.2, 0.95, 0.05, 0.7, 0.2])
+        y = np.array([1, 0, 1, 0, 1, 0, 1, 0])
+        genes = ["a"] * 8
+        m = gof_metrics(pred, y, threshold=0.90, gene=genes)
+        assert m["selection"] == m["within_gene_auroc"]
+        assert m["caller_ready"] == 0.0  # only one gene
 
     def test_collapse_fail_needs_three_genes(self):
         assert not collapse_is_fail({"n_genes_scored": 1.0, "collapse_fraction": 1.0})
@@ -268,19 +299,40 @@ class TestTaskNet:
             b_out = net.forward_from_pooled(torch.zeros(b, d), torch.zeros(b, d), var_mean, var_max, torch.zeros_like(nuc))
         assert torch.allclose(a, b_out, atol=1e-6)
 
-    def test_mlof_ignores_length_features(self):
+    def test_mlof_uses_sites_not_pool(self):
         net = TaskNet(hidden_size=16, task="mlof", pool_strategy="mean_max")
         net.eval()
         torch.manual_seed(0)
         b, d = 2, 16
-        args = (torch.randn(b, d), torch.randn(b, d), torch.randn(b, d), torch.randn(b, d))
+        site_ref = torch.randn(b, 3, d)
+        site_var = torch.randn(b, 3, d)
         nuc = torch.zeros(b, 12)
         for i in LOF_LEAK_NUC_INDICES:
             nuc[:, i] = 1.0
         with torch.no_grad():
-            a = net.forward_from_pooled(*args, nuc)
-            b_out = net.forward_from_pooled(*args, torch.zeros_like(nuc))
+            a = net.forward_from_cache(
+                torch.randn(b, d), torch.randn(b, d), torch.randn(b, d), torch.randn(b, d),
+                nuc, site_ref=site_ref, site_var=site_var,
+            )
+            b_out = net.forward_from_cache(
+                torch.zeros(b, d), torch.zeros(b, d), torch.zeros(b, d), torch.zeros(b, d),
+                torch.zeros_like(nuc), site_ref=site_ref, site_var=site_var,
+            )
         assert torch.allclose(a, b_out, atol=1e-6)
+
+    def test_mlof_requires_sites(self):
+        net = TaskNet(hidden_size=16, task="mlof")
+        b, d = 2, 16
+        try:
+            net.forward_from_pooled(
+                torch.randn(b, d), torch.randn(b, d),
+                torch.randn(b, d), torch.randn(b, d),
+                torch.zeros(b, 12),
+            )
+        except ValueError as exc:
+            assert "site_ref" in str(exc)
+        else:
+            raise AssertionError("MLoF must refuse pooled-only forward")
 
 
 class TestLofTrainFilter:
@@ -331,6 +383,91 @@ class TestResidueSplit:
         assert parse_tasks(None) == ["lof", "mlof", "growth_gof", "amr_gof"]
         assert parse_tasks(["growth_gof"]) == ["growth_gof"]
         assert parse_tasks(["lof,growth_gof"]) == ["lof", "growth_gof"]
+
+
+class TestMlofNestedSplit:
+    def test_held_proteins_never_in_train(self):
+        ref = "M" + "A" * 40
+        pids, refs, vars_ = [], [], []
+        for prot in ("p0", "p1", "p2", "p3", "p4"):
+            for site in range(2, 12):
+                pids.append(prot)
+                refs.append(ref)
+                vars_.append(ref[:site] + "V" + ref[site + 1:])
+        splits = split_mlof_nested(pids, refs, vars_, seed=0, protein_test_frac=0.2)
+        held = {p for p, s in zip(pids, splits) if s == "protein_test"}
+        assert held
+        for p in held:
+            labels = {s for pid, s in zip(pids, splits) if pid == p}
+            assert labels == {"protein_test"}
+        assert "train" in splits and "test" in splits
+
+
+class TestSites:
+    def test_hamming_one(self):
+        ref = "MKTAA"
+        var = "MRTAA"
+        assert aligned_site_index(ref, var) == 1
+
+    def test_identity_is_zero(self):
+        assert aligned_site_index("MKT", "MKT") == 0
+
+    def test_length_change_unaligned(self):
+        assert aligned_site_index("MKTAA", "MKT") == -1
+
+    def test_gather_centre_token(self):
+        b, t, d = 1, 8, 4
+        hidden = torch.arange(b * t * d, dtype=torch.float32).reshape(b, t, d)
+        seqs = ["MKTAA"]
+        # residue 1 → token 2 (CLS + 0)
+        out = gather_site_windows(hidden, seqs, [1])
+        assert out.shape == (1, 3, d)
+        assert torch.equal(out[0, 1], hidden[0, 2])
+
+
+class TestDamageMap:
+    def test_monotone(self):
+        assert damage_from_z(-3.0) > damage_from_z(-1.0) > damage_from_z(0.0) > damage_from_z(2.0)
+
+    def test_display_bins(self):
+        assert display_bin(0.8) == 0.70
+        assert display_bin(0.45) == 0.40
+        assert display_bin(0.1) == 0.00
+
+
+class TestRankNet:
+    def test_orders_same_protein(self):
+        scores = torch.tensor([0.9, 0.1, 0.8, 0.2])
+        z = torch.tensor([-3.0, 0.0, -2.0, 0.1])
+        pids = ["a", "a", "b", "b"]
+        miss = torch.tensor([True, True, True, True])
+        loss = ranknet_loss(scores, z, pids, miss)
+        flipped = ranknet_loss(1.0 - scores, z, pids, miss)
+        assert float(loss) < float(flipped)
+
+    def test_empty_when_one_per_gene(self):
+        scores = torch.tensor([0.9, 0.1])
+        z = torch.tensor([-3.0, 0.0])
+        loss = ranknet_loss(scores, z, ["a", "b"], torch.tensor([True, True]))
+        assert float(loss) == 0.0
+
+
+class TestSiteCompare:
+    def test_shape(self):
+        cmp = SiteCompare(hidden_size=16)
+        out = cmp(torch.randn(3, 3, 16), torch.randn(3, 3, 16))
+        assert out.shape == (3, 16)
+
+
+class TestProteinGroupSampler:
+    def test_keeps_proteins_together(self):
+        pids = ["a"] * 20 + ["b"] * 20 + ["c"] * 20
+        sampler = ProteinGroupBatchSampler(pids, batch_size=16, n_proteins_per_batch=2, seed=0)
+        batches = list(sampler)
+        assert batches
+        for batch in batches:
+            prot = {pids[i] for i in batch}
+            assert len(prot) <= 4
 
 
 class TestEncoders:

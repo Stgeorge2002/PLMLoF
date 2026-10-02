@@ -9,5 +9,8 @@ training:
   early_stopping_patience: 5
   mixed_precision: "bf16"
   gof_threshold: 0.90
+  rank_loss_weight: 0.7
+  regression_loss_weight: 0.3
+  mlof_proteins_per_batch: 4
   ensemble_seeds: [0, 1, 2, 3, 4]
   seed: 42
