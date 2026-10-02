@@ -24,7 +24,6 @@ def save_gallery(
     protein_ids: list[str],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    # One row per unique protein_id (first occurrence).
     seen: dict[str, int] = {}
     keep = []
     for i, pid in enumerate(protein_ids):

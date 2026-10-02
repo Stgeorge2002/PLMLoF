@@ -27,8 +27,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/env.sh"
 cd "$PLMLOF_ROOT"
 
-if [[ ! -f plmlof/data/dataset.py ]]; then
-    echo "ERROR: plmlof/data/dataset.py is missing. Copy the full working tree, not a clone that omitted gitignored data/ paths." >&2
+if [[ ! -f plmlof/model.py ]]; then
+    echo "ERROR: plmlof/model.py is missing. Copy the full working tree." >&2
     exit 1
 fi
 
@@ -111,30 +111,29 @@ print(f"  matmul: OK  ({y.shape})")
 PY
 
 echo ""
-echo "ESM2-8M forward pass ..."
+echo "ESM2-8M forward pass + TaskNet ..."
 python - <<'PY'
 import torch
-from plmlof.models.plmlof_model import PLMLoFModel
-from plmlof.data.dataset import SyntheticPLMLoFDataset
-from plmlof.data.collator import PLMLoFCollator
-from torch.utils.data import DataLoader
+from transformers import AutoModel, AutoTokenizer
+from plmlof.model import TaskNet
 
 device = "cuda"
-model = PLMLoFModel(esm2_model_name="facebook/esm2_t6_8M_UR50D", freeze_esm2=True).to(device)
-dataset = SyntheticPLMLoFDataset(num_samples=4)
-collator = PLMLoFCollator(tokenizer_name="facebook/esm2_t6_8M_UR50D")
-loader = DataLoader(dataset, batch_size=2, collate_fn=collator)
-batch = next(iter(loader))
-batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+name = "facebook/esm2_t6_8M_UR50D"
+tok = AutoTokenizer.from_pretrained(name)
+enc = AutoModel.from_pretrained(name).to(device).eval()
+batch = tok(["MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQAPILSRVGDGTQDNLSGAEKAVQVKVKALPDAQFEVVHSLAKWKRQTLGQHDFSAGEGLYTHMKALRPDEDRLSPLHSVYVDQWDWELVMGDGERTFTSLPFF"], return_tensors="pt").to(device)
 with torch.no_grad():
-    logits = model(
-        ref_input_ids=batch["ref_input_ids"],
-        ref_attention_mask=batch["ref_attention_mask"],
-        var_input_ids=batch["var_input_ids"],
-        var_attention_mask=batch["var_attention_mask"],
-        nucleotide_features=batch["nucleotide_features"],
-    )
-print(f"  logits {tuple(logits.shape)}  preds={logits.argmax(-1).tolist()}")
+    hidden = enc(**batch).last_hidden_state
+print(f"  ESM2-8M hidden {tuple(hidden.shape)}")
+d = hidden.shape[-1]
+net = TaskNet(hidden_size=d, task="lof").to(device).eval()
+b = 2
+mean = torch.randn(b, d, device=device)
+mx = torch.randn(b, d, device=device)
+nuc = torch.zeros(b, 12, device=device)
+with torch.no_grad():
+    score = net.forward_from_pooled(mean, mx, mean, mx, nuc)
+print(f"  TaskNet LoF {tuple(score.shape)}")
 PY
 
 if [[ "$TINY" != true ]]; then

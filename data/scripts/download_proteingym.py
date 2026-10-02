@@ -1,8 +1,8 @@
-"""Download and process ProteinGym DMS benchmark data.
+"""Download and process ProteinGym DMS substitution scores.
 
-ProteinGym provides Deep Mutational Scanning (DMS) datasets with fitness scores.
-We filter for bacterial protein assays and threshold fitness scores into
-LoF / WT / GoF classes.
+Writes:
+  data/processed/proteingym_substitutions.parquet  — every v1.3 assay (MLoF)
+  data/processed/proteingym_bacterial.parquet      — taxon == Prokaryote (GoF)
 
 Source: https://proteingym.org/
 GitHub: https://github.com/OATML-Markslab/ProteinGym
@@ -19,6 +19,7 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen, Request
 
+import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -255,27 +256,35 @@ def download_proteingym_scores(output_dir: Path = OUTPUT_DIR) -> Path:
     return extract_dir
 
 
-def filter_bacterial_assays(ref_path: Path) -> pd.DataFrame:
-    """Keep every ProteinGym substitution assay with taxon == Prokaryote.
-
-    ProteinGym does not have a 'Bacteria' taxon. Prokaryote is the official
-    label for bacterial (and a few archaeal) DMS assays.
-    """
+def load_reference_assays(ref_path: Path) -> pd.DataFrame:
+    """Load the ProteinGym substitution assay catalogue (all taxa)."""
     if not ref_path.exists() or ref_path.stat().st_size < 100:
         logger.warning("ProteinGym reference file empty or missing.")
         return pd.DataFrame()
 
     df = pd.read_csv(ref_path)
     if "taxon" not in df.columns:
-        logger.error("Reference file has no 'taxon' column; cannot select Prokaryote assays.")
+        logger.error("Reference file has no 'taxon' column.")
         return pd.DataFrame()
 
-    logger.info(f"ProteinGym reference contains {len(df)} assays")
-    logger.info(f"Taxon counts:\n{df['taxon'].astype(str).str.strip().value_counts().to_string()}")
+    logger.info("ProteinGym reference contains %s assays", len(df))
+    logger.info("Taxon counts:\n%s", df["taxon"].astype(str).str.strip().value_counts().to_string())
+    if "coarse_selection_type" in df.columns:
+        logger.info(
+            "Selection type:\n%s",
+            df["coarse_selection_type"].astype(str).str.strip().value_counts().to_string(),
+        )
+    return df
 
+
+def filter_bacterial_assays(ref_path: Path) -> pd.DataFrame:
+    """Keep every ProteinGym substitution assay with taxon == Prokaryote."""
+    df = load_reference_assays(ref_path)
+    if df.empty:
+        return df
     prokaryote = df["taxon"].astype(str).str.strip().str.lower() == "prokaryote"
     bacterial_df = df.loc[prokaryote].copy()
-    logger.info(f"Keeping {len(bacterial_df)} Prokaryote assays")
+    logger.info("Prokaryote assays: %s", len(bacterial_df))
     if "source_organism" in bacterial_df.columns:
         logger.info(
             "Organisms:\n"
@@ -284,30 +293,21 @@ def filter_bacterial_assays(ref_path: Path) -> pd.DataFrame:
     return bacterial_df
 
 
-def process_dms_scores(
-    scores_dir: Path,
-    bacterial_assays: pd.DataFrame,
-    lof_threshold: float = 1.0,
-    gof_threshold: float = 1.0,
-) -> pd.DataFrame:
-    """Load individual DMS score files and threshold into LoF/WT/GoF.
-
-    Returns DataFrame with ref_protein, var_protein, label, gene, species, source.
-    """
-    records = []
-
-    wanted_names = set()
-    if "DMS_filename" in bacterial_assays.columns:
-        wanted_names = set(bacterial_assays["DMS_filename"].dropna().astype(str))
-    wanted_ids = set()
-    if "DMS_id" in bacterial_assays.columns:
-        wanted_ids = set(bacterial_assays["DMS_id"].dropna().astype(str))
-
-    ref_seqs: dict[str, str] = {}
-    organism_by_key: dict[str, str] = {}
-    for _, row in bacterial_assays.iterrows():
+def _assay_meta(assays: pd.DataFrame) -> tuple[set[str], dict[str, dict]]:
+    """Map DMS_id / filename / stem → reference sequence and phenotype tags."""
+    wanted: set[str] = set()
+    meta: dict[str, dict] = {}
+    for _, row in assays.iterrows():
         seq = row.get("target_seq", "")
         org = str(row.get("source_organism") or "").strip()
+        taxon = str(row.get("taxon") or "").strip()
+        coarse = str(row.get("coarse_selection_type") or "").strip()
+        rec = {
+            "seq": seq if isinstance(seq, str) else "",
+            "organism": org,
+            "taxon": taxon,
+            "coarse": coarse,
+        }
         keys = [row.get("DMS_id"), row.get("DMS_filename")]
         if isinstance(row.get("DMS_filename"), str):
             keys.append(Path(row["DMS_filename"]).stem)
@@ -315,112 +315,107 @@ def process_dms_scores(
             if not key or (isinstance(key, float) and pd.isna(key)):
                 continue
             key_s = str(key)
-            if isinstance(seq, str) and len(seq) > 10:
-                ref_seqs[key_s] = seq
-            if org:
-                organism_by_key[key_s] = org
+            wanted.add(key_s)
+            wanted.add(Path(key_s).stem)
+            meta[key_s] = rec
+            meta[Path(key_s).stem] = rec
+    return wanted, meta
 
-    wanted_stems = {Path(n).stem for n in wanted_names} | wanted_ids
 
+def process_dms_scores(
+    scores_dir: Path,
+    assays: pd.DataFrame,
+    lof_threshold: float = 1.0,
+    gof_threshold: float = 1.0,
+) -> pd.DataFrame:
+    """Load DMS CSVs listed in `assays` and attach per-assay z-scores.
+
+    One row per (assay, mutant). Same protein measured in several assays is
+    kept — MLoF averages z later. Does not globally collapse TEM-like duplicates.
+    """
+    wanted, meta = _assay_meta(assays)
     score_files = list(scores_dir.rglob("*.csv"))
-    logger.info(f"Found {len(score_files)} score files in {scores_dir}")
+    logger.info("Found %s score files in %s", len(score_files), scores_dir)
 
+    chunks: list[pd.DataFrame] = []
     n_matched = 0
     for csv_path in score_files:
         stem = csv_path.stem
-        if csv_path.name not in wanted_names and stem not in wanted_stems:
+        rec = meta.get(stem) or meta.get(csv_path.name)
+        if rec is None and csv_path.name not in wanted and stem not in wanted:
             continue
         n_matched += 1
+        if rec is None:
+            rec = {"seq": "", "organism": "", "taxon": "", "coarse": ""}
 
         try:
             df = pd.read_csv(csv_path)
         except Exception:
             continue
-
         if df.empty:
             continue
 
-        # Find fitness score column
-        score_col = None
-        for candidate in ["DMS_score", "score", "fitness", "DMS_score_bin"]:
-            if candidate in df.columns:
-                score_col = candidate
-                break
-        if score_col is None:
+        score_col = next((c for c in ("DMS_score", "score", "fitness", "DMS_score_bin") if c in df.columns), None)
+        mut_col = next((c for c in ("mutant", "mutation", "mutated_sequence") if c in df.columns), None)
+        if score_col is None or mut_col is None:
             continue
 
-        # Find mutation column
-        mut_col = None
-        for candidate in ["mutant", "mutation", "mutated_sequence"]:
-            if candidate in df.columns:
-                mut_col = candidate
-                break
-        if mut_col is None:
-            continue
-
-        # Get reference sequence
-        ref_protein = ref_seqs.get(stem, "") or ref_seqs.get(csv_path.name, "")
+        ref_protein = rec["seq"] if len(rec["seq"]) > 10 else ""
         if not ref_protein and "mutated_sequence" in df.columns:
-            # Try to infer from wildtype rows
             wt_mask = df[score_col].between(-0.1, 0.1)
             if wt_mask.any():
                 ref_protein = str(df.loc[wt_mask.idxmax(), "mutated_sequence"])
-
         if not ref_protein:
             continue
 
-        # Z-score threshold
-        scores = df[score_col].dropna()
-        if scores.empty:
+        numeric = pd.to_numeric(df[score_col], errors="coerce")
+        keep = numeric.notna()
+        if not keep.any():
             continue
-        mean, std = scores.mean(), scores.std()
+        scores = numeric[keep]
+        mean, std = float(scores.mean()), float(scores.std())
         if std == 0:
             std = 1.0
+        z = (numeric - mean) / std
 
-        for _, row in df.iterrows():
-            score = row.get(score_col)
-            if pd.isna(score):
-                continue
+        if "mutated_sequence" in df.columns:
+            var_protein = df["mutated_sequence"].astype(str)
+        else:
+            var_protein = df[mut_col].astype(str).map(
+                lambda m, ref=ref_protein: _apply_mutation_string(ref, m)
+            )
 
-            z = (score - mean) / std
-            if z < -lof_threshold:
-                label = 0  # LoF
-            elif z > gof_threshold:
-                label = 2  # GoF
-            else:
-                label = 1  # WT
+        coarse = rec["coarse"]
+        organism = rec["organism"] or _guess_species(stem)
+        label = np.where(z < -lof_threshold, 0, np.where(z > gof_threshold, 2, 1))
+        chunk = pd.DataFrame({
+            "gene": stem,
+            "species": organism,
+            "taxon": rec["taxon"],
+            "coarse_selection_type": coarse,
+            "ref_protein": ref_protein,
+            "var_protein": var_protein,
+            "ref_dna": "",
+            "var_dna": "",
+            "label": label,
+            "dms_score": numeric,
+            "dms_zscore": z,
+            "source": f"ProteinGym_{coarse}" if coarse else "ProteinGym",
+        })
+        chunk = chunk.loc[keep & chunk["var_protein"].ne("") & chunk["var_protein"].ne(ref_protein)]
+        if not chunk.empty:
+            chunks.append(chunk)
 
-            # Build variant protein
-            mut_str = str(row.get(mut_col, ""))
-            if "mutated_sequence" in df.columns and isinstance(row.get("mutated_sequence"), str):
-                var_protein = row["mutated_sequence"]
-            else:
-                var_protein = _apply_mutation_string(ref_protein, mut_str)
-
-            if var_protein and var_protein != ref_protein:
-                records.append({
-                    "gene": stem,
-                    "species": organism_by_key.get(stem) or organism_by_key.get(csv_path.name) or _guess_species(stem),
-                    "ref_protein": ref_protein,
-                    "var_protein": var_protein,
-                    "ref_dna": "",
-                    "var_dna": "",
-                    "label": label,
-                    "dms_score": float(score),
-                    "dms_zscore": float(z),
-                    "source": "ProteinGym",
-                })
-
-    logger.info(f"Matched {n_matched} Prokaryote assay CSV files")
-
-    df_out = pd.DataFrame(records)
-    if not df_out.empty:
-        df_out = df_out.drop_duplicates(subset=["ref_protein", "var_protein"])
-        label_counts = df_out["label"].value_counts()
-        logger.info(
-            f"ProteinGym: LoF={label_counts.get(0, 0)}, "
-            f"WT={label_counts.get(1, 0)}, GoF={label_counts.get(2, 0)}"
-        )
+    logger.info("Matched %s assay CSV files", n_matched)
+    if not chunks:
+        return pd.DataFrame()
+    df_out = pd.concat(chunks, ignore_index=True)
+    logger.info(
+        "ProteinGym substitutions: %s variants, %s assays, taxa=\n%s",
+        len(df_out),
+        df_out["gene"].nunique(),
+        df_out["taxon"].value_counts().to_string() if "taxon" in df_out.columns else "(none)",
+    )
     return df_out
 
 
@@ -514,15 +509,15 @@ def main():
     logging.basicConfig(level=logging.INFO)
 
     ref_path = download_proteingym_reference()
-    bacterial = filter_bacterial_assays(ref_path)
+    assays = load_reference_assays(ref_path)
+    if assays.empty:
+        logger.error("No ProteinGym reference assays.")
+        sys.exit(1)
 
+    scores_dir = download_proteingym_scores()
     result_df = pd.DataFrame()
-
-    # Try downloading and processing actual DMS scores
-    if not bacterial.empty:
-        scores_dir = download_proteingym_scores()
-        if scores_dir.exists() and any(scores_dir.rglob("*.csv")):
-            result_df = process_dms_scores(scores_dir, bacterial)
+    if scores_dir.exists() and any(scores_dir.rglob("*.csv")):
+        result_df = process_dms_scores(scores_dir, assays)
 
     if result_df.empty or (
         "source" in result_df.columns and (result_df["source"] == "ProteinGym_curated").all()
@@ -530,12 +525,19 @@ def main():
         logger.error("No real ProteinGym DMS rows. Refusing TEM-1 fallback.")
         sys.exit(1)
 
-    logger.info(f"Processed {len(result_df)} variants from ProteinGym DMS data")
+    logger.info("Processed %s variants from ProteinGym DMS data", len(result_df))
 
-    out_path = Path("data/processed/proteingym_bacterial.parquet")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    result_df.to_parquet(out_path, index=False)
-    logger.info(f"Saved {len(result_df)} records to {out_path}")
+    out_dir = Path("data/processed")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    all_path = out_dir / "proteingym_substitutions.parquet"
+    result_df.to_parquet(all_path, index=False)
+    logger.info("Saved %s records to %s", len(result_df), all_path)
+
+    taxon = result_df["taxon"].astype(str).str.strip().str.lower()
+    bacterial = result_df.loc[taxon.eq("prokaryote")].copy()
+    bact_path = out_dir / "proteingym_bacterial.parquet"
+    bacterial.to_parquet(bact_path, index=False)
+    logger.info("Saved %s Prokaryote records to %s", len(bacterial), bact_path)
 
 
 if __name__ == "__main__":

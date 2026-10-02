@@ -12,8 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+from plmlof.gbff import AA, MAX_AA
 from plmlof.utils.sequence_utils import translate_dna
-from plmlof.v2.gbff import AA, MAX_AA
 
 # 1-based protein coordinates. Priors are labels, not biology.
 PRIOR_SURE = 1.00
@@ -149,7 +149,6 @@ def lof_prior(
             return PRIOR_SURE, "in_domain"
         return PRIOR_DOMAIN_DROP, "in_domain"
 
-    # in-frame indel
     if domains:
         last_end = last_domain_end(domains)
         first_start = first_domain_start(domains)

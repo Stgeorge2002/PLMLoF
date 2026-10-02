@@ -54,14 +54,11 @@ export PLMLOF_SCRATCH="${PLMLOF_SCRATCH:-${SCRATCHDIR}/plmlof}"
 
 export PLMLOF_DATA_DIR="${PLMLOF_DATA_DIR:-${PLMLOF_ROOT}/data/processed}"
 export PLMLOF_EMB_DIR="${PLMLOF_EMB_DIR:-${PLMLOF_SCRATCH}/embeddings}"
-export PLMLOF_OUTPUT_DIR="${PLMLOF_OUTPUT_DIR:-${PLMLOF_ROOT}/outputs/production}"
+export PLMLOF_OUTPUT_DIR="${PLMLOF_OUTPUT_DIR:-${PLMLOF_ROOT}/outputs}"
 export PLMLOF_LOG_DIR="${PLMLOF_LOG_DIR:-${PLMLOF_SCRATCH}/logs}"
 
-export PLMLOF_TRAIN_CFG="${PLMLOF_TRAIN_CFG:-${PLMLOF_ROOT}/configs/v2_training.yaml}"
-export PLMLOF_MODEL_CFG="${PLMLOF_MODEL_CFG:-${PLMLOF_ROOT}/configs/v2_model.yaml}"
-export PLMLOF_V2_DATA_DIR="${PLMLOF_V2_DATA_DIR:-${PLMLOF_ROOT}/data/processed/v2}"
-export PLMLOF_V2_EMB_DIR="${PLMLOF_V2_EMB_DIR:-${PLMLOF_EMB_DIR}/v2}"
-export PLMLOF_V2_OUTPUT_DIR="${PLMLOF_V2_OUTPUT_DIR:-${PLMLOF_ROOT}/outputs/v2}"
+export PLMLOF_TRAIN_CFG="${PLMLOF_TRAIN_CFG:-${PLMLOF_ROOT}/configs/training.yaml}"
+export PLMLOF_MODEL_CFG="${PLMLOF_MODEL_CFG:-${PLMLOF_ROOT}/configs/model.yaml}"
 
 # HuggingFace / Torch / pip / uv / inductor — never ~/.cache
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${PLMLOF_CACHE}/xdg}"

@@ -1,7 +1,0 @@
-# v2 model (frozen ESM2 + independent task heads)
-model:
-  esm2_model_name: "facebook/esm2_t33_650M_UR50D"
-  pool_strategy: "mean_max"
-  use_cross_attention: false
-  head_hidden: 128
-  dropout: 0.2

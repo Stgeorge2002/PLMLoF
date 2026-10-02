@@ -1,4 +1,4 @@
-# PLMLoF v2
+# PLMLoF
 
 Bacterial **LoF score** for protein alleles (FASTA in), plus two rare flags (growth-fitness, resistance SNP). Not a 3-class LoF/WT/GoF softmax. Not Snippy. Not genome-wide GoF.
 
@@ -13,21 +13,21 @@ Clear wrecks (stop / frameshift / large indel) are a **rule**. HMMER grades how 
 From the repo root (needs `pandas`, `pyarrow`, `biopython`; GPU is not required):
 
 ```bash
-bash scripts/prepare_v2_local.sh
+bash scripts/prepare_local.sh
 ```
 
 This:
 
-1. Downloads ProteinGym Prokaryote → `data/processed/proteingym_bacterial.parquet`
+1. Downloads ProteinGym substitutions → `data/processed/proteingym_substitutions.parquet`
 2. Builds CARD/OF GoF source → `data/processed/gof_growth_amr.parquet`
 3. Downloads ~150 complete bacterial GBFFs and writes synthetic wrecks → `data/processed/synthetic_lof.parquet`
-4. Writes **protein-held-out / species-held-out / family-held-out** tables under `data/processed/v2/`
+4. Writes **protein-held-out / residue-held-out / family-held-out** tables under `data/processed/{lof,mlof,growth_gof,amr_gof}/`
 
 To grade synthetic wrecks with Pfam coordinates (~1 GB HMM download, needs `pyhmmer` or `hmmscan`):
 
 ```bash
 pip install pyhmmer
-bash scripts/prepare_v2_local.sh --with-pfam
+bash scripts/prepare_local.sh --with-pfam
 ```
 
 Without Pfam, the last 10% of each ORF is the tail proxy so C-terminal nonsense is not labelled `lof_score = 1.0`. Delete `data/processed/synthetic_lof.parquet` to rebuild after adding a domain map.
@@ -35,18 +35,18 @@ Without Pfam, the last 10% of each ORF is the tail proxy so C-terminal nonsense 
 If GBFFs already exist:
 
 ```bash
-bash scripts/prepare_v2_local.sh --gbff-dir /path/to/gbff
+bash scripts/prepare_local.sh --gbff-dir /path/to/gbff
 # or skip genome download+synthetic:
-bash scripts/prepare_v2_local.sh --skip-genomes
+bash scripts/prepare_local.sh --skip-genomes
 ```
 
 Copy tables to the cluster (parquet is gitignored):
 
 ```bash
-rsync -avP data/processed/v2/ HOST:/projects/b6bh/tbea20.b6bh/PLMLoF/data/processed/v2/
+rsync -avP data/processed/{lof,mlof,growth_gof,amr_gof} HOST:/projects/b6bh/tbea20.b6bh/PLMLoF/data/processed/
 ```
 
-Do **not** run `prepare_v2_local.sh` on an Isambard login node.
+Do **not** run `prepare_local.sh` on an Isambard login node.
 
 ---
 
@@ -60,19 +60,19 @@ git clone https://github.com/Stgeorge2002/PLMLoF.git
 cd PLMLoF
 ```
 
-Cheap GPU check (ESM2-8M only, no v2 data, ≤ ~0.08 NHR):
+Cheap GPU check (ESM2-8M + TaskNet, no training data, ≤ ~0.08 NHR):
 
 ```bash
 bash isambard/submit.sh smoke
 ```
 
-Full venv + ESM2-650M (after smoke):
+Full venv + ESM2-35M (LoF) + ESM2-650M (MLoF/GoF):
 
 ```bash
 bash isambard/submit.sh setup
 ```
 
-v2 pipeline (1 GH200, up to 24 h). **Fails immediately if `data/processed/v2/` is missing** — it will not download ProteinGym.
+Pipeline (1 GH200, up to 24 h). **Fails immediately if `data/processed/lof/` is missing** — it will not download ProteinGym.
 
 ```bash
 bash isambard/submit.sh pipeline
@@ -83,7 +83,7 @@ tail -f "$SCRATCHDIR/plmlof/logs/"plmlof-pipeline-*.out
 Checkpoints:
 
 ```text
-$PLMLOF_ROOT/outputs/v2/{lof,growth_gof,amr_gof}/seed*/checkpoints/model_best.pt
+$PLMLOF_ROOT/outputs/{lof,mlof,growth_gof,amr_gof}/seed*/checkpoints/model_best.pt
 ```
 
 Other job flags:
@@ -108,20 +108,26 @@ srun --nodes=1 --gpus=1 --time=01:00:00 --pty bash --login
 source isambard/env.sh
 source "$PLMLOF_VENV/bin/activate"
 python scripts/predict.py \
-  --model "$PLMLOF_V2_OUTPUT_DIR" \
+  --model "$PLMLOF_OUTPUT_DIR" \
   --reference ref.fasta \
   --variants var.fasta \
   --output predictions.tsv \
   --device cuda
 ```
 
-Columns include `lof_score`, `lof_sd`, `lof_p`, `lof_q`, `in_family`, wreck flags, and growth/AMR GoF probabilities + calls.
+Alignment-free LoF (no reference pair; loads ESM2-35M only):
+
+```bash
+python scripts/predict.py --model "$PLMLOF_OUTPUT_DIR" --proteins alleles.faa --device cuda
+```
+
+Columns include `lof_score`, `lof_sd`, `lof_p`, `lof_q`, `mlof_score`, `in_family`, wreck flags, and growth/AMR GoF probabilities + calls.
 
 Held-out Dewachter exam (never in training):
 
 ```bash
 python scripts/evaluate_dewachter.py \
-  --model-dir "$PLMLOF_V2_OUTPUT_DIR" \
+  --model-dir "$PLMLOF_OUTPUT_DIR" \
   --reference /path/to/dewachter/ref.fasta \
   --variants  /path/to/dewachter/var.fasta \
   --scores    /path/to/dewachter/labels.tsv \
@@ -130,15 +136,16 @@ python scripts/evaluate_dewachter.py \
 
 ---
 
-## 4. What the three heads are
+## 4. Heads
 
-| Head | Target | Call |
-|------|--------|------|
-| LoF | `lof_score` ∈ [0, 1] (early/in-domain wrecks=1, in-domain missense=0.7, tail wreck≈0.4, WT=0) | daily score |
-| Growth GoF | P(z ≥ +2 on OrganismalFitness growth) | only if p≥0.90 **and** in-family **and** empirical p<0.05 |
-| AMR GoF | P(CARD-like resistance SNP) | same conservative rule |
+| Head | Encoder | Target | Call |
+|------|---------|--------|------|
+| LoF | ESM2-35M | `lof_score` ∈ [0, 1] (early/in-domain wrecks=1, in-domain missense=0.7, tail wreck≈0.4, WT=0) | daily score |
+| MLoF | ESM2-650M | missense-damage rank on all ProteinGym substitution genes | score, not a wreck caller |
+| Growth GoF | ESM2-650M | P(z ≥ +2 on OrganismalFitness growth) | only if p≥0.90 **and** in-family **and** empirical p<0.05 |
+| AMR GoF | ESM2-650M | P(CARD-like resistance SNP) | same conservative rule |
 
-GB1 binding and Tsuboyama stability are **not** training labels.
+GB1 binding and Tsuboyama stability are **not** GoF training labels; they are MLoF missense-damage signal.
 
 ---
 

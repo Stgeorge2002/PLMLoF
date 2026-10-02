@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Prepare PLMLoF v2 training tables on a LAPTOP (or any machine with network).
+# Prepare PLMLoF training tables on a LAPTOP (or any machine with network).
 # Do not run this on an Isambard login node. Do not run it inside the GPU pipeline.
 #
 # Usage (from repo root):
-#   bash scripts/prepare_v2_local.sh
-#   bash scripts/prepare_v2_local.sh --skip-genomes   # if GBFFs / synthetic already exist
-#   bash scripts/prepare_v2_local.sh --gbff-dir /path/to/gbff
-#   bash scripts/prepare_v2_local.sh --with-pfam      # download Pfam-A and grade wrecks by domain
+#   bash scripts/prepare_local.sh
+#   bash scripts/prepare_local.sh --skip-genomes   # if GBFFs / synthetic already exist
+#   bash scripts/prepare_local.sh --gbff-dir /path/to/gbff
+#   bash scripts/prepare_local.sh --with-pfam      # download Pfam-A and grade wrecks by domain
+#   bash scripts/prepare_local.sh --skip-genomes --tasks growth_gof
 #
-# Then copy data/processed/v2/ (and optionally data/processed/*.parquet sources)
-# to the cluster clone:
-#   rsync -avP data/processed/v2/ HOST:/projects/b6bh/$USER/PLMLoF/data/processed/v2/
+# Then copy task tables to the cluster clone:
+#   rsync -avP data/processed/{lof,mlof,growth_gof,amr_gof} HOST:/projects/b6bh/$USER/PLMLoF/data/processed/
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -23,6 +23,7 @@ HMM_PATH="${ROOT}/data/raw/pfam/Pfam-A.hmm.gz"
 DOMAINS_PATH="${ROOT}/data/processed/pfam_domains.parquet"
 N_GENOMES=150
 CPUS="${CPUS:-20}"
+TABLE_TASKS=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -32,6 +33,7 @@ while [[ $# -gt 0 ]]; do
         --hmm) HMM_PATH="$2"; shift 2 ;;
         --n-genomes) N_GENOMES="$2"; shift 2 ;;
         --cpus) CPUS="$2"; shift 2 ;;
+        --tasks) TABLE_TASKS="$2"; shift 2 ;;
         *) echo "Unknown arg: $1" >&2; exit 1 ;;
     esac
 done
@@ -45,8 +47,8 @@ fi
 
 mkdir -p data/raw/proteingym data/processed data/raw/refseq_gbff data/raw/pfam
 
-echo "=== 1/5 ProteinGym Prokaryote parquet (laptop download) ==="
-if [[ -f data/processed/proteingym_bacterial.parquet ]]; then
+echo "=== 1/5 ProteinGym substitutions parquet (all taxa, laptop download) ==="
+if [[ -f data/processed/proteingym_substitutions.parquet ]]; then
     echo "  exists, skipping download_proteingym.py"
 else
     "$PYTHON" data/scripts/download_proteingym.py
@@ -104,9 +106,14 @@ else
     "$PYTHON" data/scripts/generate_synthetic_lof.py "${GEN_ARGS[@]}"
 fi
 
-echo "=== 5/5 Build v2 train/val/test/null tables ==="
-"$PYTHON" data/scripts/build_v2_tables.py --processed data/processed --out data/processed/v2
+echo "=== 5/5 Build train/val/test/null tables ==="
+TABLE_ARGS=(--processed data/processed --out data/processed)
+if [[ -n "$TABLE_TASKS" ]]; then
+    # shellcheck disable=SC2206
+    TABLE_ARGS+=(--tasks $TABLE_TASKS)
+fi
+"$PYTHON" data/scripts/build_tables.py "${TABLE_ARGS[@]}"
 
 echo ""
-echo "Local tables are in data/processed/v2/{lof,growth_gof,amr_gof}/"
-echo "Copy that directory to Isambard, then:  bash isambard/submit.sh pipeline"
+echo "Local tables are in data/processed/{lof,mlof,growth_gof,amr_gof}/"
+echo "Copy those directories to Isambard, then:  bash isambard/submit.sh pipeline"

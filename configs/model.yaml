@@ -1,29 +1,10 @@
-# Model architecture configuration
+# Frozen ESM2 + independent task heads.
+# LoF wreck scanner: 35M (speed + coarse domain geometry).
+# MLoF / GoF: 650M (missense and rare-gain ranking).
 model:
-  # ESM2 backbone
-  esm2_model_name: "facebook/esm2_t33_650M_UR50D"  # Production
-  esm2_model_name_tiny: "facebook/esm2_t6_8M_UR50D"  # Testing / CPU
-
-  # LoRA configuration
-  lora:
-    enabled: true
-    rank: 16
-    alpha: 32
-    dropout: 0.1
-    target_modules: ["query", "value"]
-
-  # Comparison module
-  comparison:
-    use_cross_attention: false  # Enable for Phase 5
-    pool_strategy: "mean_max"  # mean_max | cls | attention
-
-  # Classifier head
-  classifier:
-    hidden_dims: [256, 64]
-    dropout: 0.3
-    num_classes: 3  # LoF=0, WT=1, GoF=2
-    label_smoothing: 0.05
-
-  # Nucleotide features
-  nucleotide_features:
-    num_features: 12
+  esm2_model_name: "facebook/esm2_t33_650M_UR50D"
+  esm2_model_name_lof: "facebook/esm2_t12_35M_UR50D"
+  pool_strategy: "mean_max"
+  use_cross_attention: false
+  head_hidden: 128
+  dropout: 0.2

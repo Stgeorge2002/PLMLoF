@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from plmlof.v2 import LOF_STRONG, LOF_WEAK, LOF_WRECK, LOF_WT
-from plmlof.v2.domains import (
+from plmlof.constants import LOF_STRONG, LOF_WEAK, LOF_WRECK, LOF_WT
+from plmlof.domains import (
     PRIOR_DOMAIN_DROP,
     PRIOR_EXTRA_MISSENSE,
     PRIOR_INDOMAIN_MISSENSE,
@@ -14,7 +14,7 @@ from plmlof.v2.domains import (
     SURE_MIN,
     lof_prior,
 )
-from plmlof.v2.wreck import first_affected_residue, wreck_call, wreck_grade
+from plmlof.wreck import first_affected_residue, wreck_call, wreck_grade
 
 Z_STRONG = -2.0
 Z_WEAK = -1.0
@@ -36,11 +36,17 @@ INDOMAIN_MISSENSE_TYPES = {"missense_in_domain", "heavy_missense"}
 EXTRA_MISSENSE_TYPES = {"missense_extra_domain"}
 
 
-def lof_score_from_z(z: float | None, *, is_wreck: bool = False) -> float | None:
-    """Map a growth-DMS z-score (and optional wreck flag) to lof_score.
+def lof_score_from_z(
+    z: float | None,
+    *,
+    is_wreck: bool = False,
+    drop_gain: bool = True,
+) -> float | None:
+    """Map a DMS z-score (and optional wreck flag) to lof_score.
 
-    Returns None when the row is an upper-tail GoF (z > +1) and must not
-    enter the LoF table.
+    Per-assay z: low fitness → damage. When drop_gain is True (GoF tables),
+    z > +1 is excluded. When False (MLoF missense-damage ranker), the
+    beneficial tail is WT (not damaged).
     """
     if is_wreck:
         return LOF_WRECK
@@ -53,7 +59,7 @@ def lof_score_from_z(z: float | None, *, is_wreck: bool = False) -> float | None
     if abs(z) <= Z_WT:
         return LOF_WT
     if z > Z_GOF_LOOSE:
-        return None
+        return None if drop_gain else LOF_WT
     return LOF_WT
 
 

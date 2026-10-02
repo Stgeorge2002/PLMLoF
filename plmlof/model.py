@@ -1,16 +1,17 @@
-"""Frozen-ESM comparison + task head for LoF regression or binary GoF."""
+"""Task nets: alignment-free LoF, pairwise MLoF, conservative GoF."""
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 
-from plmlof.data.features import NUM_NUCLEOTIDE_FEATURES
+from plmlof.constants import REGRESSION_TASKS, TASKS
+from plmlof.data.features import LOF_LEAK_NUC_INDICES, NUM_NUCLEOTIDE_FEATURES
 from plmlof.models.comparison import ComparisonModule
 
 
 class LofScoreHead(nn.Module):
-    """Scalar LoF score in [0, 1]."""
+    """Scalar score in [0, 1]."""
 
     def __init__(self, input_size: int, hidden_dim: int = 128, dropout: float = 0.2):
         super().__init__()
@@ -47,11 +48,13 @@ class BinaryLogitHead(nn.Module):
         return self.mlp(features).squeeze(-1)
 
 
-class V2TaskNet(nn.Module):
-    """Comparison module + engineered-feature norm + task head.
+class TaskNet(nn.Module):
+    """One head per task.
 
-    Independent copies are trained per task so wreck length features cannot
-    poison a GoF caller.
+    ``lof`` is alignment-free: it scores a single protein (the isolate allele)
+    from pooled ESM2. No ref, no pair features, no MSA.
+
+    ``mlof`` / GoF compare ref vs var so wreck length cannot leak into those heads.
     """
 
     def __init__(
@@ -67,9 +70,20 @@ class V2TaskNet(nn.Module):
         num_nuc_features: int = NUM_NUCLEOTIDE_FEATURES,
     ):
         super().__init__()
-        if task not in {"lof", "growth_gof", "amr_gof"}:
-            raise ValueError(f"Unknown v2 task: {task}")
+        if task not in TASKS:
+            raise ValueError(f"Unknown task: {task}")
         self.task = task
+        self.hidden_size = hidden_size
+        self.alignment_free = task == "lof"
+        self.comparison: ComparisonModule | None = None
+        self.feature_norm: nn.LayerNorm | None = None
+        self.seq_norm: nn.LayerNorm | None = None
+
+        if self.alignment_free:
+            self.seq_norm = nn.LayerNorm(hidden_size * 2)
+            self.head = LofScoreHead(hidden_size * 2, hidden_dim=head_hidden, dropout=dropout)
+            return
+
         self.comparison = ComparisonModule(
             hidden_size=hidden_size,
             pool_strategy=pool_strategy,
@@ -79,7 +93,7 @@ class V2TaskNet(nn.Module):
         )
         self.feature_norm = nn.LayerNorm(num_nuc_features)
         input_size = self.comparison.output_size + num_nuc_features
-        if task == "lof":
+        if task == "mlof":
             self.head = LofScoreHead(input_size, hidden_dim=head_hidden, dropout=dropout)
         else:
             self.head = BinaryLogitHead(input_size, hidden_dim=head_hidden, dropout=dropout)
@@ -92,13 +106,17 @@ class V2TaskNet(nn.Module):
         var_max: torch.Tensor,
         nucleotide_features: torch.Tensor,
     ) -> torch.Tensor:
+        if self.alignment_free:
+            return self.head(self.seq_norm(torch.cat([var_mean, var_max], dim=-1)))
         comparison = self.comparison.compare_pooled(ref_mean, ref_max, var_mean, var_max)
-        nuc = self.feature_norm(nucleotide_features)
-        features = torch.cat([comparison, nuc], dim=-1)
-        return self.head(features)
+        nuc = nucleotide_features
+        if self.task == "mlof":
+            nuc = nucleotide_features.clone()
+            nuc[..., list(LOF_LEAK_NUC_INDICES)] = 0
+        nuc = self.feature_norm(nuc)
+        return self.head(torch.cat([comparison, nuc], dim=-1))
 
     def probability(self, raw: torch.Tensor) -> torch.Tensor:
-        """Map head output to a [0, 1] measure (LoF score or GoF probability)."""
-        if self.task == "lof":
+        if self.task in REGRESSION_TASKS:
             return raw
         return torch.sigmoid(raw)

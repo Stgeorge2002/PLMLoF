@@ -1,5 +1,5 @@
 #!/bin/bash
-# Cheap GPU check: ESM2-8M + a few synthetic samples. No ProteinGym, no 650M.
+# Cheap GPU check: ESM2-8M forward + TaskNet. No ProteinGym, no 650M.
 # Hard cap 20 min so this cannot hold a GH200 for a long allocation.
 # Max bill: 20 min × 0.25 NHR/h ≈ 0.083 NHR (usually much less if it finishes early).
 
@@ -20,3 +20,4 @@ if [[ ! -x "${PLMLOF_VENV}/bin/python" ]] \
 fi
 
 bash isambard/pipeline.sh --smoke
+

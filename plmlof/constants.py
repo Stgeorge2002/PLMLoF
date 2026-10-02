@@ -1,8 +1,9 @@
-"""PLMLoF v2: graded LoF score plus two conservative GoF flags."""
+"""Task names and score constants."""
 
 from __future__ import annotations
 
-TASKS = ("lof", "growth_gof", "amr_gof")
+TASKS = ("lof", "mlof", "growth_gof", "amr_gof")
+REGRESSION_TASKS = frozenset({"lof", "mlof"})
 
 LOF_WRECK = 1.00
 LOF_STRONG = 0.70

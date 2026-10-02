@@ -1,4 +1,4 @@
-"""Stage-1 trainer for a single v2 task head on cached ESM2 embeddings."""
+"""Trainer for a single task head on cached ESM2 embeddings."""
 
 from __future__ import annotations
 
@@ -13,16 +13,17 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from plmlof.v2.metrics import gof_metrics, lof_metrics
-from plmlof.v2.model import V2TaskNet
+from plmlof.constants import REGRESSION_TASKS
+from plmlof.metrics import gof_metrics, lof_metrics
+from plmlof.model import TaskNet
 
 logger = logging.getLogger(__name__)
 
 
-class V2Trainer:
+class Trainer:
     def __init__(
         self,
-        net: V2TaskNet,
+        net: TaskNet,
         train_loader: DataLoader,
         val_loader: DataLoader,
         device: str | torch.device = "cpu",
@@ -52,14 +53,17 @@ class V2Trainer:
         self.best_metric = -1e9
         self.best_epoch = -1
         self.model_config = {
-            "v2": True,
+            "plmlof": True,
             "task": net.task,
             "esm2_model_name": esm2_model_name,
             "pool_strategy": pool_strategy,
             "seed": seed,
             "gof_threshold": gof_threshold,
-            "hidden_size": net.comparison.hidden_size,
-            "use_cross_attention": net.comparison.cross_attn is not None,
+            "hidden_size": net.hidden_size,
+            "alignment_free": net.alignment_free,
+            "use_cross_attention": (
+                net.comparison is not None and net.comparison.cross_attn is not None
+            ),
         }
         self.lof_loss = nn.SmoothL1Loss(reduction="none")
         self.bce = nn.BCEWithLogitsLoss(reduction="none")
@@ -72,7 +76,7 @@ class V2Trainer:
         )
         target = batch["target"].float()
         weight = batch["sample_weight"].float().clamp(min=1e-6)
-        if self.task == "lof":
+        if self.task in REGRESSION_TASKS:
             per = self.lof_loss(raw, target)
         else:
             per = self.bce(raw, target)
@@ -125,7 +129,7 @@ class V2Trainer:
         is_wreck = np.concatenate(wrecks).astype(bool) if wrecks else np.array([], dtype=bool)
         is_missense = np.concatenate(misses).astype(bool) if misses else np.array([], dtype=bool)
         metrics: dict[str, float] = {"loss": total / max(n, 1)}
-        if self.task == "lof":
+        if self.task in REGRESSION_TASKS:
             metrics.update(lof_metrics(pred, target, z, is_wreck, is_missense))
         else:
             metrics.update(gof_metrics(pred, target, threshold=self.gof_threshold))
@@ -137,7 +141,7 @@ class V2Trainer:
         path = ckpt_dir / "model_best.pt"
         torch.save(
             {
-                "v2": True,
+                "plmlof": True,
                 "task": self.task,
                 "epoch": epoch,
                 "seed": self.seed,
@@ -176,11 +180,25 @@ class V2Trainer:
                 epoch, max_epochs, train_loss, val["loss"], selection,
                 {k: round(v, 4) for k, v in val.items() if k not in {"n", "loss"}},
             )
-            if self.task == "lof" and val.get("wreck_auroc", 0) > 0.97 and abs(val.get("missense_spearman", 0)) < 0.02:
+            cheat = (
+                self.task == "mlof"
+                and float(val.get("wreck_auroc", 0)) > 0.97
+                and abs(float(val.get("missense_spearman", 0))) < 0.05
+            )
+            if cheat:
                 logger.warning(
-                    "Wreck AUROC is %.3f but missense Spearman is %.3f — head is likely cheating on length",
+                    "Skipping checkpoint: wreck AUROC=%.3f missense Spearman=%.3f (length cheat)",
                     val["wreck_auroc"], val["missense_spearman"],
                 )
+                if self.best_epoch < 0:
+                    self._save(epoch, val)
+                    self.best_epoch = epoch
+                    best = dict(val)
+                stale += 1
+                if stale >= patience:
+                    logger.info("Early stopping at epoch %s", epoch)
+                    break
+                continue
             if selection > self.best_metric:
                 self.best_metric = selection
                 self.best_epoch = epoch
@@ -192,5 +210,8 @@ class V2Trainer:
                 if stale >= patience:
                     logger.info("Early stopping at epoch %s", epoch)
                     break
-        logger.info("Best selection=%.4f at epoch %s", self.best_metric, self.best_epoch)
+        if self.best_metric <= -1e8:
+            logger.info("Only length-cheat fallback saved at epoch %s", self.best_epoch)
+        else:
+            logger.info("Best selection=%.4f at epoch %s", self.best_metric, self.best_epoch)
         return best

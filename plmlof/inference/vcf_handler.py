@@ -209,3 +209,25 @@ def parse_fasta_pairs(
         ))
 
     return records
+
+
+def parse_protein_fasta(fasta: str | Path) -> list[VariantRecord]:
+    """One protein (or CDS) per record. No reference — alignment-free LoF."""
+    records = []
+    for record in SeqIO.parse(str(fasta), "fasta"):
+        seq = str(record.seq).upper()
+        dna_chars = set("ATGCN")
+        if seq and all(c in dna_chars for c in seq[:100]):
+            protein = translate_dna(seq, to_stop=True).replace("*", "")
+            dna = seq
+        else:
+            protein = seq.replace("*", "")
+            dna = ""
+        records.append(VariantRecord(
+            gene=record.id,
+            ref_protein=protein,
+            var_protein=protein,
+            ref_dna=dna,
+            var_dna=dna,
+        ))
+    return records

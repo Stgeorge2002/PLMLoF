@@ -14,9 +14,9 @@ from pathlib import Path
 
 import pandas as pd
 
-from plmlof.v2.domains import protein_id
-from plmlof.v2.gbff import iter_cds
-from plmlof.v2.hmmer import annotate_proteins
+from plmlof.domains import protein_id
+from plmlof.gbff import iter_cds
+from plmlof.hmmer import annotate_proteins
 
 logger = logging.getLogger(__name__)
 

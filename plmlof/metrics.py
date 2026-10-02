@@ -1,4 +1,4 @@
-"""Validation metrics for v2 LoF (graded) and GoF (precision-first)."""
+"""Validation metrics for LoF (graded) and GoF (precision-first)."""
 
 from __future__ import annotations
 
@@ -46,7 +46,6 @@ def lof_metrics(
 
     miss = is_missense & np.isfinite(z)
     out["missense_spearman_vs_z"] = _spearman(pred[miss], z[miss]) if miss.any() else 0.0
-    # Higher LoF score should track more negative z.
     out["missense_spearman"] = _spearman(pred[miss], -z[miss]) if miss.any() else 0.0
 
     strong = miss & (z <= -2.0)
@@ -72,13 +71,9 @@ def lof_metrics(
     else:
         out["weak_vs_wt_auroc"] = 0.0
 
-    # Gene-prior collapse: if wreck AUROC is high but missense Spearman is ~0,
-    # the head is cheating on length. Surface that as a combined score.
     spearman01 = (out["missense_spearman"] + 1.0) / 2.0
-    if miss.any() and is_wreck.any():
-        out["selection"] = 0.5 * out["wreck_auroc"] + 0.5 * spearman01
-    elif miss.any():
-        out["selection"] = spearman01
+    if miss.any():
+        out["selection"] = 0.6 * spearman01 + 0.4 * out["strong_vs_wt_auroc"]
     else:
         out["selection"] = out["wreck_auroc"]
     return out
@@ -114,6 +109,29 @@ def gof_metrics(
     return out
 
 
+def within_gene_auroc(pred: np.ndarray, target: np.ndarray, gene: list[str]) -> dict[str, float]:
+    """Mean AUROC inside each gene that has both classes. The honest growth-GoF metric."""
+    pred = np.asarray(pred, dtype=np.float64)
+    y = np.asarray(target)
+    genes = np.asarray(gene)
+    aucs: list[float] = []
+    for g in np.unique(genes):
+        mask = genes == g
+        if int(mask.sum()) < 8:
+            continue
+        labels = y[mask]
+        if len(np.unique(labels)) < 2:
+            continue
+        try:
+            aucs.append(float(roc_auc_score(labels, pred[mask])))
+        except ValueError:
+            continue
+    return {
+        "within_gene_auroc": float(np.mean(aucs)) if aucs else 0.0,
+        "n_genes_with_auroc": float(len(aucs)),
+    }
+
+
 def gene_prior_collapse(pred: np.ndarray, gene: list[str], z: np.ndarray | None = None) -> dict[str, float]:
     """Flag heads that emit an almost-constant score per gene."""
     pred = np.asarray(pred, dtype=np.float64)
@@ -133,3 +151,8 @@ def gene_prior_collapse(pred: np.ndarray, gene: list[str], z: np.ndarray | None 
         "n_genes_collapsed": float(collapsed),
         "collapse_fraction": float(collapsed / n_genes) if n_genes else 0.0,
     }
+
+
+def collapse_is_fail(collapse: dict, min_genes: int = 3, fraction: float = 0.5) -> bool:
+    """One held-out gene is not a collapse verdict."""
+    return float(collapse.get("n_genes_scored", 0)) >= min_genes and float(collapse.get("collapse_fraction", 0)) > fraction

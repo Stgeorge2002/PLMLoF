@@ -12,10 +12,9 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from plmlof.domains import PRIOR_SURE, PRIOR_TAIL_STOP, SURE_MIN, in_c_terminal_tail
 from plmlof.utils.sequence_utils import compute_truncation_fraction
-from plmlof.v2.domains import PRIOR_SURE, PRIOR_TAIL_STOP, SURE_MIN, in_c_terminal_tail
 
-# Stop in the first ~60% of the ORF → at least 40% of the protein is gone.
 TRUNCATION_FRACTION = 0.40
 LENGTH_RATIO_DELETE = 0.70
 LENGTH_RATIO_INSERT = 1.30

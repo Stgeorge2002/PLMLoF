@@ -1,4 +1,4 @@
-"""Parquet + cached-embedding datasets for v2 tasks."""
+"""Parquet + cached-embedding datasets for task heads."""
 
 from __future__ import annotations
 
@@ -11,11 +11,46 @@ from torch.utils.data import Dataset
 from plmlof.data.features import extract_nucleotide_features
 
 
-V2_REQUIRED = {"ref_protein", "var_protein", "target", "sample_weight"}
+REQUIRED_COLUMNS = {"ref_protein", "var_protein", "target", "sample_weight"}
+IDENTITY_TARGET_EPS = 0.05
 
 
-class V2PairDataset(Dataset):
-    """On-disk v2 rows (used for embedding scatter and live ESM2)."""
+def lof_train_keep_indices(
+    is_wreck: torch.Tensor,
+    is_missense: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    channels: list[str] | None = None,
+    seed: int = 0,
+    identity_per_missense: float = 1.0,
+) -> list[int]:
+    """LoF train rows: drop sure wrecks; cap identity WT to ~1× missense count.
+
+    Inference still applies wreck_grade. Training on sure wrecks teaches length.
+    Identity WT is `channel == wt` and not missense when channels exist; otherwise
+    non-wreck / non-missense with target ≈ 0 (works on older embedding caches).
+    """
+    wreck = is_wreck.bool()
+    miss = is_missense.bool()
+    keep = ~wreck
+    have_wt = channels is not None and len(channels) == int(keep.numel()) and any(c == "wt" for c in channels)
+    if have_wt:
+        ident = keep & ~miss & torch.tensor([c == "wt" for c in channels], dtype=torch.bool)
+    else:
+        ident = keep & ~miss & (targets.abs() < IDENTITY_TARGET_EPS)
+    n_miss = int((keep & miss).sum().item())
+    cap = max(int(round(n_miss * identity_per_missense)), 1)
+    ident_idx = ident.nonzero(as_tuple=False).view(-1)
+    other = (keep & ~ident).nonzero(as_tuple=False).view(-1)
+    if ident_idx.numel() > cap:
+        g = torch.Generator()
+        g.manual_seed(int(seed))
+        ident_idx = ident_idx[torch.randperm(ident_idx.numel(), generator=g)[:cap]]
+    return torch.cat([other, ident_idx]).sort().values.tolist()
+
+
+class PairDataset(Dataset):
+    """On-disk rows (used for embedding scatter and live ESM2)."""
 
     def __init__(self, data_path: str | Path, max_seq_length: int = 1024):
         self.max_seq_length = max_seq_length
@@ -27,9 +62,9 @@ class V2PairDataset(Dataset):
         else:
             raise ValueError(f"Unsupported format: {path.suffix}")
 
-        missing = V2_REQUIRED - set(self.df.columns)
+        missing = REQUIRED_COLUMNS - set(self.df.columns)
         if missing:
-            raise ValueError(f"Missing v2 columns: {missing}")
+            raise ValueError(f"Missing columns: {missing}")
 
         self._ref = [str(v).replace("*", "")[:max_seq_length] for v in self.df["ref_protein"]]
         self._var = [str(v).replace("*", "")[:max_seq_length] for v in self.df["var_protein"]]
@@ -79,8 +114,8 @@ class V2PairDataset(Dataset):
         }
 
 
-class V2CachedDataset(Dataset):
-    """Pre-pooled ESM2 embeddings plus v2 targets/weights/channels."""
+class CachedDataset(Dataset):
+    """Pre-pooled ESM2 embeddings plus targets/weights/channels."""
 
     def __init__(self, cache_path: str | Path):
         path = Path(cache_path)
@@ -99,6 +134,7 @@ class V2CachedDataset(Dataset):
         self.is_missense = data.get("is_missense", torch.zeros(len(self.targets), dtype=torch.bool))
         self.genes = data.get("genes", [""] * len(self.targets))
         self.protein_ids = data.get("protein_ids", [""] * len(self.targets))
+        self.channels = data.get("channels", ["unknown"] * len(self.targets))
 
     def __len__(self) -> int:
         return len(self.targets)
@@ -115,4 +151,7 @@ class V2CachedDataset(Dataset):
             "dms_zscore": self.z[idx],
             "is_wreck": self.is_wreck[idx],
             "is_missense": self.is_missense[idx],
+            "gene": self.genes[idx],
+            "protein_id": self.protein_ids[idx],
+            "channel": self.channels[idx],
         }

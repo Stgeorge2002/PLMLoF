@@ -1,341 +1,120 @@
-"""Evaluation script for PLMLoF model.
+"""Evaluate an ensemble on cached test embeddings.
 
-Usage:
-    python scripts/evaluate.py --model outputs/checkpoints/model_best.pt --test-data data/processed/test.parquet
-    python scripts/evaluate.py --model outputs/checkpoints/model_best.pt --tiny
-
-Supports both full-model and cached-training checkpoints automatically.
+    python scripts/evaluate.py --task lof \
+        --ensemble-dir outputs/lof \
+        --embeddings $PLMLOF_EMB_DIR/lof/test_embeddings.pt
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 
-from plmlof.models.plmlof_model import PLMLoFModel
-from plmlof.data.dataset import PLMLoFDataset, SyntheticPLMLoFDataset
-from plmlof.data.collator import PLMLoFCollator
-from plmlof.training.metrics import compute_metrics, compute_confusion_matrix, format_classification_report
-from plmlof import LABEL_MAP
+from plmlof.constants import REGRESSION_TASKS
+from plmlof.dataset import CachedDataset
+from plmlof.metrics import (
+    collapse_is_fail,
+    gene_prior_collapse,
+    gof_metrics,
+    lof_metrics,
+    within_gene_auroc,
+)
+from plmlof.predictor import _load_net, discover_ensemble
+from plmlof.stats import empirical_p
 
 logger = logging.getLogger(__name__)
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate PLMLoF model")
-    parser.add_argument("--model", type=str, required=True, help="Path to model checkpoint")
-    parser.add_argument("--test-data", type=str, default=None, help="Path to test data parquet")
-    parser.add_argument("--embeddings", type=str, default=None,
-                        help="Path to pre-computed embeddings .pt file for the test set "
-                             "(e.g. data/embeddings/test_embeddings.pt). "
-                             "Skips ESM2 inference when provided.")
-    parser.add_argument("--device", type=str, default="cpu")
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--tiny", action="store_true", help="Use tiny model + synthetic data")
-    return parser.parse_args()
-
-
-@torch.no_grad()
-def evaluate(model, data_loader, device):
-    model.eval()
-    all_preds = []
-    all_labels = []
-    all_probs = []
-
-    for batch in data_loader:
-        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                 for k, v in batch.items()}
-
-        logits = model(
-            ref_input_ids=batch["ref_input_ids"],
-            ref_attention_mask=batch["ref_attention_mask"],
-            var_input_ids=batch["var_input_ids"],
-            var_attention_mask=batch["var_attention_mask"],
-            nucleotide_features=batch["nucleotide_features"],
-        )
-
-        probs = torch.softmax(logits, dim=-1).cpu().numpy()
-        preds = logits.argmax(dim=-1).cpu().numpy()
-        all_preds.extend(preds)
-        all_labels.extend(batch["labels"].cpu().numpy())
-        all_probs.extend(probs)
-
-    return np.array(all_preds), np.array(all_labels), np.array(all_probs)
-
-
-def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    args = parse_args()
-
-    # Load checkpoint
-    checkpoint = torch.load(args.model, map_location=args.device, weights_only=False)
-
-    # ── Cached-training checkpoint ────────────────────────────────────────
-    if checkpoint.get("cached_training"):
-        logger.info("Detected cached-training checkpoint — using embedding-based evaluation")
-        model_cfg = checkpoint.get("model_config", {})
-        esm2_name = model_cfg.get("esm2_model_name", "facebook/esm2_t33_650M_UR50D")
-        pool_strategy = model_cfg.get("pool_strategy", "mean_max")
-
-        from plmlof.models.comparison import ComparisonModule
-        from plmlof.models.classifier import ClassifierHead, RegressionHead
-        from plmlof.data.features import NUM_NUCLEOTIDE_FEATURES
-        from transformers import AutoTokenizer, AutoModel
-
-        # Load comparison + classifier
-        # Infer hidden_size from checkpoint state dict
-        comparison_state = checkpoint["comparison_state_dict"]
-        # _pre_norm.weight shape is [raw_size], raw_size = 8*D for mean_max, 4*D for mean
-        pre_norm_shape = comparison_state["_pre_norm.weight"].shape[0]
-        if pool_strategy == "mean_max":
-            hidden_size = pre_norm_shape // 8
-        else:
-            hidden_size = pre_norm_shape // 4
-        comparison = ComparisonModule(
-            hidden_size=hidden_size,
-            pool_strategy=pool_strategy,
-            use_cross_attention=model_cfg.get("use_cross_attention", False),
-            cross_attn_heads=model_cfg.get("cross_attn_heads", 4),
-            cross_attn_dropout=model_cfg.get("cross_attn_dropout", 0.1),
-        )
-        comparison.load_state_dict(checkpoint["comparison_state_dict"])
-
-        classifier_input = comparison.output_size + NUM_NUCLEOTIDE_FEATURES
-        classifier = ClassifierHead(
-            input_size=classifier_input,
-            hidden_dims=model_cfg.get("classifier_hidden_dims", [256, 64]),
-            num_classes=3,
-            dropout=model_cfg.get("classifier_dropout", 0.3),
-        )
-        classifier.load_state_dict(checkpoint["classifier_state_dict"])
-
-        # Load regression head if present
-        regressor = None
-        if model_cfg.get("has_regressor") and "regressor_state_dict" in checkpoint:
-            regressor = RegressionHead(input_size=classifier_input)
-            regressor.load_state_dict(checkpoint["regressor_state_dict"])
-            logger.info("Loaded regression head for DMS score prediction")
-
-        # Load feature normalization (LayerNorm for engineered features)
-        feature_norm = nn.LayerNorm(NUM_NUCLEOTIDE_FEATURES)
-        if "feature_norm_state_dict" in checkpoint:
-            feature_norm.load_state_dict(checkpoint["feature_norm_state_dict"])
-            logger.info("Loaded feature normalization")
-
-        device = torch.device(args.device)
-        comparison = comparison.to(device).eval()
-        classifier = classifier.to(device).eval()
-        feature_norm = feature_norm.to(device).eval()
-        if regressor is not None:
-            regressor = regressor.to(device).eval()
-
-        # ── Fast path: use pre-computed embeddings if available ──────────
-        # Resolve the embeddings path: explicit --embeddings flag, or auto-
-        # detect test_embeddings.pt next to the train/val embeddings.
-        embeddings_path = None
-        if args.embeddings:
-            embeddings_path = Path(args.embeddings)
-        elif args.test_data:
-            _candidate = Path("data/embeddings/test_embeddings.pt")
-            if _candidate.exists():
-                embeddings_path = _candidate
-                logger.info(f"Auto-detected cached test embeddings: {_candidate}")
-
-        if embeddings_path is not None and embeddings_path.exists():
-            from plmlof.data.dataset import CachedEmbeddingDataset
-            logger.info(f"Using pre-computed embeddings from {embeddings_path} — skipping ESM2 inference")
-            cached_ds = CachedEmbeddingDataset(embeddings_path)
-            cached_loader = DataLoader(
-                cached_ds, batch_size=args.batch_size * 8,  # larger batch OK without ESM2
-                num_workers=4, pin_memory=True,
-            )
-            all_preds, all_labels, all_probs = [], [], []
-            all_reg_preds, all_dms_targets = [], []
-            with torch.no_grad():
-                for batch in tqdm(cached_loader, desc="Evaluating"):
-                    batch = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v
-                             for k, v in batch.items()}
-                    ref_mean, ref_max = batch["ref_mean"], batch["ref_max"]
-                    var_mean, var_max = batch["var_mean"], batch["var_max"]
-                    comp = comparison.compare_pooled(ref_mean, ref_max, var_mean, var_max)
-                    features = torch.cat([comp, feature_norm(batch["nucleotide_features"])], dim=-1)
-                    logits = classifier(features)
-                    all_preds.extend(logits.argmax(dim=-1).cpu().numpy())
-                    all_labels.extend(batch["labels"].cpu().numpy())
-                    all_probs.extend(torch.softmax(logits, dim=-1).cpu().numpy())
-                    if regressor is not None:
-                        reg_pred = regressor(features)
-                        all_reg_preds.extend(reg_pred.cpu().numpy())
-                        all_dms_targets.extend(batch["dms_scores"].cpu().numpy())
-            preds = np.array(all_preds)
-            labels = np.array(all_labels)
-            probs = np.array(all_probs)
-            reg_preds = np.array(all_reg_preds) if all_reg_preds else None
-            dms_targets = np.array(all_dms_targets) if all_dms_targets else None
-
-        else:
-            # ── Slow path: embed test set on-the-fly with ESM2 ───────────
-            logger.info(f"Loading ESM2: {esm2_name}")
-            tokenizer = AutoTokenizer.from_pretrained(esm2_name)
-            esm2 = AutoModel.from_pretrained(esm2_name).to(device)
-            esm2.eval()
-            for p in esm2.parameters():
-                p.requires_grad = False
-
-            if args.tiny or args.test_data is None:
-                dataset = SyntheticPLMLoFDataset(num_samples=30)
+def ensemble_predict(nets, loader, device) -> tuple[np.ndarray, np.ndarray, dict]:
+    means, sds = [], []
+    extra: dict[str, list] = {"target": [], "z": [], "wreck": [], "missense": [], "gene": []}
+    with torch.no_grad():
+        for batch in loader:
+            tensors = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            parts = []
+            for net in nets:
+                raw = net.forward_from_pooled(
+                    tensors["ref_mean"], tensors["ref_max"],
+                    tensors["var_mean"], tensors["var_max"],
+                    tensors["nucleotide_features"],
+                )
+                parts.append(net.probability(raw).float().cpu())
+            stacked = torch.stack(parts, dim=0)
+            means.append(stacked.mean(0).numpy())
+            sds.append(stacked.std(0).numpy())
+            extra["target"].append(batch["target"].numpy())
+            extra["z"].append(batch["dms_zscore"].numpy())
+            extra["wreck"].append(batch["is_wreck"].numpy())
+            extra["missense"].append(batch["is_missense"].numpy())
+            genes = batch.get("gene", [])
+            if isinstance(genes, (list, tuple)):
+                extra["gene"].extend(genes)
             else:
-                dataset = PLMLoFDataset(args.test_data)
+                extra["gene"].extend(list(genes))
+    pred = np.concatenate(means)
+    sd = np.concatenate(sds)
+    packed = {k: np.concatenate(v) for k, v in extra.items() if v and k != "gene"}
+    packed["gene"] = extra["gene"]
+    return pred, sd, packed
 
-            max_len = 1024
 
-            def _collate_eval(batch):
-                ref_seqs = [s["ref_protein"] for s in batch]
-                var_seqs = [s["var_protein"] for s in batch]
-                all_seqs = ref_seqs + var_seqs
-                enc = tokenizer(all_seqs, padding=True, truncation=True,
-                                max_length=max_len, return_tensors="pt")
-                nuc = torch.stack([s["nucleotide_features"] for s in batch])
-                labels = torch.tensor([s["label"] for s in batch], dtype=torch.long)
-                dms_scores = torch.tensor([s.get("dms_score", 0.0) for s in batch], dtype=torch.float32)
-                return {
-                    "input_ids": enc["input_ids"],
-                    "attention_mask": enc["attention_mask"],
-                    "n_ref": len(ref_seqs),
-                    "nucleotide_features": nuc,
-                    "labels": labels,
-                    "dms_scores": dms_scores,
-                }
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    p = argparse.ArgumentParser()
+    p.add_argument("--task", required=True, choices=["lof", "mlof", "growth_gof", "amr_gof"])
+    p.add_argument("--ensemble-dir", type=Path, required=True)
+    p.add_argument("--embeddings", type=Path, required=True)
+    p.add_argument("--device", default=None)
+    p.add_argument("--batch-size", type=int, default=512)
+    p.add_argument("--gof-threshold", type=float, default=0.90)
+    p.add_argument("--json-out", type=Path, default=None)
+    args = p.parse_args()
 
-            loader = DataLoader(dataset, batch_size=args.batch_size, collate_fn=_collate_eval,
-                                num_workers=4, pin_memory=True)
+    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    members = discover_ensemble(args.ensemble_dir)
+    if not members:
+        raise SystemExit(f"No ensemble in {args.ensemble_dir}")
+    nets = [_load_net(m, device) for m in members]
+    ds = CachedDataset(args.embeddings)
+    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False)
+    pred, sd, packed = ensemble_predict(nets, loader, device)
+    genes = packed["gene"] if packed["gene"] else list(ds.genes)
 
-            all_preds, all_labels, all_probs = [], [], []
-            all_reg_preds, all_dms_targets = [], []
-
-            @torch.no_grad()
-            def _pool(emb, mask):
-                m_f = mask.unsqueeze(-1).float()
-                mean_p = (emb * m_f).sum(1) / m_f.sum(1).clamp(min=1)
-                emb_masked = emb.masked_fill(~mask.unsqueeze(-1).bool(), float("-inf"))
-                max_p = emb_masked.max(dim=1).values
-                max_p = max_p.masked_fill(max_p == float("-inf"), 0.0)
-                return mean_p, max_p
-
-            with torch.no_grad():
-                for batch in tqdm(loader, desc="Evaluating"):
-                    ids = batch["input_ids"].to(device, non_blocking=True)
-                    mask = batch["attention_mask"].to(device, non_blocking=True)
-                    n_ref = batch["n_ref"]
-                    nuc = batch["nucleotide_features"].to(device, non_blocking=True)
-
-                    _is_ampere = (
-                        device.type == "cuda"
-                        and torch.cuda.get_device_capability(device)[0] >= 8
-                    )
-                    _amp_dtype = torch.bfloat16 if _is_ampere else torch.float16
-                    with torch.amp.autocast("cuda", dtype=_amp_dtype, enabled=device.type == "cuda"):
-                        out = esm2(ids, attention_mask=mask).last_hidden_state
-
-                    ref_out, var_out = out[:n_ref], out[n_ref:]
-                    ref_mask, var_mask = mask[:n_ref], mask[n_ref:]
-
-                    ref_mean, ref_max = _pool(ref_out, ref_mask)
-                    var_mean, var_max = _pool(var_out, var_mask)
-
-                    comp = comparison.compare_pooled(ref_mean, ref_max, var_mean, var_max)
-                    nuc_normed = feature_norm(nuc)
-                    features = torch.cat([comp, nuc_normed], dim=-1)
-                    logits = classifier(features)
-
-                    probs = torch.softmax(logits, dim=-1).cpu().numpy()
-                    preds_batch = logits.argmax(dim=-1).cpu().numpy()
-                    all_preds.extend(preds_batch)
-                    all_labels.extend(batch["labels"].numpy())
-                    all_probs.extend(probs)
-
-                    if regressor is not None:
-                        reg_pred = regressor(features)
-                        all_reg_preds.extend(reg_pred.cpu().numpy())
-                        all_dms_targets.extend(batch["dms_scores"].numpy())
-
-            preds = np.array(all_preds)
-            labels = np.array(all_labels)
-            probs = np.array(all_probs)
-            reg_preds = np.array(all_reg_preds) if all_reg_preds else None
-            dms_targets = np.array(all_dms_targets) if all_dms_targets else None
-
-    else:
-        # ── Full-model checkpoint ─────────────────────────────────────────
-        state_dict = checkpoint.get("model_state_dict", checkpoint)
-        model_cfg = checkpoint.get("model_config", {})
-        if args.tiny:
-            esm2_name = "facebook/esm2_t6_8M_UR50D"
-        else:
-            esm2_name = model_cfg.get("esm2_model_name", "facebook/esm2_t33_650M_UR50D")
-
-        model = PLMLoFModel(
-            esm2_model_name=esm2_name,
-            freeze_esm2=True,
-            lora_config=model_cfg.get("lora_config"),
-            classifier_hidden_dims=model_cfg.get("classifier_hidden_dims", [256, 64]),
-            classifier_dropout=model_cfg.get("classifier_dropout", 0.3),
-            pool_strategy=model_cfg.get("pool_strategy", "mean_max"),
-        )
-        model.load_state_dict(state_dict, strict=False)
-        model = model.to(args.device)
-
-        if args.tiny or args.test_data is None:
-            dataset = SyntheticPLMLoFDataset(num_samples=30)
-        else:
-            dataset = PLMLoFDataset(args.test_data)
-
-        collator = PLMLoFCollator(tokenizer_name=esm2_name)
-        loader = DataLoader(dataset, batch_size=args.batch_size, collate_fn=collator)
-
-        preds, labels, probs = evaluate(model, loader, args.device)
-        reg_preds = None
-        dms_targets = None
-
-    metrics = compute_metrics(preds, labels, probs)
-    cm = compute_confusion_matrix(preds, labels)
-    report = format_classification_report(preds, labels)
-
-    print("\n" + "=" * 60)
-    print("EVALUATION RESULTS")
     print("=" * 60)
-    print(f"\nAccuracy:   {metrics['accuracy']:.4f}")
-    print(f"Macro F1:   {metrics['macro_f1']:.4f}")
-    print(f"AUROC:      {metrics.get('auroc_macro', 'N/A')}")
-    print(f"\nConfusion Matrix:")
-    print(f"{'':>10} {'Pred LoF':>10} {'Pred WT':>10} {'Pred GoF':>10}")
-    for i, row in enumerate(cm):
-        print(f"{'True '+LABEL_MAP[i]:>10} {row[0]:>10} {row[1]:>10} {row[2]:>10}")
-    print(f"\nClassification Report:\n{report}")
+    print(f"{args.task}  n={len(pred)}  members={len(nets)}  mean_sd={float(sd.mean()):.4f}")
+    if args.task in REGRESSION_TASKS:
+        metrics = lof_metrics(pred, packed["target"], packed["z"], packed["wreck"], packed["missense"])
+        diversity = packed["z"] if args.task == "mlof" else packed["target"]
+        collapse = gene_prior_collapse(pred, genes, diversity)
+    else:
+        metrics = gof_metrics(pred, packed["target"], threshold=args.gof_threshold)
+        metrics.update(within_gene_auroc(pred, packed["target"], genes))
+        collapse = gene_prior_collapse(pred, genes, packed["target"])
+    metrics.update(collapse)
+    for k, v in metrics.items():
+        print(f"  {k:28s} {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
 
-    # Regression metrics
-    if reg_preds is not None and len(reg_preds) > 0:
-        from scipy.stats import spearmanr, pearsonr
-        rho, rho_p, r, r_p = 0.0, 1.0, 0.0, 1.0
-        if dms_targets.std() > 0 and reg_preds.std() > 0:
-            rho, rho_p = spearmanr(dms_targets, reg_preds)
-            r, r_p = pearsonr(dms_targets, reg_preds)
-        mae = float(np.mean(np.abs(dms_targets - reg_preds)))
-        mse = float(np.mean((dms_targets - reg_preds) ** 2))
-        print("=" * 60)
-        print("REGRESSION RESULTS (DMS z-score prediction)")
-        print("=" * 60)
-        print(f"  Spearman ρ:   {rho:.4f} (p={rho_p:.2e})")
-        print(f"  Pearson r:    {r:.4f} (p={r_p:.2e})")
-        print(f"  MAE:          {mae:.4f}")
-        print(f"  MSE:          {mse:.4f}")
+    if collapse_is_fail(collapse):
+        print("FAIL: gene-prior collapse (most genes have near-constant scores).")
+
+    null_path = args.ensemble_dir / "null_scores.pt"
+    if null_path.exists():
+        null = torch.load(null_path, map_location="cpu", weights_only=False)["scores"].numpy()
+        pval = empirical_p(pred, null)
+        print(f"  empirical p  median={np.nanmedian(pval):.4f}  p<0.05={float(np.mean(pval < 0.05)):.3f}")
+        metrics["p_median"] = float(np.nanmedian(pval))
+        metrics["frac_p_lt_0.05"] = float(np.mean(pval < 0.05))
+
+    if args.json_out:
+        args.json_out.parent.mkdir(parents=True, exist_ok=True)
+        args.json_out.write_text(json.dumps(metrics, indent=2))
+        logger.info("Wrote %s", args.json_out)
 
 
 if __name__ == "__main__":

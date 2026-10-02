@@ -1,5 +1,5 @@
 #!/bin/bash
-# Full v2 pipeline on 1 GH200. Tables must already be in data/processed/v2/
+# Full pipeline on 1 GH200. Tables must already be in data/processed/{lof,mlof,...}
 # (built on a laptop). This job does not download ProteinGym/CARD/GBFF.
 # 1 GPU-hour = 0.25 NHR. Do not add --exclusive.
 

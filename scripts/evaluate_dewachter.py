@@ -4,7 +4,7 @@ Expects paired FASTA plus a TSV with at least gene (or id) and a competition
 coefficient column.
 
     python scripts/evaluate_dewachter.py \
-        --model-dir outputs/v2 \
+        --model-dir outputs \
         --reference dewachter/fasta/ref.fasta \
         --variants  dewachter/fasta/var.fasta \
         --scores    dewachter/labels.tsv
@@ -19,8 +19,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from plmlof.v2.metrics import gene_prior_collapse
-from plmlof.v2.predictor import V2Predictor
+from plmlof.metrics import gene_prior_collapse
+from plmlof.predictor import Predictor
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +47,7 @@ def main() -> None:
 
     import torch
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    pred = V2Predictor(args.model_dir, device=device)
+    pred = Predictor(args.model_dir, device=device)
     rows = pred.predict_fasta(args.reference, args.variants)
     df = pd.DataFrame(rows)
 
@@ -63,6 +63,9 @@ def main() -> None:
         rho_raw = _spearman(df["lof_score"].to_numpy(), df["cc"].to_numpy())
         print(f"Dewachter Spearman(lof_score, -CC) = {rho:.4f}")
         print(f"Dewachter Spearman(lof_score,  CC) = {rho_raw:.4f}")
+        if "mlof_score" in df.columns:
+            rho_m = _spearman(df["mlof_score"].to_numpy(), -df["cc"].to_numpy())
+            print(f"Dewachter Spearman(mlof_score, -CC) = {rho_m:.4f}")
         collapse = gene_prior_collapse(
             df["lof_score"].to_numpy(),
             df["gene"].astype(str).str.replace(r"_.*", "", regex=True).tolist(),

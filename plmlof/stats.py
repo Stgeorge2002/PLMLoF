@@ -19,15 +19,8 @@ def empirical_p(observed: np.ndarray | float, null_scores: np.ndarray) -> np.nda
     null = np.asarray(null_scores, dtype=np.float64).reshape(-1)
     if null.size == 0:
         raise ValueError("null_scores is empty")
-    # Sort descending so searchsorted on -null finds how many nulls are >= obs.
-    null_desc = np.sort(null)[::-1]
-    n = null_desc.size
-    # number of null values >= x  ==  searchsorted on descending array
-    # Using -null ascending: count of null >= x is searchsorted(-null, -x, side='left')
-    # wait: np.searchsorted(np.sort(-null), -x, side="left") counts null > x if duplicates...
-    # For P(null >= obs): count of nulls that are >= obs.
+    n = null.size
     null_asc = np.sort(null)
-    # searchsorted(side='left') of obs in ascending null = how many null < obs
     n_less = np.searchsorted(null_asc, obs, side="left")
     n_ge = n - n_less
     p = (1.0 + n_ge) / (1.0 + n)

@@ -1,4 +1,4 @@
-"""ESM2 unique-sequence embedding used by the v2 precompute script."""
+"""ESM2 unique-sequence embedding used by the precompute script."""
 
 from __future__ import annotations
 

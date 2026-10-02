@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Download ESM2 weights into $HF_HOME (project cache). Never ~/.cache.
 #
-#   bash isambard/download_models.sh           # 8M + 650M
+#   bash isambard/download_models.sh           # 8M + 35M (LoF) + 650M (MLoF/GoF)
 #   bash isambard/download_models.sh --tiny    # 8M only
 #   bash isambard/download_models.sh --all     # 8M, 35M, 150M, 650M
 
@@ -41,7 +41,11 @@ models = {
         "facebook/esm2_t30_150M_UR50D",
         "facebook/esm2_t33_650M_UR50D",
     ],
-}.get(mode, ["facebook/esm2_t6_8M_UR50D", "facebook/esm2_t33_650M_UR50D"])
+}.get(mode, [
+        "facebook/esm2_t6_8M_UR50D",
+        "facebook/esm2_t12_35M_UR50D",
+        "facebook/esm2_t33_650M_UR50D",
+    ])
 
 token = os.environ.get("HF_TOKEN") or None
 cache = os.environ["HF_HUB_CACHE"]

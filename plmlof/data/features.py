@@ -19,6 +19,10 @@ from plmlof.utils.sequence_utils import (
 
 NUM_NUCLEOTIDE_FEATURES = 12
 
+# Truncation / stop / length-ratio. The LoF *rule* already uses these; the
+# network must not, or it learns wrecks and ignores missense embeddings.
+LOF_LEAK_NUC_INDICES: tuple[int, ...] = (0, 1, 4, 6, 11)
+
 # Region encoding: 0=N-terminal (first 20%), 1=middle, 2=C-terminal (last 20%)
 _REGION_MAP = {"N-terminal": 0, "middle": 1, "C-terminal": 2, "none": 1}
 

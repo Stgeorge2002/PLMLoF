@@ -1,391 +1,155 @@
-"""Training entry point for PLMLoF.
+"""Train one task seed on cached embeddings.
 
-Usage:
-    # Full training with YAML config
-    python scripts/train.py --config configs/training.yaml
-
-    # Quick smoke test on CPU with synthetic data
-    python scripts/train.py --tiny --max-epochs 2 --device cpu
+    python scripts/train.py --task lof --seed 0 \
+        --precomputed $PLMLOF_EMB_DIR --output-dir outputs/lof/seed0
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
-import sys
 from pathlib import Path
 
 import torch
 import yaml
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
-from plmlof.models.plmlof_model import PLMLoFModel
-from plmlof.data.dataset import PLMLoFDataset, SyntheticPLMLoFDataset, CachedEmbeddingDataset
-from plmlof.data.collator import PLMLoFCollator
-from plmlof.training.trainer import PLMLoFTrainer, CachedTrainer
+from plmlof.applicability import save_gallery
+from plmlof.dataset import CachedDataset, lof_train_keep_indices
+from plmlof.encoders import HIDDEN_SIZE, esm2_for_task, read_encoder_meta
+from plmlof.model import TaskNet
+from plmlof.trainer import Trainer
 
 logger = logging.getLogger(__name__)
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train PLMLoF model")
-    parser.add_argument("--config", type=str, default=None, help="Path to training YAML config")
-    parser.add_argument("--model-config", type=str, default=None, help="Path to model YAML config")
-    parser.add_argument("--train-data", type=str, default=None, help="Path to training data (parquet/csv)")
-    parser.add_argument("--val-data", type=str, default=None, help="Path to validation data")
-    parser.add_argument("--device", type=str, default=None, help="Device (cpu/cuda/auto). Default: auto-detect")
-    parser.add_argument("--output-dir", type=str, default="outputs/", help="Output directory")
-    parser.add_argument("--max-epochs", type=int, default=None)
-    parser.add_argument("--s2-max-epochs", type=int, default=None, help="Override Stage 2 max epochs")
-    parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--lr", type=float, default=None)
-    parser.add_argument("--tiny", action="store_true", help="Use tiny ESM2 model + synthetic data for testing")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--mixed-precision", type=str, default=None, choices=["fp16", "bf16", "no"], help="Mixed precision mode")
-    parser.add_argument("--num-workers", type=int, default=None, help="DataLoader workers (default: auto)")
-    parser.add_argument("--precomputed", type=str, default=None,
-                        help="Path to pre-computed embeddings dir (from precompute_embeddings.py). "
-                             "Trains comparison+classifier only — no ESM2 forward passes.")
-    parser.add_argument("--stage2-only", action="store_true",
-                        help="Skip Stage 1 and run only Stage 2 (LoRA fine-tuning). "
-                             "Requires --checkpoint to load Stage 1 weights.")
-    parser.add_argument("--checkpoint", type=str, default=None,
-                        help="Path to checkpoint .pt file to resume from.")
-    return parser.parse_args()
-
-
-def load_config(path: str | None) -> dict:
+def load_yaml(path: str | None) -> dict:
     if path and Path(path).exists():
         with open(path) as f:
-            return yaml.safe_load(f)
+            return yaml.safe_load(f) or {}
     return {}
 
 
-def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
-    args = parse_args()
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    p = argparse.ArgumentParser(description="Train a LoF, MLoF, or GoF head")
+    p.add_argument("--task", required=True, choices=["lof", "mlof", "growth_gof", "amr_gof"])
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--precomputed", type=Path, required=True, help="Dir containing <task>/train_embeddings.pt")
+    p.add_argument("--output-dir", type=Path, required=True)
+    p.add_argument("--config", default="configs/training.yaml")
+    p.add_argument("--model-config", default="configs/model.yaml")
+    p.add_argument("--device", default=None)
+    p.add_argument("--mixed-precision", default=None)
+    p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument("--max-epochs", type=int, default=None)
+    args = p.parse_args()
 
-    # Load configs
-    train_cfg = load_config(args.config).get("training", {})
-    model_cfg = load_config(args.model_config or "configs/model.yaml").get("model", {})
-
-    # Resolve device
-    device = args.device
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    if device == "cuda" and torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
-        logger.info(f"GPU detected: {gpu_name} ({gpu_mem:.1f} GB)")
-        logger.info(f"CUDA devices: {torch.cuda.device_count()}")
-
-    output_dir = args.output_dir
-    seed = args.seed or train_cfg.get("seed", 42)
-
-    torch.manual_seed(seed)
+    train_cfg = load_yaml(args.config).get("training", {})
+    model_cfg = load_yaml(args.model_config).get("model", {})
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(args.seed)
     if device == "cuda":
-        torch.cuda.manual_seed_all(seed)
+        torch.cuda.manual_seed_all(args.seed)
 
-    if args.tiny:
-        esm2_name = "facebook/esm2_t6_8M_UR50D"
-        max_epochs_s1 = args.max_epochs or 2
-        max_epochs_s2 = 1
-        batch_size_s1 = args.batch_size or 4
-        batch_size_s2 = args.batch_size or 4
-        lr_s1 = args.lr or 1e-3
-        lr_s2 = 1e-4
-        grad_accum_s1 = 1
-        grad_accum_s2 = 1
+    task_emb = Path(args.precomputed) / args.task
+    esm_name = esm2_for_task(args.task, model_cfg)
+    enc_meta = read_encoder_meta(task_emb)
+    if enc_meta and enc_meta.get("esm2_model_name") != esm_name:
+        raise SystemExit(
+            f"{task_emb}/encoder.json is {enc_meta.get('esm2_model_name')}, "
+            f"config wants {esm_name}. Re-run scripts/precompute.py"
+        )
+    train_full = CachedDataset(task_emb / "train_embeddings.pt")
+    val_ds = CachedDataset(task_emb / "val_embeddings.pt")
+    if args.task == "mlof":
+        keep = lof_train_keep_indices(
+            train_full.is_wreck, train_full.is_missense, train_full.targets,
+            channels=list(train_full.channels), seed=args.seed,
+        )
+        train_ds = Subset(train_full, keep)
+        logger.info(
+            "MLoF train filter %s → %s (no sure wrecks, capped identity WT)",
+            len(train_full), len(train_ds),
+        )
     else:
-        esm2_name = model_cfg.get("esm2_model_name", "facebook/esm2_t33_650M_UR50D")
-        s1_cfg = train_cfg.get("stage1", {})
-        s2_cfg = train_cfg.get("stage2", {})
-        max_epochs_s1 = args.max_epochs or s1_cfg.get("max_epochs", 20)
-        max_epochs_s2 = args.s2_max_epochs or s2_cfg.get("max_epochs", 10)
-        batch_size_s1 = args.batch_size or s1_cfg.get("batch_size", 16)
-        batch_size_s2 = args.batch_size or s2_cfg.get("batch_size", 8)
-        lr_s1 = args.lr or s1_cfg.get("learning_rate", 1e-3)
-        lr_s2 = s2_cfg.get("learning_rate", 1e-4)
-        grad_accum_s1 = s1_cfg.get("gradient_accumulation_steps", 1)
-        grad_accum_s2 = s2_cfg.get("gradient_accumulation_steps", 1)
+        train_ds = train_full
+    hidden = train_full.ref_mean.shape[1]
+    expected = HIDDEN_SIZE.get(esm_name)
+    if expected is not None and int(hidden) != int(expected):
+        raise SystemExit(
+            f"{args.task} embeddings are D={hidden} but {esm_name} is D={expected}. "
+            "Delete that task's embedding dir and re-run precompute.py"
+        )
+    logger.info("%s seed=%s train=%s val=%s D=%s encoder=%s", args.task, args.seed, len(train_ds), len(val_ds), hidden, esm_name)
 
-    # LoRA config
-    lora_cfg = model_cfg.get("lora", {})
-    lora_config = {
-        "rank": lora_cfg.get("rank", 16),
-        "alpha": lora_cfg.get("alpha", 32),
-        "dropout": lora_cfg.get("dropout", 0.1),
-        "target_modules": lora_cfg.get("target_modules", ["query", "value"]),
-    } if lora_cfg.get("enabled", True) else None
-
-    # Build model — read pool_strategy from comparison section
-    comparison_cfg = model_cfg.get("comparison", {})
-    pool_strategy = comparison_cfg.get("pool_strategy", "mean_max")
-    use_cross_attention = comparison_cfg.get("use_cross_attention", False)
-    cross_attn_heads = comparison_cfg.get("cross_attn_heads", 4)
-    cross_attn_dropout = comparison_cfg.get("cross_attn_dropout", 0.1)
-    classifier_hidden_dims = model_cfg.get("classifier", {}).get("hidden_dims", [256, 64])
-    classifier_dropout = model_cfg.get("classifier", {}).get("dropout", 0.3)
-
-    # Resolve mixed precision early (needed by both cached and standard paths)
-    mixed_precision = args.mixed_precision or train_cfg.get("mixed_precision", "no")
-    if mixed_precision != "no" and device != "cuda":
-        logger.warning(f"Mixed precision '{mixed_precision}' requires CUDA. Falling back to 'no'.")
-        mixed_precision = "no"
-
-    logger.info(f"Building model with ESM2: {esm2_name}")
-    model = PLMLoFModel(
-        esm2_model_name=esm2_name,
-        freeze_esm2=True,
-        lora_config=lora_config,
-        pool_strategy=pool_strategy,
-        classifier_hidden_dims=classifier_hidden_dims,
-        classifier_dropout=classifier_dropout,
-        use_cross_attention=use_cross_attention,
-        cross_attn_heads=cross_attn_heads,
-        cross_attn_dropout=cross_attn_dropout,
+    batch = int(train_cfg.get("batch_size", 256))
+    train_loader = DataLoader(
+        train_ds, batch_size=batch, shuffle=True,
+        num_workers=args.num_workers, pin_memory=(device == "cuda"),
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch, shuffle=False,
+        num_workers=args.num_workers, pin_memory=(device == "cuda"),
     )
 
-    # ── Pre-computed embedding mode (fast Stage 1 only) ──────────────────
-    # If --stage2-only with --precomputed, skip cached trainer and go straight to Stage 2
-    if args.precomputed and not args.stage2_only:
-        emb_dir = Path(args.precomputed)
-        train_cache = emb_dir / "train_embeddings.pt"
-        val_cache = emb_dir / "val_embeddings.pt"
-
-        logger.info(f"Using pre-computed embeddings from {emb_dir}")
-        train_dataset = CachedEmbeddingDataset(train_cache)
-        if not val_cache.exists():
-            logger.error(
-                f"Validation embeddings not found: {val_cache}\n"
-                "Re-run precompute_embeddings.py with --val-data, or provide --val-data "
-                "when training without --precomputed."
-            )
-            sys.exit(1)
-        val_dataset = CachedEmbeddingDataset(val_cache)
-        logger.info(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
-
-        # Respect --num-workers flag (or auto-detect) in cached mode too
-        cached_workers = args.num_workers
-        if cached_workers is None:
-            cached_workers = 4 if device == "cuda" else 0
-
-        train_loader = DataLoader(
-            train_dataset, batch_size=batch_size_s1 * 4, shuffle=True,
-            num_workers=cached_workers, pin_memory=(device == "cuda"),
-        )
-        val_loader = DataLoader(
-            val_dataset, batch_size=batch_size_s1 * 4, shuffle=False,
-            num_workers=cached_workers, pin_memory=(device == "cuda"),
-        )
-
-        # Build lightweight model (comparison + classifier only)
-        hidden_size = train_dataset.ref_mean.shape[1]
-        from plmlof.models.comparison import ComparisonModule
-        from plmlof.models.classifier import ClassifierHead, RegressionHead
-        from plmlof.data.features import NUM_NUCLEOTIDE_FEATURES
-
-        comparison = ComparisonModule(
-            hidden_size=hidden_size,
-            pool_strategy=pool_strategy,
-            use_cross_attention=use_cross_attention,
-            cross_attn_heads=cross_attn_heads,
-            cross_attn_dropout=cross_attn_dropout,
-        )
-        classifier_input = comparison.output_size + NUM_NUCLEOTIDE_FEATURES
-        classifier = ClassifierHead(
-            input_size=classifier_input,
-            hidden_dims=classifier_hidden_dims,
-            num_classes=3,
-            dropout=classifier_dropout,
-        )
-
-        # Multi-task regression head for DMS z-score prediction
-        regression_weight = train_cfg.get("regression_weight", 0.1)
-        regressor = RegressionHead(input_size=classifier_input)
-        logger.info(f"Multi-task: classification + regression (weight={regression_weight})")
-
-        cached_trainer = CachedTrainer(
-            comparison=comparison,
-            classifier=classifier,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            device=device,
-            output_dir=output_dir,
-            class_weights=train_cfg.get("class_weights", None),
-            label_smoothing=train_cfg.get("label_smoothing", 0.0),
-            mixed_precision=mixed_precision,
-            regressor=regressor,
-            regression_weight=regression_weight,
-            regression_warmup_epochs=train_cfg.get("regression_warmup_epochs", 3),
-            focal_gamma=train_cfg.get("focal_gamma", 0.0),
-            use_cross_attention=use_cross_attention,
-            cross_attn_heads=cross_attn_heads,
-            cross_attn_dropout=cross_attn_dropout,
-            esm2_model_name=esm2_name,
-            pool_strategy=pool_strategy,
-            classifier_hidden_dims=classifier_hidden_dims,
-            classifier_dropout=classifier_dropout,
-            lora_config=lora_config,
-            warmup_ratio=s1_cfg.get("warmup_ratio", 0.1),
-            curriculum_z_thresh=s1_cfg.get("curriculum_z_thresh", 0.0),
-            curriculum_epochs=s1_cfg.get("curriculum_epochs", 0),
-            scheduler=s1_cfg.get("scheduler", "cosine"),
-            mixup_alpha=train_cfg.get("mixup_alpha", 0.0),
-            mixup_prob=train_cfg.get("mixup_prob", 0.5),
-            noise_scale=train_cfg.get("noise_scale", 0.0),
-        )
-
-        logger.info("=" * 60)
-        logger.info("STAGE 1 (CACHED): Training comparison + classifier head")
-        logger.info("=" * 60)
-        cached_trainer.train(
-            max_epochs=max_epochs_s1,
-            learning_rate=lr_s1,
-            patience=train_cfg.get("early_stopping_patience", 5),
-            grad_accum_steps=grad_accum_s1,
-        )
-        logger.info("Training complete!")
-        logger.info(f"Best model saved to {output_dir}/checkpoints/model_best.pt")
-        
-        # If Stage 2 is requested with cached embeddings, proceed to Stage 2 below
-        # Otherwise, exit after cached Stage 1
-        if not args.stage2_only:
-            return
-
-    # ── Standard mode (ESM2 forward passes each batch) ────────────────────
-    # For --stage2-only with --precomputed, load checkpoint here before building Stage 2 trainer
-    if args.stage2_only and args.precomputed:
-        if not args.checkpoint:
-            logger.error("--stage2-only with --precomputed requires --checkpoint to load Stage 1 weights")
-            sys.exit(1)
-        logger.info(f"Loading Stage 1 checkpoint for Stage 2 fine-tuning: {args.checkpoint}")
-    
-    # Build datasets
-    if args.tiny or (args.train_data is None):
-        logger.info("Using synthetic dataset for testing")
-        train_dataset = SyntheticPLMLoFDataset(num_samples=60, seed=seed)
-        val_dataset = SyntheticPLMLoFDataset(num_samples=20, seed=seed + 1)
-    else:
-        train_dataset = PLMLoFDataset(args.train_data)
-        if args.val_data is None:
-            logger.error(
-                "--val-data is required when --train-data is provided. "
-                "Without a separate validation set the model evaluates on training data, "
-                "metrics are inflated, and early stopping is meaningless."
-            )
-            sys.exit(1)
-        val_dataset = PLMLoFDataset(args.val_data)
-
-    collator = PLMLoFCollator(tokenizer_name=esm2_name)
-
-    num_workers = args.num_workers
-    if num_workers is None:
-        num_workers = 4 if device == "cuda" else 0
-
-    def _make_loaders(batch_size: int):
-        tl = DataLoader(
-            train_dataset, batch_size=batch_size, shuffle=True,
-            collate_fn=collator, num_workers=num_workers,
-            pin_memory=(device == "cuda"),
-        )
-        vl = DataLoader(
-            val_dataset, batch_size=batch_size, shuffle=False,
-            collate_fn=collator, num_workers=num_workers,
-            pin_memory=(device == "cuda"),
-        )
-        return tl, vl
-
-    train_loader, val_loader = _make_loaders(batch_size_s1)
-
-    # Build trainer
-    trainer = PLMLoFTrainer(
-        model=model,
+    net = TaskNet(
+        hidden_size=hidden,
+        task=args.task,
+        pool_strategy=model_cfg.get("pool_strategy", "mean_max"),
+        use_cross_attention=model_cfg.get("use_cross_attention", False),
+        head_hidden=int(model_cfg.get("head_hidden", 128)),
+        dropout=float(model_cfg.get("dropout", 0.2)),
+    )
+    precision = args.mixed_precision or train_cfg.get("mixed_precision", "bf16")
+    trainer = Trainer(
+        net=net,
         train_loader=train_loader,
         val_loader=val_loader,
         device=device,
-        output_dir=output_dir,
-        label_smoothing=model_cfg.get("classifier", {}).get("label_smoothing", 0.05),
-        mixed_precision=mixed_precision,
-        focal_gamma=train_cfg.get("focal_gamma", 0.0),
+        output_dir=args.output_dir,
+        mixed_precision=precision,
+        gof_threshold=float(train_cfg.get("gof_threshold", 0.90)),
+        esm2_model_name=esm_name,
+        pool_strategy=model_cfg.get("pool_strategy", "mean_max"),
+        seed=args.seed,
+    )
+    trainer.train(
+        max_epochs=args.max_epochs or int(train_cfg.get("max_epochs", 20)),
+        learning_rate=float(train_cfg.get("learning_rate", 1e-3)),
+        weight_decay=float(train_cfg.get("weight_decay", 0.01)),
+        patience=int(train_cfg.get("early_stopping_patience", 5)),
+        grad_accum_steps=int(train_cfg.get("gradient_accumulation_steps", 1)),
+        warmup_ratio=float(train_cfg.get("warmup_ratio", 0.1)),
     )
 
-    # Save model config for later reconstruction during inference/eval
-    trainer.model_config = {
-        "esm2_model_name": esm2_name,
-        "classifier_hidden_dims": classifier_hidden_dims,
-        "classifier_dropout": classifier_dropout,
-        "pool_strategy": pool_strategy,
-        "lora_config": lora_config,
-        "use_cross_attention": use_cross_attention,
-        "cross_attn_heads": cross_attn_heads,
-        "cross_attn_dropout": cross_attn_dropout,
-    }
-
-    # Load checkpoint if provided
-    if args.checkpoint:
-        ckpt_path = Path(args.checkpoint)
-        if not ckpt_path.exists():
-            logger.error(f"Checkpoint not found: {ckpt_path}")
-            sys.exit(1)
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-        if "model_state_dict" in ckpt:
-            model.load_state_dict(ckpt["model_state_dict"])
-        elif ckpt.get("cached_training"):
-            # Checkpoint from CachedTrainer — load submodule weights. Cross-attention
-            # (if enabled) is a submodule of `comparison`, so it's already included
-            # in comparison_state_dict as long as `model` was built with the same
-            # use_cross_attention/cross_attn_heads config used at cache-train time.
-            model.comparison.load_state_dict(ckpt["comparison_state_dict"])
-            model.classifier.load_state_dict(ckpt["classifier_state_dict"])
-            if "feature_norm_state_dict" in ckpt:
-                model.feature_norm.load_state_dict(ckpt["feature_norm_state_dict"])
-        else:
-            logger.error(f"Unknown checkpoint format: keys={list(ckpt.keys())}")
-            sys.exit(1)
-        logger.info(f"Loaded checkpoint from {ckpt_path} (epoch {ckpt.get('epoch', '?')})")
-
-    # Stage 1: Classification head only (ESM2 frozen)
-    if not args.stage2_only:
-        logger.info("=" * 60)
-        logger.info("STAGE 1: Training classification head (ESM2 frozen)")
-        logger.info("=" * 60)
-        trainer.train(
-            stage=1,
-            max_epochs=max_epochs_s1,
-            learning_rate=lr_s1,
-            patience=train_cfg.get("early_stopping_patience", 5),
-            grad_accum_steps=grad_accum_s1,
-        )
+    if args.task == "lof":
+        intact = ~train_full.is_wreck
+        if not bool(intact.any()):
+            intact = torch.ones(len(train_full), dtype=torch.bool)
+        idx = intact.nonzero(as_tuple=False).view(-1).tolist()
+        gal_mean = train_full.var_mean[intact]
     else:
-        if not args.checkpoint:
-            logger.error("--stage2-only requires --checkpoint to load Stage 1 weights")
-            sys.exit(1)
-        logger.info("Skipping Stage 1 (--stage2-only)")
-
-    # Stage 2: LoRA fine-tuning (skip in tiny mode or if no LoRA)
-    if lora_config and not args.tiny:
-        # Rebuild loaders with stage2 batch size if different
-        if batch_size_s2 != batch_size_s1:
-            train_loader, val_loader = _make_loaders(batch_size_s2)
-            trainer.train_loader = train_loader
-            trainer.val_loader = val_loader
-        logger.info("=" * 60)
-        logger.info("STAGE 2: Fine-tuning with LoRA")
-        logger.info("=" * 60)
-        trainer.train(
-            stage=2,
-            max_epochs=max_epochs_s2,
-            learning_rate=lr_s2,
-            patience=train_cfg.get("early_stopping_patience", 5),
-            grad_accum_steps=grad_accum_s2,
-        )
-
-    logger.info("Training complete!")
-    logger.info(f"Best model saved to {output_dir}/checkpoints/model_best.pt")
+        miss = train_full.is_missense
+        if not bool(miss.any()):
+            miss = torch.ones(len(train_full), dtype=torch.bool)
+        idx = miss.nonzero(as_tuple=False).view(-1).tolist()
+        gal_mean = train_full.ref_mean[miss]
+    save_gallery(
+        Path(args.output_dir) / "train_gallery.pt",
+        gal_mean,
+        [train_full.genes[i] for i in idx],
+        [train_full.protein_ids[i] for i in idx],
+    )
+    meta = {
+        "task": args.task,
+        "seed": args.seed,
+        "esm2_model_name": esm_name,
+        "hidden_size": hidden,
+    }
+    (Path(args.output_dir) / "model_config.json").write_text(json.dumps(meta, indent=2))
+    logger.info("Done → %s", args.output_dir)
 
 
 if __name__ == "__main__":

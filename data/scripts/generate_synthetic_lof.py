@@ -25,8 +25,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from plmlof.v2.domains import load_domain_map, protein_id, sample_events
-from plmlof.v2.gbff import iter_cds
+from plmlof.domains import load_domain_map, protein_id, sample_events
+from plmlof.gbff import iter_cds
 
 logger = logging.getLogger(__name__)
 

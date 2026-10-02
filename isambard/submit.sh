@@ -4,16 +4,16 @@
 #
 #   bash isambard/submit.sh smoke            # cheap GPU check (ESM2-8M only)
 #   bash isambard/submit.sh setup
-#   bash isambard/submit.sh pipeline         # v2 embed + train + eval (tables must already be on disk)
+#   bash isambard/submit.sh pipeline         # embed + train + eval (tables must already be on disk)
 #   bash isambard/submit.sh pipeline --train-only
 #   bash isambard/submit.sh pipeline --eval-only
 #   bash isambard/submit.sh embed
 #   bash isambard/submit.sh all              # setup, then pipeline after setup succeeds
-#   bash isambard/submit.sh test             # smoke train if venv already exists
+#   bash isambard/submit.sh test             # smoke if venv already exists
 #
 # Training data is NOT downloaded here. On a laptop:
-#   bash scripts/prepare_v2_local.sh
-#   rsync -avP data/processed/v2/ HOST:$PROJECTDIR/$USER/PLMLoF/data/processed/v2/
+#   bash scripts/prepare_local.sh
+#   rsync -avP data/processed/{lof,mlof,growth_gof,amr_gof} HOST:$PROJECTDIR/$USER/PLMLoF/data/processed/
 
 set -euo pipefail
 
@@ -43,12 +43,12 @@ submit_one() {
 case "$ACTION" in
     smoke)
         submit_one smoke.sbatch
-        echo "Submitted smoke (max 20 min, 1 GPU). Env check only — not v2 training."
+        echo "Submitted smoke (max 20 min, 1 GPU). Env check only — not training."
         ;;
     setup)
         submit_one setup.sbatch
         ;;
-    pipeline|v2)
+    pipeline)
         submit_one pipeline.sbatch "$@"
         ;;
     embed)
@@ -56,8 +56,8 @@ case "$ACTION" in
         ;;
     data)
         echo "Training data is prepared on a laptop, not on Isambard." >&2
-        echo "  bash scripts/prepare_v2_local.sh" >&2
-        echo "  rsync -avP data/processed/v2/ HOST:\$PROJECTDIR/\$USER/PLMLoF/data/processed/v2/" >&2
+        echo "  bash scripts/prepare_local.sh" >&2
+        echo "  rsync -avP data/processed/{lof,mlof,growth_gof,amr_gof} HOST:\$PROJECTDIR/\$USER/PLMLoF/data/processed/" >&2
         exit 1
         ;;
     test)

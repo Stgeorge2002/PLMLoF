@@ -9,8 +9,8 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from plmlof.v2.dataset import V2CachedDataset
-from plmlof.v2.predictor import discover_ensemble, _load_net
+from plmlof.dataset import CachedDataset
+from plmlof.predictor import discover_ensemble, _load_net
 
 logger = logging.getLogger(__name__)
 
@@ -18,8 +18,8 @@ logger = logging.getLogger(__name__)
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     p = argparse.ArgumentParser()
-    p.add_argument("--task", required=True, choices=["lof", "growth_gof", "amr_gof"])
-    p.add_argument("--ensemble-dir", type=Path, required=True, help="outputs/v2/<task>")
+    p.add_argument("--task", required=True, choices=["lof", "mlof", "growth_gof", "amr_gof"])
+    p.add_argument("--ensemble-dir", type=Path, required=True, help="outputs/<task>")
     p.add_argument("--embeddings", type=Path, required=True, help="null_embeddings.pt")
     p.add_argument("--device", default=None)
     p.add_argument("--batch-size", type=int, default=512)
@@ -30,7 +30,7 @@ def main() -> None:
     if not members:
         raise SystemExit(f"No ensemble members in {args.ensemble_dir}")
     nets = [_load_net(m, device) for m in members]
-    ds = V2CachedDataset(args.embeddings)
+    ds = CachedDataset(args.embeddings)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False)
 
     acc = []

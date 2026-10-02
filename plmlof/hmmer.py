@@ -9,11 +9,10 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from plmlof.v2.domains import protein_id
+from plmlof.domains import protein_id
 
 logger = logging.getLogger(__name__)
 
-# Inclusive domain i-Evalue if gathering cutoffs are unavailable.
 DOM_EVALUE = 1e-5
 MIN_HMM_BYTES = 50_000_000
 
