@@ -39,6 +39,32 @@ class TestComparisonModule:
         assert out.shape == (b, comp.output_size)
 
 
+class TestSiteBank:
+    def test_roundtrip_and_missing(self, tmp_path):
+        from plmlof.embed import SiteBank
+
+        bank = SiteBank(n_slots=4, dim=3, path=tmp_path / "sites.dat")
+        try:
+            bank.add("AAA", [0, 2], torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]))
+            assert bank.get("AAA", 0).tolist() == [1.0, 2.0, 3.0]
+            assert bank.get("AAA", 2).tolist() == [4.0, 5.0, 6.0]
+            assert bank.get("AAA", 1) is None
+            assert bank.get("BBB", 0) is None
+        finally:
+            bank.close()
+
+    def test_overflow_fails_fast(self):
+        from plmlof.embed import SiteBank
+
+        bank = SiteBank(n_slots=1, dim=2)
+        bank.add("A", [0], torch.ones(1, 2))
+        try:
+            bank.add("B", [0], torch.ones(1, 2))
+            raise AssertionError("expected overflow")
+        except RuntimeError as exc:
+            assert "overflow" in str(exc)
+
+
 class TestSiteCompare:
     def test_delta_changes_output(self):
         from plmlof.model import SiteCompare

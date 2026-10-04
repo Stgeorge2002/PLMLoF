@@ -23,7 +23,7 @@ from transformers import AutoModel, AutoTokenizer
 
 from plmlof.constants import TASKS
 from plmlof.dataset import PairDataset
-from plmlof.embed import embed_unique_sequences
+from plmlof.embed import SiteBank, embed_unique_sequences
 from plmlof.encoders import ESM2_PAIR, esm2_for_task, read_encoder_meta, write_encoder_meta
 from plmlof.sites import neighbor_indices
 
@@ -32,18 +32,25 @@ logger = logging.getLogger(__name__)
 SPLITS = ("train", "val", "test", "protein_test", "null")
 
 
-def _site_window(seq: str, center: int, site_bank: dict[tuple[str, int], torch.Tensor], dim: int) -> torch.Tensor:
-    window = torch.zeros(3, dim, dtype=torch.float32)
-    if center < 0 or not seq:
-        return window
-    left, mid, right = neighbor_indices(center, len(seq))
-    for slot, residue in enumerate((left, mid, right)):
-        if residue < 0:
+def _fill_site_windows(
+    sequences: list[str],
+    centers: list[int],
+    bank: SiteBank,
+    dim: int,
+) -> torch.Tensor:
+    """Write ``[N, 3, D]`` windows in place — no per-row Tensor stack."""
+    out = torch.zeros(len(sequences), 3, dim, dtype=torch.float32)
+    for i, (seq, center) in enumerate(zip(sequences, centers)):
+        if center < 0 or not seq:
             continue
-        vec = site_bank.get((seq, residue))
-        if vec is not None:
-            window[slot] = vec
-    return window
+        left, mid, right = neighbor_indices(center, len(seq))
+        for slot, residue in enumerate((left, mid, right)):
+            if residue < 0:
+                continue
+            vec = bank.get(seq, residue)
+            if vec is not None:
+                out[i, slot].copy_(torch.as_tensor(vec, dtype=torch.float32))
+    return out
 
 
 def scatter(
@@ -52,7 +59,7 @@ def scatter(
     mean_t: torch.Tensor,
     max_t: torch.Tensor,
     out: Path,
-    site_bank: dict[tuple[str, int], torch.Tensor] | None = None,
+    site_bank: SiteBank | None = None,
     store_sites: bool = False,
 ) -> None:
     n = len(dataset)
@@ -60,13 +67,10 @@ def scatter(
     ref_idx = torch.tensor([seq_to_idx[s] for s in dataset._ref], dtype=torch.long)
     var_idx = torch.tensor([seq_to_idx[s] for s in dataset._var], dtype=torch.long)
     if store_sites:
-        bank = site_bank or {}
-        site_ref = torch.stack([
-            _site_window(seq, c, bank, hidden) for seq, c in zip(dataset._ref, dataset._site_index)
-        ])
-        site_var = torch.stack([
-            _site_window(seq, c, bank, hidden) for seq, c in zip(dataset._var, dataset._site_index)
-        ])
+        if site_bank is None:
+            raise RuntimeError(f"MLoF scatter requires a site bank: {out}")
+        site_ref = _fill_site_windows(dataset._ref, dataset._site_index, site_bank, hidden)
+        site_var = _fill_site_windows(dataset._var, dataset._site_index, site_bank, hidden)
     else:
         site_ref = torch.zeros(n, 3, hidden, dtype=torch.float32)
         site_var = torch.zeros(n, 3, hidden, dtype=torch.float32)
@@ -127,7 +131,12 @@ def main() -> None:
     p.add_argument("--esm2-model", default=None, help="Override pair-head encoder (MLoF/GoF)")
     p.add_argument("--esm2-model-lof", default=None, help="Override LoF encoder")
     p.add_argument("--model-config", type=Path, default=Path("configs/model.yaml"))
-    p.add_argument("--no-compile", action="store_true")
+    p.add_argument(
+        "--compile",
+        action="store_true",
+        help="torch.compile (off by default: variable-length ESM recompiles and leaks graphs)",
+    )
+    p.add_argument("--no-compile", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--tasks", nargs="*", default=list(TASKS))
     args = p.parse_args()
 
@@ -176,16 +185,20 @@ def main() -> None:
         model.eval()
         for p_ in model.parameters():
             p_.requires_grad = False
-        if not args.no_compile and hasattr(torch, "compile") and device.type == "cuda":
+        if args.compile and hasattr(torch, "compile") and device.type == "cuda":
             try:
                 model = torch.compile(model)
             except RuntimeError as exc:
                 logger.warning("torch.compile skipped: %s", exc)
+        elif need_sites:
+            logger.info("torch.compile off (site banking + variable-length ESM)")
 
+        site_path = args.output_dir / "_mlof_site_bank.dat" if need_sites else None
         ordered, mean_t, max_t, site_bank = embed_unique_sequences(
             list(unique), model, tokenizer, device,
             args.batch_size, args.max_seq_length, num_workers=args.num_workers,
             residue_requests=dict(residue_requests) if need_sites else None,
+            site_store_path=site_path,
         )
         del model
         if device.type == "cuda":
@@ -193,18 +206,22 @@ def main() -> None:
         seq_to_idx = {s: i for i, s in enumerate(ordered)}
         hidden = int(mean_t.shape[1])
         stamped: set[str] = set()
-        for task, split, ds, dest in jobs:
-            logger.info("Scatter %s/%s", task, split)
-            scatter(
-                ds, seq_to_idx, mean_t, max_t, dest,
-                site_bank=site_bank, store_sites=(task == "mlof"),
-            )
-            if task not in stamped:
-                write_encoder_meta(
-                    dest.parent, esm_name, hidden,
-                    site_embeddings=(task == "mlof"),
+        try:
+            for task, split, ds, dest in jobs:
+                logger.info("Scatter %s/%s", task, split)
+                scatter(
+                    ds, seq_to_idx, mean_t, max_t, dest,
+                    site_bank=site_bank, store_sites=(task == "mlof"),
                 )
-                stamped.add(task)
+                if task not in stamped:
+                    write_encoder_meta(
+                        dest.parent, esm_name, hidden,
+                        site_embeddings=(task == "mlof"),
+                    )
+                    stamped.add(task)
+        finally:
+            if site_bank is not None:
+                site_bank.close()
 
     logger.info("Embeddings complete → %s", args.output_dir)
 

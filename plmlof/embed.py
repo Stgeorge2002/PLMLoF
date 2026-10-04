@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
@@ -24,6 +26,64 @@ class _LenSortedSeqs(Dataset):
         return self.sequences[idx]
 
 
+class SiteBank:
+    """Packed residue tokens: one ``[N, D]`` store plus an int index.
+
+    A ``dict[(seq, residue)] → Tensor[D]`` OOMs on the ESM2-650M unique-seq
+    pass — millions of PyTorch objects plus a full ``[B, T, D]`` float32 copy
+    every batch. This keeps one array (RAM or a scratch memmap) and never
+    materialises the unused tokens.
+    """
+
+    def __init__(self, n_slots: int, dim: int, path: Path | None = None):
+        if n_slots < 0 or dim < 1:
+            raise ValueError(f"n_slots={n_slots} dim={dim}")
+        self.dim = int(dim)
+        self._index: dict[tuple[str, int], int] = {}
+        self._next = 0
+        self._path = Path(path) if path is not None else None
+        shape = (max(int(n_slots), 1), self.dim)
+        if self._path is not None:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            if self._path.exists():
+                self._path.unlink()
+            self._store = np.memmap(self._path, dtype=np.float32, mode="w+", shape=shape)
+        else:
+            self._store = np.zeros(shape, dtype=np.float32)
+
+    def add(self, seq: str, residues: list[int], vecs: torch.Tensor) -> None:
+        if vecs.ndim != 2 or vecs.size(0) != len(residues) or vecs.size(1) != self.dim:
+            raise ValueError(
+                f"vecs {tuple(vecs.shape)} does not match residues={len(residues)} D={self.dim}"
+            )
+        n = len(residues)
+        start = self._next
+        if start + n > self._store.shape[0]:
+            raise RuntimeError(
+                f"site bank overflow: need {start + n} slots, have {self._store.shape[0]}"
+            )
+        self._store[start:start + n] = vecs.detach().float().cpu().numpy()
+        for i, residue in enumerate(residues):
+            self._index[(seq, int(residue))] = start + i
+        self._next = start + n
+
+    def get(self, seq: str, residue: int) -> np.ndarray | None:
+        row = self._index.get((seq, int(residue)))
+        if row is None:
+            return None
+        return np.asarray(self._store[row])
+
+    def close(self) -> None:
+        store = getattr(self, "_store", None)
+        if store is not None and hasattr(store, "flush"):
+            store.flush()
+        self._store = None
+        self._index.clear()
+        if self._path is not None and self._path.exists():
+            self._path.unlink()
+            self._path = None
+
+
 def _pool(hidden: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     mask_f = mask.unsqueeze(-1).float()
     mean_p = (hidden * mask_f).sum(1) / mask_f.sum(1).clamp(min=1)
@@ -31,6 +91,14 @@ def _pool(hidden: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch
     max_p = masked.max(dim=1).values
     max_p = max_p.masked_fill(max_p == float("-inf"), 0.0)
     return mean_p, max_p
+
+
+def _hidden_dim(model) -> int:
+    cfg = getattr(model, "config", None)
+    dim = getattr(cfg, "hidden_size", None) if cfg is not None else None
+    if dim:
+        return int(dim)
+    raise ValueError("model.config.hidden_size is required to bank residue tokens")
 
 
 @torch.no_grad()
@@ -43,8 +111,9 @@ def embed_unique_sequences(
     max_length: int,
     num_workers: int = 4,
     residue_requests: dict[str, set[int]] | None = None,
-) -> tuple[list[str], torch.Tensor, torch.Tensor, dict[tuple[str, int], torch.Tensor]]:
-    """Pool unique sequences; optionally bank residue tokens at requested indices."""
+    site_store_path: Path | str | None = None,
+) -> tuple[list[str], torch.Tensor, torch.Tensor, SiteBank | None]:
+    """Pool unique sequences; optionally bank only the requested residue tokens."""
     ds = _LenSortedSeqs(sequences)
 
     def collate(batch: list[str]) -> dict:
@@ -59,7 +128,15 @@ def embed_unique_sequences(
         num_workers=num_workers, pin_memory=(device.type == "cuda"),
     )
     means, maxes, ordered = [], [], []
-    site_bank: dict[tuple[str, int], torch.Tensor] = {}
+    site_bank: SiteBank | None = None
+    if residue_requests:
+        n_slots = sum(len(v) for v in residue_requests.values())
+        path = Path(site_store_path) if site_store_path is not None else None
+        site_bank = SiteBank(n_slots, _hidden_dim(model), path)
+        logger.info(
+            "Site bank  slots=%s  D=%s  store=%s",
+            n_slots, site_bank.dim, path if path is not None else "ram",
+        )
     use_amp = device.type == "cuda"
     amp_dtype = torch.bfloat16
     if use_amp:
@@ -76,12 +153,23 @@ def embed_unique_sequences(
         maxes.append(max_p.float().cpu())
         seqs = batch["sequences"]
         ordered.extend(seqs)
-        if residue_requests:
-            hidden_cpu = hidden.float().cpu()
-            n_tok = hidden_cpu.size(1)
+        if site_bank is not None and residue_requests:
+            n_tok = hidden.size(1)
             for b, seq in enumerate(seqs):
-                for residue in residue_requests.get(seq, ()):
+                requested = residue_requests.get(seq)
+                if not requested:
+                    continue
+                residues: list[int] = []
+                toks: list[int] = []
+                for residue in requested:
                     tok = token_index(int(residue))
                     if 0 <= tok < n_tok:
-                        site_bank[(seq, int(residue))] = hidden_cpu[b, tok].contiguous()
+                        residues.append(int(residue))
+                        toks.append(tok)
+                if not toks:
+                    continue
+                tok_t = torch.tensor(toks, device=hidden.device, dtype=torch.long)
+                site_bank.add(seq, residues, hidden[b].index_select(0, tok_t))
+        del hidden
+
     return ordered, torch.cat(means), torch.cat(maxes), site_bank

@@ -177,7 +177,8 @@ if [[ "$MODE" == "full" || "$MODE" == "embed" || "$MODE" == "train" ]]; then
         --model-config "$MODEL_CFG" \
         --device "$DEVICE" \
         --batch-size 128 \
-        --num-workers 8 \
+        --num-workers 2 \
+        --no-compile \
         --tasks "${TASKS[@]}"
 fi
 
