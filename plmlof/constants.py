@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 TASKS = ("lof", "mlof", "growth_gof", "amr_gof")
+# GoF heads stay in the tree but are not trained or evaluated.
+# Restore: TRAIN_TASKS = TASKS
+TRAIN_TASKS = ("lof", "mlof")
+# TRAIN_TASKS = ("lof", "mlof", "growth_gof", "amr_gof")
 REGRESSION_TASKS = frozenset({"lof", "mlof"})
 
 LOF_WRECK = 1.00

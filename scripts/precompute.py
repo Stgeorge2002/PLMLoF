@@ -21,7 +21,7 @@ import torch
 import yaml
 from transformers import AutoModel, AutoTokenizer
 
-from plmlof.constants import TASKS
+from plmlof.constants import TRAIN_TASKS
 from plmlof.dataset import PairDataset
 from plmlof.embed import SiteBank, embed_unique_sequences
 from plmlof.encoders import ESM2_PAIR, esm2_for_task, read_encoder_meta, write_encoder_meta
@@ -137,7 +137,7 @@ def main() -> None:
         help="torch.compile (off by default: variable-length ESM recompiles and leaks graphs)",
     )
     p.add_argument("--no-compile", action="store_true", help=argparse.SUPPRESS)
-    p.add_argument("--tasks", nargs="*", default=list(TASKS))
+    p.add_argument("--tasks", nargs="*", default=list(TRAIN_TASKS))
     args = p.parse_args()
 
     model_cfg = _load_model_cfg(args.model_config)

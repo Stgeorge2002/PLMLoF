@@ -483,3 +483,22 @@ class TestEncoders:
         cfg = {"esm2_model_name_lof": "facebook/esm2_t6_8M_UR50D", "esm2_model_name": "facebook/esm2_t30_150M_UR50D"}
         assert esm2_for_task("lof", cfg).endswith("8M_UR50D")
         assert esm2_for_task("mlof", cfg).endswith("150M_UR50D")
+
+
+class TestTrainTasks:
+    def test_gof_is_frozen(self):
+        from plmlof.constants import TASKS, TRAIN_TASKS
+
+        assert TRAIN_TASKS == ("lof", "mlof")
+        assert "growth_gof" in TASKS and "amr_gof" in TASKS
+
+    def test_sweep_names_unique(self):
+        from pathlib import Path
+
+        import yaml
+
+        payload = yaml.safe_load(Path("configs/sweeps.yaml").read_text())
+        for task in ("lof", "mlof"):
+            names = [row["name"] for row in payload[task]]
+            assert names
+            assert len(names) == len(set(names))

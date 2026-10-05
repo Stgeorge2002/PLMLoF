@@ -44,10 +44,39 @@ def main() -> None:
     p.add_argument("--mixed-precision", default=None)
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--max-epochs", type=int, default=None)
+    p.add_argument("--learning-rate", type=float, default=None)
+    p.add_argument("--patience", type=int, default=None)
+    p.add_argument("--batch-size", type=int, default=None)
+    p.add_argument("--rank-loss-weight", type=float, default=None)
+    p.add_argument("--regression-loss-weight", type=float, default=None)
+    p.add_argument("--mlof-proteins-per-batch", type=int, default=None)
+    p.add_argument("--head-hidden", type=int, default=None)
+    p.add_argument("--dropout", type=float, default=None)
+    p.add_argument(
+        "--drop-sure-wrecks",
+        action="store_true",
+        help="Drop sure wrecks from the train set (always on for MLoF; optional for LoF)",
+    )
     args = p.parse_args()
 
     train_cfg = load_yaml(args.config).get("training", {})
     model_cfg = load_yaml(args.model_config).get("model", {})
+    if args.learning_rate is not None:
+        train_cfg["learning_rate"] = args.learning_rate
+    if args.patience is not None:
+        train_cfg["early_stopping_patience"] = args.patience
+    if args.batch_size is not None:
+        train_cfg["batch_size"] = args.batch_size
+    if args.rank_loss_weight is not None:
+        train_cfg["rank_loss_weight"] = args.rank_loss_weight
+    if args.regression_loss_weight is not None:
+        train_cfg["regression_loss_weight"] = args.regression_loss_weight
+    if args.mlof_proteins_per_batch is not None:
+        train_cfg["mlof_proteins_per_batch"] = args.mlof_proteins_per_batch
+    if args.head_hidden is not None:
+        model_cfg["head_hidden"] = args.head_hidden
+    if args.dropout is not None:
+        model_cfg["dropout"] = args.dropout
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)
     if device == "cuda":
@@ -67,15 +96,16 @@ def main() -> None:
         raise SystemExit(
             f"{task_emb} has pooled embeddings only. Delete that dir and re-run scripts/precompute.py"
         )
-    if args.task == "mlof":
+    filter_wrecks = args.task == "mlof" or args.drop_sure_wrecks
+    if filter_wrecks:
         keep = lof_train_keep_indices(
             train_full.is_wreck, train_full.is_missense, train_full.targets,
             channels=list(train_full.channels), seed=args.seed,
         )
         train_ds = Subset(train_full, keep)
         logger.info(
-            "MLoF train filter %s → %s (no sure wrecks, capped identity WT)",
-            len(train_full), len(train_ds),
+            "%s train filter %s → %s (no sure wrecks, capped identity WT)",
+            args.task, len(train_full), len(train_ds),
         )
     else:
         train_ds = train_full

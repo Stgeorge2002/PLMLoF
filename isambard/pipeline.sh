@@ -56,11 +56,12 @@ while [[ $i -lt ${#ARGS[@]} ]]; do
         --train-only)  MODE="train" ;;
         --eval-only)   MODE="eval" ;;
         --embed-only)  MODE="embed" ;;
+        --sweep)       MODE="sweep" ;;
         --task)        i=$((i+1)); TASK="${ARGS[$i]}" ;;
         --seeds)       i=$((i+1)); SEEDS="${ARGS[$i]}" ;;
         --max-epochs)  i=$((i+1)); MAX_EPOCHS="${ARGS[$i]}" ;;
         --help|-h)
-            echo "Usage: bash isambard/pipeline.sh [--smoke|--train-only|--eval-only|--embed-only|--task lof|mlof|growth_gof|amr_gof|all|--max-epochs N]"
+            echo "Usage: bash isambard/pipeline.sh [--smoke|--train-only|--eval-only|--embed-only|--sweep|--task lof|mlof|all|--max-epochs N]"
             exit 0
             ;;
         *)
@@ -142,7 +143,9 @@ require_task() {
 
 TASKS=()
 if [[ "$TASK" == "all" ]]; then
-    for t in lof mlof growth_gof amr_gof; do
+    # GoF frozen. Restore growth_gof amr_gof in this list to train those heads again.
+    for t in lof mlof; do
+        # for t in lof mlof growth_gof amr_gof; do
         if [[ -f "$DATA_DIR/$t/train.parquet" ]]; then
             n=$(python -c "import pandas as pd; print(len(pd.read_parquet('$DATA_DIR/$t/train.parquet')))")
             if [[ "$n" -gt 0 ]]; then
@@ -167,6 +170,22 @@ if [[ ${#TASKS[@]} -eq 0 ]]; then
     exit 1
 fi
 require_task "lof"
+
+if [[ "$MODE" == "sweep" ]]; then
+    require_task "mlof"
+    echo "──────── LoF + MDG head sweep (cached embeddings, no GoF) ────────"
+    python scripts/sweep.py \
+        --precomputed "$EMB_DIR" \
+        --output-dir "$OUT_DIR/sweep" \
+        --sweep "${PLMLOF_ROOT}/configs/sweeps.yaml" \
+        --config "$TRAIN_CFG" \
+        --model-config "$MODEL_CFG" \
+        --device "$DEVICE" \
+        --mixed-precision "$PRECISION" \
+        --num-workers 8
+    echo "Sweep complete. Scoreboard: $OUT_DIR/sweep/scoreboard.tsv"
+    exit 0
+fi
 
 if [[ "$MODE" == "full" || "$MODE" == "embed" || "$MODE" == "train" ]]; then
     echo "──────── Precompute embeddings (no downloads) ────────"

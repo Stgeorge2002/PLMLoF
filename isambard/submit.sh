@@ -7,6 +7,7 @@
 #   bash isambard/submit.sh pipeline         # embed + train + eval (tables must already be on disk)
 #   bash isambard/submit.sh pipeline --train-only
 #   bash isambard/submit.sh pipeline --eval-only
+#   bash isambard/submit.sh pipeline --sweep     # LoF+MDG head ablations, no GoF
 #   bash isambard/submit.sh embed
 #   bash isambard/submit.sh all              # setup, then pipeline after setup succeeds
 #   bash isambard/submit.sh test             # smoke if venv already exists
@@ -51,6 +52,9 @@ case "$ACTION" in
     pipeline)
         submit_one pipeline.sbatch "$@"
         ;;
+    sweep)
+        submit_one pipeline.sbatch --sweep
+        ;;
     embed)
         submit_one pipeline.sbatch --embed-only
         ;;
@@ -73,7 +77,7 @@ case "$ACTION" in
         sed -n '2,20p' "$0"
         ;;
     *)
-        echo "Unknown action: $ACTION (expected smoke|setup|pipeline|embed|test|all)" >&2
+        echo "Unknown action: $ACTION (expected smoke|setup|pipeline|sweep|embed|test|all)" >&2
         exit 1
         ;;
 esac

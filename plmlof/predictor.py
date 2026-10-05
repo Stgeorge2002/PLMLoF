@@ -11,7 +11,7 @@ import torch
 from transformers import AutoModel, AutoTokenizer
 
 from plmlof.applicability import in_family_flags, load_gallery
-from plmlof.constants import GOF_CALL_THRESHOLD, IN_FAMILY_COSINE, TASKS
+from plmlof.constants import GOF_CALL_THRESHOLD, IN_FAMILY_COSINE, TRAIN_TASKS
 from plmlof.data.features import extract_nucleotide_features
 from plmlof.embed import _pool
 from plmlof.encoders import esm2_for_task
@@ -77,7 +77,8 @@ class Predictor:
         self.ensembles: dict[str, list[TaskNet]] = {}
         self.nulls: dict[str, np.ndarray] = {}
         self.galleries: dict[str, dict] = {}
-        for task in TASKS:
+        # GoF: iterate TASKS instead of TRAIN_TASKS to load growth_gof / amr_gof again.
+        for task in TRAIN_TASKS:
             tdir = self.model_dir / task
             members = discover_ensemble(tdir) if tdir.exists() else []
             if not members:
