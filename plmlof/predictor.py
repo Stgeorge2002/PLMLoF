@@ -15,7 +15,7 @@ from plmlof.chem import aa_token_ids, site_chem_at, site_llr
 from plmlof.constants import GOF_CALL_THRESHOLD, IN_FAMILY_COSINE, SITE_RADIUS, TRAIN_TASKS
 from plmlof.data.features import extract_nucleotide_features
 from plmlof.domains import DomainIndex, classify_position
-from plmlof.embed import _pool
+from plmlof.embed import _pool, forward_hidden_and_logits
 from plmlof.encoders import esm2_for_task
 from plmlof.inference.vcf_handler import VariantRecord, parse_fasta_pairs, parse_protein_fasta
 from plmlof.labels import display_bin
@@ -180,10 +180,8 @@ class Predictor:
         )
         ids = enc["input_ids"].to(self.device)
         mask = enc["attention_mask"].to(self.device)
-        out = encoder(ids, attention_mask=mask)
-        hidden = out.last_hidden_state
+        hidden, logits = forward_hidden_and_logits(encoder, ids, mask)
         mean_p, max_p = _pool(hidden, mask)
-        logits = getattr(out, "logits", None)
         return hidden, mean_p, max_p, logits
 
     @torch.no_grad()

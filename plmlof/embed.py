@@ -101,6 +101,26 @@ def _hidden_dim(model) -> int:
     raise ValueError("model.config.hidden_size is required to bank residue tokens")
 
 
+def forward_hidden_and_logits(model, ids: torch.Tensor, mask: torch.Tensor):
+    """Hidden tokens plus MLM logits.
+
+    ``EsmForMaskedLM`` returns ``MaskedLMOutput`` (logits only). Taking
+    ``output_hidden_states=True`` would stash every layer and OOM. The trunk
+    ``model.esm`` still exposes ``last_hidden_state``; ``lm_head`` maps it to V.
+    """
+    if hasattr(model, "esm"):
+        hidden = model.esm(ids, attention_mask=mask).last_hidden_state
+        logits = model.lm_head(hidden) if hasattr(model, "lm_head") else None
+        return hidden, logits
+    out = model(ids, attention_mask=mask)
+    hidden = getattr(out, "last_hidden_state", None)
+    if hidden is None:
+        raise AttributeError(
+            f"{type(out).__name__} has no last_hidden_state; expected EsmModel or EsmForMaskedLM"
+        )
+    return hidden, getattr(out, "logits", None)
+
+
 @torch.no_grad()
 def embed_unique_sequences(
     sequences: list[str],
@@ -154,9 +174,7 @@ def embed_unique_sequences(
         ids = batch["input_ids"].to(device, non_blocking=True)
         mask = batch["attention_mask"].to(device, non_blocking=True)
         with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-            out = model(ids, attention_mask=mask)
-            hidden = out.last_hidden_state
-            logits = getattr(out, "logits", None)
+            hidden, logits = forward_hidden_and_logits(model, ids, mask)
         mean_p, max_p = _pool(hidden, mask)
         means.append(mean_p.float().cpu())
         maxes.append(max_p.float().cpu())

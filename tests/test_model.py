@@ -65,6 +65,28 @@ class TestSiteBank:
             assert "overflow" in str(exc)
 
 
+class TestForwardHiddenAndLogits:
+    def test_mlm_uses_esm_trunk(self):
+        from types import SimpleNamespace
+
+        from plmlof.embed import forward_hidden_and_logits
+
+        class Trunk:
+            def __call__(self, ids, attention_mask=None):
+                return SimpleNamespace(last_hidden_state=torch.ones(ids.size(0), ids.size(1), 4))
+
+        class Head:
+            def __call__(self, hidden):
+                return hidden[..., :2]
+
+        model = SimpleNamespace(esm=Trunk(), lm_head=Head())
+        ids = torch.zeros(2, 5, dtype=torch.long)
+        mask = torch.ones(2, 5)
+        hidden, logits = forward_hidden_and_logits(model, ids, mask)
+        assert hidden.shape == (2, 5, 4)
+        assert logits.shape == (2, 5, 2)
+
+
 class TestSiteCompare:
     def test_delta_changes_output(self):
         from plmlof.constants import SITE_WINDOW
