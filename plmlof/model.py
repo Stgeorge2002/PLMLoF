@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from plmlof.constants import REGRESSION_TASKS, TASKS
+from plmlof.constants import NUM_SITE_CHEM, REGRESSION_TASKS, SITE_WINDOW, TASKS
 from plmlof.data.features import NUM_NUCLEOTIDE_FEATURES
 from plmlof.models.comparison import ComparisonModule
 
@@ -49,18 +49,22 @@ class BinaryLogitHead(nn.Module):
 
 
 class SiteCompare(nn.Module):
-    """Compare ref vs var at the mutated residue, not the pooled protein.
+    """Compare ref vs var on a residue window, not the pooled protein.
 
-    Input is a window ``[B, 3, D]`` of (left, centre, right) residue tokens
-    for each side. Pooled sequence identity never enters, so the head cannot
-    learn a gene prior from ``ref_mean``.
+    Input is ``[B, W, D]`` with W odd (centre at ``W // 2``). Features are
+    centre tokens plus the flattened per-position delta. Pooled sequence
+    identity never enters, so the head cannot learn a gene prior from
+    ``ref_mean``.
     """
 
-    def __init__(self, hidden_size: int, dropout: float = 0.1):
+    def __init__(self, hidden_size: int, dropout: float = 0.1, window: int = SITE_WINDOW):
         super().__init__()
+        if int(window) < 1 or int(window) % 2 == 0:
+            raise ValueError(f"site window must be odd and >= 1, got {window}")
         self.hidden_size = hidden_size
-        # centre_ref, centre_var, delta_centre, delta_left, delta_right
-        raw = 5 * hidden_size
+        self.window = int(window)
+        self.radius = self.window // 2
+        raw = (self.window + 2) * hidden_size
         self.norm = nn.LayerNorm(raw)
         self.proj = nn.Sequential(
             nn.Linear(raw, 2 * hidden_size),
@@ -76,16 +80,16 @@ class SiteCompare(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self, site_ref: torch.Tensor, site_var: torch.Tensor) -> torch.Tensor:
-        if site_ref.ndim != 3 or site_var.ndim != 3 or site_ref.size(1) != 3:
+        if site_ref.ndim != 3 or site_var.ndim != 3 or site_ref.size(1) != self.window:
             raise ValueError(
-                f"site tensors must be [B, 3, D], got ref={tuple(site_ref.shape)} var={tuple(site_var.shape)}"
+                f"site tensors must be [B, {self.window}, D], "
+                f"got ref={tuple(site_ref.shape)} var={tuple(site_var.shape)}"
             )
-        ref_l, ref_c, ref_r = site_ref[:, 0], site_ref[:, 1], site_ref[:, 2]
-        var_l, var_c, var_r = site_var[:, 0], site_var[:, 1], site_var[:, 2]
-        raw = torch.cat(
-            [ref_c, var_c, ref_c - var_c, ref_l - var_l, ref_r - var_r],
-            dim=-1,
-        )
+        centre = self.radius
+        ref_c = site_ref[:, centre]
+        var_c = site_var[:, centre]
+        delta = (site_ref - site_var).reshape(site_ref.size(0), -1)
+        raw = torch.cat([ref_c, var_c, delta], dim=-1)
         return self.proj(self.norm(raw))
 
 
@@ -112,6 +116,8 @@ class TaskNet(nn.Module):
         head_hidden: int = 128,
         dropout: float = 0.2,
         num_nuc_features: int = NUM_NUCLEOTIDE_FEATURES,
+        site_window: int = SITE_WINDOW,
+        chem_dim: int = NUM_SITE_CHEM,
     ):
         super().__init__()
         if task not in TASKS:
@@ -120,10 +126,13 @@ class TaskNet(nn.Module):
         self.hidden_size = hidden_size
         self.alignment_free = task == "lof"
         self.uses_sites = task == "mlof"
+        self.site_window = int(site_window)
+        self.chem_dim = int(chem_dim) if self.uses_sites else 0
         self.comparison: ComparisonModule | None = None
         self.site_compare: SiteCompare | None = None
         self.feature_norm: nn.LayerNorm | None = None
         self.seq_norm: nn.LayerNorm | None = None
+        self.chem_norm: nn.LayerNorm | None = None
 
         if self.alignment_free:
             self.seq_norm = nn.LayerNorm(hidden_size * 2)
@@ -131,8 +140,11 @@ class TaskNet(nn.Module):
             return
 
         if self.uses_sites:
-            self.site_compare = SiteCompare(hidden_size, dropout=dropout)
-            self.head = LofScoreHead(self.site_compare.output_size, hidden_dim=head_hidden, dropout=dropout)
+            self.site_compare = SiteCompare(hidden_size, dropout=dropout, window=self.site_window)
+            head_in = self.site_compare.output_size + self.chem_dim
+            if self.chem_dim:
+                self.chem_norm = nn.LayerNorm(self.chem_dim)
+            self.head = LofScoreHead(head_in, hidden_dim=head_hidden, dropout=dropout)
             return
 
         self.comparison = ComparisonModule(
@@ -155,13 +167,21 @@ class TaskNet(nn.Module):
         nucleotide_features: torch.Tensor,
         site_ref: torch.Tensor | None = None,
         site_var: torch.Tensor | None = None,
+        site_chem: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.alignment_free:
             return self.head(self.seq_norm(torch.cat([var_mean, var_max], dim=-1)))
         if self.uses_sites:
             if site_ref is None or site_var is None:
-                raise ValueError("MLoF requires site_ref and site_var [B, 3, D]")
-            return self.head(self.site_compare(site_ref, site_var))
+                raise ValueError(
+                    f"MLoF requires site_ref and site_var [B, {self.site_window}, D]"
+                )
+            feat = self.site_compare(site_ref, site_var)
+            if self.chem_dim:
+                if site_chem is None:
+                    site_chem = feat.new_zeros(feat.size(0), self.chem_dim)
+                feat = torch.cat([feat, self.chem_norm(site_chem.float())], dim=-1)
+            return self.head(feat)
         comparison = self.comparison.compare_pooled(ref_mean, ref_max, var_mean, var_max)
         nuc = nucleotide_features
         nuc = self.feature_norm(nuc)
@@ -176,10 +196,11 @@ class TaskNet(nn.Module):
         nucleotide_features: torch.Tensor,
         site_ref: torch.Tensor | None = None,
         site_var: torch.Tensor | None = None,
+        site_chem: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.forward_from_cache(
             ref_mean, ref_max, var_mean, var_max, nucleotide_features,
-            site_ref=site_ref, site_var=site_var,
+            site_ref=site_ref, site_var=site_var, site_chem=site_chem,
         )
 
     def probability(self, raw: torch.Tensor) -> torch.Tensor:

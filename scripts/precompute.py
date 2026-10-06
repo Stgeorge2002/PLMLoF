@@ -1,8 +1,8 @@
 """Pre-compute ESM2 embeddings for task splits.
 
 LoF uses ESM2-35M (pooled allele). MLoF/GoF share ESM2-650M; MLoF also
-banks residue tokens at the substitution so the ranker never sees gene identity
-from a pooled ref vector.
+banks a 5-residue window at the substitution plus BLOSUM chemistry so the
+ranker never sees gene identity from a pooled ref vector.
 
     python scripts/precompute.py \
         --data-dir data/processed \
@@ -21,11 +21,12 @@ import torch
 import yaml
 from transformers import AutoModel, AutoTokenizer
 
-from plmlof.constants import TRAIN_TASKS
+from plmlof.chem import site_chem_at
+from plmlof.constants import NUM_SITE_CHEM, SITE_WINDOW, TRAIN_TASKS
 from plmlof.dataset import PairDataset
 from plmlof.embed import SiteBank, embed_unique_sequences
 from plmlof.encoders import ESM2_PAIR, esm2_for_task, read_encoder_meta, write_encoder_meta
-from plmlof.sites import neighbor_indices
+from plmlof.sites import window_indices
 
 logger = logging.getLogger(__name__)
 
@@ -38,19 +39,22 @@ def _fill_site_windows(
     bank: SiteBank,
     dim: int,
 ) -> torch.Tensor:
-    """Write ``[N, 3, D]`` windows in place — no per-row Tensor stack."""
-    out = torch.zeros(len(sequences), 3, dim, dtype=torch.float32)
+    """Write ``[N, SITE_WINDOW, D]`` windows in place — no per-row Tensor stack."""
+    out = torch.zeros(len(sequences), SITE_WINDOW, dim, dtype=torch.float32)
     for i, (seq, center) in enumerate(zip(sequences, centers)):
         if center < 0 or not seq:
             continue
-        left, mid, right = neighbor_indices(center, len(seq))
-        for slot, residue in enumerate((left, mid, right)):
+        for slot, residue in enumerate(window_indices(center, len(seq))):
             if residue < 0:
                 continue
             vec = bank.get(seq, residue)
             if vec is not None:
                 out[i, slot].copy_(torch.as_tensor(vec, dtype=torch.float32))
     return out
+
+
+def _fill_site_chem(refs: list[str], vars_: list[str], centers: list[int]) -> torch.Tensor:
+    return torch.stack([site_chem_at(r, v, c) for r, v, c in zip(refs, vars_, centers)])
 
 
 def scatter(
@@ -71,9 +75,11 @@ def scatter(
             raise RuntimeError(f"MLoF scatter requires a site bank: {out}")
         site_ref = _fill_site_windows(dataset._ref, dataset._site_index, site_bank, hidden)
         site_var = _fill_site_windows(dataset._var, dataset._site_index, site_bank, hidden)
+        site_chem = _fill_site_chem(dataset._ref, dataset._var, dataset._site_index)
     else:
-        site_ref = torch.zeros(n, 3, hidden, dtype=torch.float32)
-        site_var = torch.zeros(n, 3, hidden, dtype=torch.float32)
+        site_ref = torch.zeros(n, SITE_WINDOW, hidden, dtype=torch.float32)
+        site_var = torch.zeros(n, SITE_WINDOW, hidden, dtype=torch.float32)
+        site_chem = torch.zeros(n, NUM_SITE_CHEM, dtype=torch.float32)
     data = {
         "ref_mean": mean_t[ref_idx].contiguous(),
         "ref_max": max_t[ref_idx].contiguous(),
@@ -81,7 +87,9 @@ def scatter(
         "var_max": max_t[var_idx].contiguous(),
         "site_ref": site_ref.contiguous(),
         "site_var": site_var.contiguous(),
+        "site_chem": site_chem.contiguous(),
         "has_sites": bool(store_sites),
+        "site_window": SITE_WINDOW,
         "nucleotide_features": dataset._nuc,
         "targets": torch.tensor(dataset._target, dtype=torch.float32),
         "weights": torch.tensor(dataset._weight, dtype=torch.float32),
@@ -114,7 +122,11 @@ def _fresh(parquet: Path, dest: Path, wanted: str, task: str) -> bool:
         return False
     if meta.get("esm2_model_name") != wanted:
         return False
-    if task == "mlof" and not meta.get("site_embeddings"):
+    if task == "mlof" and (
+        not meta.get("site_embeddings")
+        or int(meta.get("site_window", 0)) != SITE_WINDOW
+        or not meta.get("site_chem")
+    ):
         return False
     return True
 
@@ -217,6 +229,8 @@ def main() -> None:
                     write_encoder_meta(
                         dest.parent, esm_name, hidden,
                         site_embeddings=(task == "mlof"),
+                        site_window=SITE_WINDOW if task == "mlof" else None,
+                        site_chem=(task == "mlof"),
                     )
                     stamped.add(task)
         finally:

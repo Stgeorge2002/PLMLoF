@@ -67,14 +67,15 @@ class TestSiteBank:
 
 class TestSiteCompare:
     def test_delta_changes_output(self):
+        from plmlof.constants import SITE_WINDOW
         from plmlof.model import SiteCompare
 
         torch.manual_seed(0)
         cmp = SiteCompare(hidden_size=8)
         cmp.eval()
-        ref = torch.randn(2, 3, 8)
+        ref = torch.randn(2, SITE_WINDOW, 8)
         var = ref.clone()
-        var[:, 1] = var[:, 1] + 1.0
+        var[:, SITE_WINDOW // 2] = var[:, SITE_WINDOW // 2] + 1.0
         with torch.no_grad():
             same = cmp(ref, ref)
             diff = cmp(ref, var)

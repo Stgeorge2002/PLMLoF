@@ -53,6 +53,7 @@ def ensemble_predict(nets, loader, device) -> tuple[np.ndarray, np.ndarray, dict
                     tensors["nucleotide_features"],
                     site_ref=tensors.get("site_ref"),
                     site_var=tensors.get("site_var"),
+                    site_chem=tensors.get("site_chem"),
                 )
                 parts.append(net.probability(raw).float().cpu())
             stacked = torch.stack(parts, dim=0)

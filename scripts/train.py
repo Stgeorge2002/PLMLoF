@@ -16,6 +16,7 @@ import yaml
 from torch.utils.data import DataLoader, Subset
 
 from plmlof.applicability import save_gallery
+from plmlof.constants import NUM_SITE_CHEM, SITE_WINDOW
 from plmlof.dataset import CachedDataset, ProteinGroupBatchSampler, lof_train_keep_indices
 from plmlof.encoders import HIDDEN_SIZE, esm2_for_task, read_encoder_meta
 from plmlof.model import TaskNet
@@ -96,6 +97,11 @@ def main() -> None:
         raise SystemExit(
             f"{task_emb} has pooled embeddings only. Delete that dir and re-run scripts/precompute.py"
         )
+    if args.task == "mlof" and int(train_full.site_window) != SITE_WINDOW:
+        raise SystemExit(
+            f"{task_emb} site window is {train_full.site_window}, code expects {SITE_WINDOW}. "
+            "Delete that task's embedding dir and re-run scripts/precompute.py"
+        )
     filter_wrecks = args.task == "mlof" or args.drop_sure_wrecks
     if filter_wrecks:
         keep = lof_train_keep_indices(
@@ -149,6 +155,8 @@ def main() -> None:
         use_cross_attention=model_cfg.get("use_cross_attention", False),
         head_hidden=int(model_cfg.get("head_hidden", 128)),
         dropout=float(model_cfg.get("dropout", 0.2)),
+        site_window=SITE_WINDOW,
+        chem_dim=NUM_SITE_CHEM if args.task == "mlof" else 0,
     )
     precision = args.mixed_precision or train_cfg.get("mixed_precision", "bf16")
     trainer = Trainer(
@@ -162,14 +170,14 @@ def main() -> None:
         esm2_model_name=esm_name,
         pool_strategy=model_cfg.get("pool_strategy", "mean_max"),
         seed=args.seed,
-        rank_loss_weight=float(train_cfg.get("rank_loss_weight", 0.7)),
-        regression_loss_weight=float(train_cfg.get("regression_loss_weight", 0.3)),
+        rank_loss_weight=float(train_cfg.get("rank_loss_weight", 0.5)),
+        regression_loss_weight=float(train_cfg.get("regression_loss_weight", 0.5)),
     )
     trainer.train(
-        max_epochs=args.max_epochs or int(train_cfg.get("max_epochs", 20)),
+        max_epochs=args.max_epochs or int(train_cfg.get("max_epochs", 40)),
         learning_rate=float(train_cfg.get("learning_rate", 1e-3)),
         weight_decay=float(train_cfg.get("weight_decay", 0.01)),
-        patience=int(train_cfg.get("early_stopping_patience", 5)),
+        patience=int(train_cfg.get("early_stopping_patience", 8)),
         grad_accum_steps=int(train_cfg.get("gradient_accumulation_steps", 1)),
         warmup_ratio=float(train_cfg.get("warmup_ratio", 0.1)),
     )
@@ -199,6 +207,8 @@ def main() -> None:
         "hidden_size": hidden,
         "head_hidden": int(model_cfg.get("head_hidden", 128)),
         "dropout": float(model_cfg.get("dropout", 0.2)),
+        "site_window": SITE_WINDOW if args.task == "mlof" else None,
+        "chem_dim": NUM_SITE_CHEM if args.task == "mlof" else 0,
     }
     (Path(args.output_dir) / "model_config.json").write_text(json.dumps(meta, indent=2))
     logger.info("Done → %s", args.output_dir)

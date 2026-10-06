@@ -11,14 +11,16 @@ import torch
 from transformers import AutoModel, AutoTokenizer
 
 from plmlof.applicability import in_family_flags, load_gallery
-from plmlof.constants import GOF_CALL_THRESHOLD, IN_FAMILY_COSINE, TRAIN_TASKS
+from plmlof.chem import site_chem_at
+from plmlof.constants import GOF_CALL_THRESHOLD, IN_FAMILY_COSINE, SITE_RADIUS, TRAIN_TASKS
 from plmlof.data.features import extract_nucleotide_features
+from plmlof.domains import DomainIndex
 from plmlof.embed import _pool
 from plmlof.encoders import esm2_for_task
 from plmlof.inference.vcf_handler import VariantRecord, parse_fasta_pairs, parse_protein_fasta
 from plmlof.labels import display_bin
 from plmlof.model import TaskNet
-from plmlof.sites import aligned_site_index, gather_site_windows
+from plmlof.sites import aligned_site_index, gather_site_windows, missense_sites
 from plmlof.stats import benjamini_hochberg, empirical_p
 from plmlof.wreck import wreck_grade
 
@@ -35,10 +37,33 @@ def _head_hparams(ckpt: dict) -> tuple[int, float]:
     return int(hidden), float(cfg.get("dropout", 0.2))
 
 
+def _mlof_arch(ckpt: dict) -> tuple[int, int]:
+    """(site_window, chem_dim) from config or weight shapes."""
+    cfg = ckpt.get("model_config") or {}
+    hidden = int(cfg["hidden_size"])
+    sd = ckpt["state_dict"]
+    window = cfg.get("site_window")
+    if window is None:
+        weight = sd.get("site_compare.proj.0.weight")
+        window = int(weight.shape[1] / hidden) - 2 if weight is not None else 5
+    chem = cfg.get("chem_dim")
+    if chem is None:
+        head_w = sd.get("head.mlp.0.weight")
+        chem = max(int(head_w.shape[1]) - hidden, 0) if head_w is not None else 0
+    return int(window), int(chem)
+
+
 def _load_net(ckpt_path: Path, device: torch.device) -> TaskNet:
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     cfg = ckpt["model_config"]
     head_hidden, dropout = _head_hparams(ckpt)
+    extra: dict = {}
+    if ckpt["task"] == "mlof":
+        window, chem = _mlof_arch(ckpt)
+        extra["site_window"] = window
+        extra["chem_dim"] = chem
+    else:
+        extra["chem_dim"] = 0
     net = TaskNet(
         hidden_size=cfg["hidden_size"],
         task=ckpt["task"],
@@ -46,6 +71,7 @@ def _load_net(ckpt_path: Path, device: torch.device) -> TaskNet:
         use_cross_attention=cfg.get("use_cross_attention", False),
         head_hidden=head_hidden,
         dropout=dropout,
+        **extra,
     )
     net.load_state_dict(ckpt["state_dict"])
     net.eval()
@@ -77,6 +103,9 @@ class Predictor:
         max_seq_length: int = 1024,
         gof_threshold: float = GOF_CALL_THRESHOLD,
         in_family_threshold: float = IN_FAMILY_COSINE,
+        domains: str | Path | None = None,
+        hmm: str | Path | None = None,
+        hmm_cpus: int = 1,
     ):
         self.model_dir = Path(model_dir)
         self.device = torch.device(device)
@@ -84,6 +113,13 @@ class Predictor:
         self.max_seq_length = max_seq_length
         self.gof_threshold = gof_threshold
         self.in_family_threshold = in_family_threshold
+        self.domains = None
+        if domains or hmm:
+            self.domains = DomainIndex(
+                parquet=Path(domains) if domains else None,
+                hmm=Path(hmm) if hmm else None,
+                cpus=hmm_cpus,
+            )
         self._encoders: dict[str, tuple[object, object]] = {}
         self.task_esm: dict[str, str] = {}
 
@@ -156,23 +192,94 @@ class Predictor:
         nuc = torch.stack([
             extract_nucleotide_features(r, v) for r, v in zip(refs, vars_)
         ]).to(self.device)
-        hidden, mean_p, max_p = self._embed_hidden(refs + vars_, esm_name)
+        _, mean_p, max_p = self._embed_hidden(refs + vars_, esm_name)
         n = len(refs)
-        centers = [aligned_site_index(r, v) for r, v in zip(refs, vars_)]
-        site_ref = gather_site_windows(hidden[:n], refs, centers)
-        site_var = gather_site_windows(hidden[n:], vars_, centers)
-        return mean_p[:n], max_p[:n], mean_p[n:], max_p[n:], nuc, site_ref, site_var
+        return mean_p[:n], max_p[:n], mean_p[n:], max_p[n:], nuc, None, None
+
+    def _mlof_radius(self) -> int:
+        net = self.ensembles["mlof"][0]
+        if net.site_compare is not None:
+            return int(net.site_compare.radius)
+        return SITE_RADIUS
+
+    @torch.no_grad()
+    def _mlof_ensemble(self, refs: list[str], vars_: list[str], esm_name: str) -> dict[str, np.ndarray]:
+        """Score every same-length missense; report max (damage) and mean."""
+        n = len(refs)
+        empty = {
+            "mean": np.full(n, np.nan),
+            "sd": np.full(n, np.nan),
+            "n_sites": np.zeros(n, dtype=np.int32),
+            "avg": np.full(n, np.nan),
+            "ref_mean": None,
+        }
+        hidden, mean_p, max_p = self._embed_hidden(refs + vars_, esm_name)
+        h_ref, h_var = hidden[:n], hidden[n:]
+        rows: list[tuple[int, int]] = []
+        for i, (ref, var) in enumerate(zip(refs, vars_)):
+            sites = missense_sites(ref, var)
+            if not sites:
+                idx = aligned_site_index(ref, var)
+                if idx >= 0:
+                    sites = [idx]
+            rows.extend((i, s) for s in sites)
+        if not rows:
+            empty["ref_mean"] = mean_p[:n]
+            return empty
+        radius = self._mlof_radius()
+        rec_idx = [i for i, _ in rows]
+        seqs_ref = [refs[i] for i, _ in rows]
+        seqs_var = [vars_[i] for i, _ in rows]
+        centers = [s for _, s in rows]
+        site_ref = gather_site_windows(h_ref[rec_idx], seqs_ref, centers, radius=radius)
+        site_var = gather_site_windows(h_var[rec_idx], seqs_var, centers, radius=radius)
+        chem = torch.stack([site_chem_at(r, v, c) for r, v, c in zip(seqs_ref, seqs_var, centers)]).to(self.device)
+        dummy = torch.zeros(len(rows), dtype=mean_p.dtype, device=self.device)
+        dummy_vec = dummy[:, None].expand(-1, mean_p.size(1))
+        dummy_nuc = torch.zeros(len(rows), 12, device=self.device)
+        parts = []
+        for net in self.ensembles["mlof"]:
+            raw = net.forward_from_cache(
+                dummy_vec, dummy_vec, dummy_vec, dummy_vec, dummy_nuc,
+                site_ref=site_ref, site_var=site_var, site_chem=chem,
+            )
+            parts.append(net.probability(raw).float().cpu())
+        stacked = torch.stack(parts, dim=0)
+        site_mean = stacked.mean(0).numpy()
+        site_sd = stacked.std(0).numpy()
+        out_max = np.full(n, np.nan)
+        out_sd = np.full(n, np.nan)
+        out_n = np.zeros(n, dtype=np.int32)
+        out_avg = np.full(n, np.nan)
+        buckets: dict[int, list[int]] = {}
+        for k, (i, _) in enumerate(rows):
+            buckets.setdefault(i, []).append(k)
+        for i, idxs in buckets.items():
+            vals = site_mean[idxs]
+            sds = site_sd[idxs]
+            j = int(np.argmax(vals))
+            out_max[i] = float(vals[j])
+            out_sd[i] = float(sds[j])
+            out_n[i] = len(idxs)
+            out_avg[i] = float(vals.mean())
+        return {
+            "mean": out_max,
+            "sd": out_sd,
+            "n_sites": out_n,
+            "avg": out_avg,
+            "ref_mean": mean_p[:n],
+        }
 
     @torch.no_grad()
     def _ensemble_measure(
         self, task: str, ref_mean, ref_max, var_mean, var_max, nuc,
-        site_ref=None, site_var=None,
+        site_ref=None, site_var=None, site_chem=None,
     ) -> tuple[np.ndarray, np.ndarray]:
         measures = []
         for net in self.ensembles[task]:
             raw = net.forward_from_cache(
                 ref_mean, ref_max, var_mean, var_max, nuc,
-                site_ref=site_ref, site_var=site_var,
+                site_ref=site_ref, site_var=site_var, site_chem=site_chem,
             )
             measures.append(net.probability(raw).float().cpu())
         stacked = torch.stack(measures, dim=0)
@@ -187,27 +294,41 @@ class Predictor:
             batch = records[start:start + self.batch_size]
             refs = [r.ref_protein.replace("*", "")[:self.max_seq_length] for r in batch]
             vars_ = [r.var_protein.replace("*", "")[:self.max_seq_length] for r in batch]
+            if self.domains is not None:
+                self.domains.ensure(refs)
             if pair:
-                wreck_flags = [
-                    wreck_grade(r.ref_protein, r.var_protein, r.ref_dna, r.var_dna) for r in batch
-                ]
+                wreck_flags = []
+                for rec, ref in zip(batch, refs):
+                    spans = self.domains.spans(ref) if self.domains is not None else ()
+                    wreck_flags.append(
+                        wreck_grade(rec.ref_protein, rec.var_protein, rec.ref_dna, rec.var_dna, spans)
+                    )
             else:
                 wreck_flags = [(False, "none", None)] * len(batch)
 
             pooled: dict[str, tuple] = {}
-            pair_tasks = [t for t in tasks if t != "lof"]
+            gof_tasks = [t for t in tasks if t not in {"lof", "mlof"}]
+            mlof_pack: dict[str, np.ndarray] | None = None
             if "lof" in tasks:
                 lof_esm = self.task_esm["lof"]
                 var_mean, var_max = self._embed_seqs(vars_, lof_esm)
                 zeros = torch.zeros(len(batch), 12, device=self.device)
                 pooled["lof"] = (var_mean, var_max, var_mean, var_max, zeros, None, None)
-            if pair_tasks:
-                pair_esm = self.task_esm[pair_tasks[0]]
+            if gof_tasks:
+                pair_esm = self.task_esm[gof_tasks[0]]
                 pooled["_pair"] = self._embed_pairs(refs, vars_, pair_esm)
+            if "mlof" in tasks:
+                mlof_pack = self._mlof_ensemble(refs, vars_, self.task_esm["mlof"])
 
             measures: dict[str, tuple[np.ndarray, np.ndarray]] = {}
             family: dict[str, tuple[np.ndarray, list[str], np.ndarray]] = {}
             for task in tasks:
+                if task == "mlof":
+                    measures[task] = (mlof_pack["mean"], mlof_pack["sd"])
+                    query = mlof_pack["ref_mean"]
+                    if task in self.galleries and query is not None:
+                        family[task] = in_family_flags(query.cpu(), self.galleries[task], self.in_family_threshold)
+                    continue
                 if task == "lof":
                     ref_mean, ref_max, var_mean, var_max, nuc, site_ref, site_var = pooled["lof"]
                 else:
@@ -253,6 +374,8 @@ class Predictor:
                     "lof_q": float(qvals["lof"][i]) if "lof" in qvals else float("nan"),
                     "mlof_score": float(mlof_mean[i]),
                     "mlof_bin": float(display_bin(float(mlof_mean[i]))) if np.isfinite(mlof_mean[i]) else float("nan"),
+                    "mlof_mean": float(mlof_pack["avg"][i]) if mlof_pack is not None else float("nan"),
+                    "mlof_n_sites": int(mlof_pack["n_sites"][i]) if mlof_pack is not None else 0,
                     "mlof_sd": float(mlof_sd[i]),
                     "mlof_p": float(pvals["mlof"][i]) if "mlof" in pvals else float("nan"),
                     "mlof_q": float(qvals["mlof"][i]) if "mlof" in qvals else float("nan"),

@@ -10,8 +10,9 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset, Sampler
 
+from plmlof.constants import NUM_SITE_CHEM, SITE_RADIUS, SITE_WINDOW
 from plmlof.data.features import extract_nucleotide_features
-from plmlof.sites import aligned_site_index
+from plmlof.sites import aligned_site_index, window_indices
 
 
 REQUIRED_COLUMNS = {"ref_protein", "var_protein", "target", "sample_weight"}
@@ -168,18 +169,16 @@ class PairDataset(Dataset):
         return len(self._ref)
 
     def residue_requests(self) -> dict[str, set[int]]:
-        """Seq → residue indices needed for (left, centre, right) site windows."""
+        """Seq → residue indices needed for the MDG site window."""
         need: dict[str, set[int]] = {}
         for ref, var, center in zip(self._ref, self._var, self._site_index):
             if center < 0:
                 continue
             for seq, length in ((ref, len(ref)), (var, len(var))):
                 bucket = need.setdefault(seq, set())
-                bucket.add(center)
-                if center > 0:
-                    bucket.add(center - 1)
-                if center + 1 < length:
-                    bucket.add(center + 1)
+                for residue in window_indices(center, length, SITE_RADIUS):
+                    if residue >= 0:
+                        bucket.add(residue)
         return need
 
     def __getitem__(self, idx: int) -> dict:
@@ -200,8 +199,12 @@ class PairDataset(Dataset):
         }
 
 
-def _empty_sites(n: int, hidden: int) -> torch.Tensor:
-    return torch.zeros(n, 3, hidden, dtype=torch.float32)
+def _empty_sites(n: int, hidden: int, window: int = SITE_WINDOW) -> torch.Tensor:
+    return torch.zeros(n, window, hidden, dtype=torch.float32)
+
+
+def _empty_chem(n: int) -> torch.Tensor:
+    return torch.zeros(n, NUM_SITE_CHEM, dtype=torch.float32)
 
 
 class CachedDataset(Dataset):
@@ -228,7 +231,9 @@ class CachedDataset(Dataset):
         hidden = int(self.ref_mean.shape[1])
         self.site_ref = data.get("site_ref", _empty_sites(len(self.targets), hidden))
         self.site_var = data.get("site_var", _empty_sites(len(self.targets), hidden))
+        self.site_chem = data.get("site_chem", _empty_chem(len(self.targets)))
         self.has_sites = bool(data.get("has_sites", False))
+        self.site_window = int(self.site_ref.shape[1]) if self.site_ref.ndim == 3 else SITE_WINDOW
 
     def __len__(self) -> int:
         return len(self.targets)
@@ -242,6 +247,7 @@ class CachedDataset(Dataset):
             "nucleotide_features": self.nuc_features[idx],
             "site_ref": self.site_ref[idx],
             "site_var": self.site_var[idx],
+            "site_chem": self.site_chem[idx],
             "target": self.targets[idx],
             "sample_weight": self.weights[idx],
             "dms_zscore": self.z[idx],

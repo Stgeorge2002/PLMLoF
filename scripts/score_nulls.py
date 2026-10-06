@@ -45,6 +45,7 @@ def main() -> None:
                     batch["nucleotide_features"],
                     site_ref=batch.get("site_ref"),
                     site_var=batch.get("site_var"),
+                    site_chem=batch.get("site_chem"),
                 )
                 parts.append(net.probability(raw).float().cpu())
             acc.append(torch.stack(parts, dim=0).mean(0))

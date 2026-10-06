@@ -79,6 +79,8 @@ class Trainer:
             "use_cross_attention": (
                 net.comparison is not None and net.comparison.cross_attn is not None
             ),
+            "site_window": int(net.site_window) if net.uses_sites else None,
+            "chem_dim": int(getattr(net, "chem_dim", 0)),
         }
         self.lof_loss = nn.SmoothL1Loss(reduction="none")
         self.bce = nn.BCEWithLogitsLoss(reduction="none")
@@ -90,6 +92,7 @@ class Trainer:
             batch["nucleotide_features"],
             site_ref=batch.get("site_ref"),
             site_var=batch.get("site_var"),
+            site_chem=batch.get("site_chem"),
         )
 
     def _step(self, batch: dict) -> tuple[torch.Tensor, torch.Tensor]:

@@ -7,6 +7,7 @@ import random
 import numpy as np
 import torch
 
+from plmlof.constants import NUM_SITE_CHEM, SITE_WINDOW
 from plmlof.data.features import LOF_LEAK_NUC_INDICES
 from plmlof.dataset import ProteinGroupBatchSampler, lof_train_keep_indices
 from plmlof.domains import lof_prior, sample_events
@@ -304,8 +305,8 @@ class TestTaskNet:
         net.eval()
         torch.manual_seed(0)
         b, d = 2, 16
-        site_ref = torch.randn(b, 3, d)
-        site_var = torch.randn(b, 3, d)
+        site_ref = torch.randn(b, SITE_WINDOW, d)
+        site_var = torch.randn(b, SITE_WINDOW, d)
         nuc = torch.zeros(b, 12)
         for i in LOF_LEAK_NUC_INDICES:
             nuc[:, i] = 1.0
@@ -443,8 +444,15 @@ class TestSites:
         seqs = ["MKTAA"]
         # residue 1 → token 2 (CLS + 0)
         out = gather_site_windows(hidden, seqs, [1])
-        assert out.shape == (1, 3, d)
-        assert torch.equal(out[0, 1], hidden[0, 2])
+        assert out.shape == (1, SITE_WINDOW, d)
+        assert torch.equal(out[0, SITE_WINDOW // 2], hidden[0, 2])
+
+    def test_all_same_length_missense(self):
+        from plmlof.sites import missense_sites
+
+        assert missense_sites("MKTAA", "MRTVA") == [1, 3]
+        assert missense_sites("MKT", "MKT") == []
+        assert missense_sites("MKT", "MK") == []
 
 
 class TestDamageMap:
@@ -477,8 +485,17 @@ class TestRankNet:
 class TestSiteCompare:
     def test_shape(self):
         cmp = SiteCompare(hidden_size=16)
-        out = cmp(torch.randn(3, 3, 16), torch.randn(3, 3, 16))
+        out = cmp(torch.randn(3, SITE_WINDOW, 16), torch.randn(3, SITE_WINDOW, 16))
         assert out.shape == (3, 16)
+
+    def test_rejects_wrong_width(self):
+        cmp = SiteCompare(hidden_size=8, window=5)
+        try:
+            cmp(torch.randn(2, 3, 8), torch.randn(2, 3, 8))
+        except ValueError as exc:
+            assert "5" in str(exc)
+        else:
+            raise AssertionError("SiteCompare must reject a 3-wide window")
 
 
 class TestProteinGroupSampler:
@@ -524,3 +541,53 @@ class TestTrainTasks:
             names = [row["name"] for row in payload[task]]
             assert names
             assert len(names) == len(set(names))
+
+
+class TestSubstitutionChem:
+    def test_identity_beats_radical_blosum(self):
+        from plmlof.chem import substitution_features
+
+        ident = substitution_features("A", "A")
+        rad = substitution_features("A", "W")
+        assert ident.shape == (NUM_SITE_CHEM,)
+        assert float(ident[0]) > float(rad[0])
+        assert float(ident[1]) == 1.0
+        assert float(rad[1]) == 0.0
+
+    def test_chem_moves_mlof_score(self):
+        net = TaskNet(hidden_size=16, task="mlof")
+        net.eval()
+        b, d = 2, 16
+        site = torch.randn(b, SITE_WINDOW, d)
+        dummy = torch.zeros(b, d)
+        nuc = torch.zeros(b, 12)
+        from plmlof.chem import substitution_features
+
+        ident = torch.stack([substitution_features("A", "A"), substitution_features("A", "A")])
+        rad = torch.stack([substitution_features("A", "W"), substitution_features("A", "W")])
+        with torch.no_grad():
+            a = net.forward_from_cache(dummy, dummy, dummy, dummy, nuc, site_ref=site, site_var=site, site_chem=ident)
+            b_out = net.forward_from_cache(dummy, dummy, dummy, dummy, nuc, site_ref=site, site_var=site, site_chem=rad)
+        assert not torch.allclose(a, b_out)
+
+
+class TestDomainIndex:
+    def test_parquet_lookup_grades_tail(self, tmp_path):
+        import pandas as pd
+
+        from plmlof.domains import DomainIndex, protein_id
+        from plmlof.wreck import wreck_grade
+
+        seq = "M" + "A" * 99
+        pid = protein_id(seq)
+        df = pd.DataFrame({"protein_id": [pid, pid], "start": [10, 40], "end": [30, 70]})
+        path = tmp_path / "pfam.parquet"
+        df.to_parquet(path, index=False)
+        index = DomainIndex(parquet=path)
+        index.ensure([seq])
+        assert index.spans(seq) == [(10, 30), (40, 70)]
+        var = seq[:90]
+        _, kind, prior = wreck_grade(seq, var, domains=index.spans(seq))
+        assert prior == 0.4
+        assert "tail" in kind
+

@@ -28,14 +28,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--output", type=str, default=None, help="Output file (JSON or TSV)")
     parser.add_argument("--format", type=str, choices=["json", "tsv"], default="tsv")
+    parser.add_argument(
+        "--domains", type=str, default=None,
+        help="pfam_domains.parquet (protein_id, start, end). Grades wrecks; last-10% tail if omitted.",
+    )
+    parser.add_argument("--hmm", type=str, default=None, help="Pfam-A.hmm for refs missing from --domains")
+    parser.add_argument("--hmm-cpus", type=int, default=1)
     return parser.parse_args()
 
 
 def _write_tsv(results: list[dict], path: Path) -> None:
     keys = [
-        "gene", "wreck", "wreck_kind",
+        "gene", "wreck", "wreck_kind", "wreck_prior",
         "lof_score", "lof_sd", "lof_p", "lof_q",
-        "mlof_score", "mlof_sd", "mlof_p", "mlof_q",
+        "mlof_score", "mlof_bin", "mlof_mean", "mlof_n_sites", "mlof_sd", "mlof_p", "mlof_q",
         "in_family", "nearest_train_gene", "ref_cosine",
         "growth_gof_p", "growth_gof_sd", "growth_gof_p_emp", "growth_gof_q", "growth_gof_call",
         "growth_gof_in_family", "growth_gof_nearest",
@@ -80,7 +86,10 @@ def main() -> None:
 
     model_path = Path(args.model)
     pred_dir = model_path if model_path.is_dir() else model_path.parent.parent.parent
-    pred = Predictor(pred_dir, device=device, batch_size=args.batch_size)
+    pred = Predictor(
+        pred_dir, device=device, batch_size=args.batch_size,
+        domains=args.domains, hmm=args.hmm, hmm_cpus=args.hmm_cpus,
+    )
     if args.proteins:
         results = pred.predict_proteins(args.proteins)
     elif args.vcf:

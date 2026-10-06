@@ -1,6 +1,6 @@
 # Frozen ESM2 + independent task heads.
-# LoF wreck scanner: 35M pooled allele.
-# MLoF: 650M residue window at the substitution (not pooled gene identity).
+# LoF wreck scanner: 35M pooled allele. Domain geometry is wreck_grade, not the MLP.
+# MLoF: 650M 5-residue window at each substitution + BLOSUM chemistry.
 # GoF: 650M pooled ComparisonModule.
 model:
   esm2_model_name: "facebook/esm2_t33_650M_UR50D"

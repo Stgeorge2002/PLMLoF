@@ -196,6 +196,59 @@ def load_domain_map(path: Path) -> dict[str, list[tuple[int, int]]]:
     return out
 
 
+class DomainIndex:
+    """Pfam spans for wreck_grade. Parquet first; optional live HMMER for misses."""
+
+    def __init__(
+        self,
+        parquet: Path | None = None,
+        hmm: Path | None = None,
+        cpus: int = 1,
+    ):
+        self.hmm = Path(hmm) if hmm is not None else None
+        self.cpus = max(1, int(cpus))
+        self._cache: dict[str, list[tuple[int, int]]] = {}
+        if parquet is not None and Path(parquet).exists():
+            self._cache.update(load_domain_map(Path(parquet)))
+
+    def spans(self, protein: str) -> list[tuple[int, int]]:
+        seq = (protein or "").replace("*", "")
+        if not seq:
+            return []
+        pid = protein_id(seq)
+        if pid in self._cache:
+            return self._cache[pid]
+        return []
+
+    def ensure(self, proteins: Sequence[str]) -> None:
+        """Fill cache for unique proteins. One HMMER pass for anything not in parquet."""
+        missing: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for protein in proteins:
+            seq = (protein or "").replace("*", "")
+            if not seq:
+                continue
+            pid = protein_id(seq)
+            if pid in self._cache or pid in seen:
+                continue
+            seen.add(pid)
+            missing.append((pid, seq))
+        if not missing:
+            return
+        if self.hmm is None or not self.hmm.exists():
+            for pid, _ in missing:
+                self._cache.setdefault(pid, [])
+            return
+        from plmlof.hmmer import annotate_proteins
+
+        hits = annotate_proteins(missing, self.hmm, cpus=self.cpus)
+        by: dict[str, list[tuple[int, int]]] = {}
+        for hit in hits:
+            by.setdefault(str(hit["protein_id"]), []).append((int(hit["start"]), int(hit["end"])))
+        for pid, _ in missing:
+            self._cache[pid] = merge_intervals(by.get(pid, []))
+
+
 @dataclass(frozen=True)
 class WreckEvent:
     kind: str

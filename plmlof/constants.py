@@ -16,3 +16,9 @@ LOF_WT = 0.00
 
 GOF_CALL_THRESHOLD = 0.90
 IN_FAMILY_COSINE = 0.75
+
+# MDG site window: centre ± 2. Odd. Cached embeddings store [N, SITE_WINDOW, D].
+SITE_WINDOW = 5
+SITE_RADIUS = SITE_WINDOW // 2
+# BLOSUM / same / charge / hydrophobicity / volume at the substituted residue.
+NUM_SITE_CHEM = 5
