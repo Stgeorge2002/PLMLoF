@@ -20,5 +20,13 @@ IN_FAMILY_COSINE = 0.75
 # MDG site window: centre ± 2. Odd. Cached embeddings store [N, SITE_WINDOW, D].
 SITE_WINDOW = 5
 SITE_RADIUS = SITE_WINDOW // 2
-# BLOSUM / same / charge / hydrophobicity / volume at the substituted residue.
-NUM_SITE_CHEM = 5
+# Train/eval Hamming-1 plus Hamming-2 (predict already maxes every same-length site).
+MLOF_MAX_HAMMING = 2
+# BLOSUM / same / charge / hydrophobicity / volume.
+NUM_SUB_CHEM = 5
+# + unmasked ESM2 log-odds + Pfam in-domain + extra-domain.
+NUM_SITE_CHEM = 8
+CHEM_LLR = 5
+CHEM_IN_DOMAIN = 6
+CHEM_EXTRA_DOMAIN = 7
+LLR_SCALE = 10.0

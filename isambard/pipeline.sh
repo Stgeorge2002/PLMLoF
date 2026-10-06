@@ -173,7 +173,7 @@ require_task "lof"
 
 if [[ "$MODE" == "sweep" ]]; then
     require_task "mlof"
-    echo "──────── LoF + MDG head sweep (cached embeddings, no GoF) ────────"
+    echo "──────── MDG feature sweep (cached embeddings, no GoF, no LoF retrain) ────────"
     python scripts/sweep.py \
         --precomputed "$EMB_DIR" \
         --output-dir "$OUT_DIR/sweep" \

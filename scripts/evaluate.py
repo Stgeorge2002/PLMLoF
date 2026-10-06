@@ -37,10 +37,42 @@ def _str_list(value) -> list[str]:
     return [str(v) for v in list(value)]
 
 
+def _slice_mlof(
+    pred: np.ndarray,
+    packed: dict,
+    genes: list[str],
+    pids: list[str],
+    labels: list[str],
+    prefix: str,
+    min_n: int = 32,
+) -> dict[str, float]:
+    """Within-gene Spearman inside a taxon or assay slice (diagnostic, not selection)."""
+    if not labels or len(labels) != len(pred):
+        return {}
+    out: dict[str, float] = {}
+    tags = np.array([str(t).strip().lower() for t in labels])
+    for name in sorted(set(tags.tolist()) - {""}):
+        mask = tags == name
+        if int(mask.sum()) < min_n:
+            continue
+        idx = np.flatnonzero(mask)
+        sub = mlof_metrics(
+            pred[idx], packed["target"][idx], packed["z"][idx], packed["missense"][idx],
+            gene=[genes[i] for i in idx],
+            protein_id=[pids[i] for i in idx],
+        )
+        key = name.replace(" ", "_")
+        out[f"{prefix}_{key}_within_gene_spearman"] = sub["within_gene_spearman"]
+        out[f"{prefix}_{key}_n"] = sub["n"]
+        out[f"{prefix}_{key}_n_genes_ranked"] = sub["n_genes_ranked"]
+    return out
+
+
 def ensemble_predict(nets, loader, device) -> tuple[np.ndarray, np.ndarray, dict]:
     means, sds = [], []
     extra: dict[str, list] = {
         "target": [], "z": [], "wreck": [], "missense": [], "gene": [], "protein_id": [],
+        "taxon": [], "assay": [],
     }
     with torch.no_grad():
         for batch in loader:
@@ -54,6 +86,10 @@ def ensemble_predict(nets, loader, device) -> tuple[np.ndarray, np.ndarray, dict
                     site_ref=tensors.get("site_ref"),
                     site_var=tensors.get("site_var"),
                     site_chem=tensors.get("site_chem"),
+                    site_ref2=tensors.get("site_ref2"),
+                    site_var2=tensors.get("site_var2"),
+                    site_chem2=tensors.get("site_chem2"),
+                    n_sites=tensors.get("n_sites"),
                 )
                 parts.append(net.probability(raw).float().cpu())
             stacked = torch.stack(parts, dim=0)
@@ -65,11 +101,19 @@ def ensemble_predict(nets, loader, device) -> tuple[np.ndarray, np.ndarray, dict
             extra["missense"].append(batch["is_missense"].numpy())
             extra["gene"].extend(_str_list(batch.get("gene", [])))
             extra["protein_id"].extend(_str_list(batch.get("protein_id", [])))
+            extra["taxon"].extend(_str_list(batch.get("taxon", [])))
+            extra["assay"].extend(_str_list(batch.get("assay", [])))
     pred = np.concatenate(means)
     sd = np.concatenate(sds)
-    packed = {k: np.concatenate(v) for k, v in extra.items() if v and k not in {"gene", "protein_id"}}
+    packed = {
+        k: np.concatenate(v)
+        for k, v in extra.items()
+        if v and k not in {"gene", "protein_id", "taxon", "assay"}
+    }
     packed["gene"] = extra["gene"]
     packed["protein_id"] = extra["protein_id"]
+    packed["taxon"] = extra["taxon"]
+    packed["assay"] = extra["assay"]
     return pred, sd, packed
 
 
@@ -104,6 +148,12 @@ def main() -> None:
             pred, packed["target"], packed["z"], packed["missense"],
             gene=genes, protein_id=pids,
         )
+        taxa = packed.get("taxon") or list(ds.taxon)
+        assays = packed.get("assay") or list(ds.assay)
+        metrics.update(_slice_mlof(pred, packed, genes, pids, taxa, "taxon"))
+        metrics.update(_slice_mlof(pred, packed, genes, pids, assays, "assay"))
+        if hasattr(ds, "n_sites"):
+            metrics["n_multi"] = float((ds.n_sites >= 2).sum().item())
     elif args.task == "lof":
         metrics = lof_metrics(pred, packed["target"], packed["z"], packed["wreck"], packed["missense"])
         metrics.update(gene_prior_collapse(pred, groups, packed["target"]))

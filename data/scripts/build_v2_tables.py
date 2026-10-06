@@ -43,7 +43,7 @@ from plmlof.labels import (
     lof_score_for_pair,
     lof_score_from_z,
 )
-from plmlof.sites import aligned_site_index
+from plmlof.sites import aligned_site_index, is_mlof_missense, missense_sites
 from plmlof.splits import parse_tasks, split_mlof_nested, split_residues_within_protein, split_species
 
 logger = logging.getLogger(__name__)
@@ -73,14 +73,14 @@ COLS = [
     "ref_protein", "var_protein", "ref_dna", "var_dna", "gene", "species", "source",
     "protein_id", "task", "split", "wreck_type", "channel", "target", "sample_weight",
     "lof_score", "dms_score", "dms_zscore", "is_wreck", "is_missense", "label",
-    "site_index",
+    "site_index", "site_index_2", "n_sites", "taxon", "assay",
 ]
 
 
 def _std_row(**kwargs) -> dict:
     numeric = {
         "target", "sample_weight", "lof_score", "dms_score", "dms_zscore",
-        "is_wreck", "is_missense", "label", "site_index",
+        "is_wreck", "is_missense", "label", "site_index", "site_index_2", "n_sites",
     }
     row = {c: (0 if c in numeric else "") for c in COLS}
     row.update({
@@ -93,12 +93,21 @@ def _std_row(**kwargs) -> dict:
         "is_missense": False,
         "label": 0,
         "site_index": -1,
+        "site_index_2": -1,
+        "n_sites": 0,
+        "taxon": "",
+        "assay": "",
     })
     row.update(kwargs)
+    ref = str(row.get("ref_protein") or "")
+    var = str(row.get("var_protein") or "")
+    sites = missense_sites(ref, var)
+    if "n_sites" not in kwargs:
+        row["n_sites"] = len(sites)
     if "site_index" not in kwargs:
-        ref = str(row.get("ref_protein") or "")
-        var = str(row.get("var_protein") or "")
-        row["site_index"] = aligned_site_index(ref, var)
+        row["site_index"] = sites[0] if sites else aligned_site_index(ref, var)
+    if "site_index_2" not in kwargs:
+        row["site_index_2"] = sites[1] if len(sites) > 1 else -1
     return row
 
 
@@ -162,16 +171,8 @@ BACT_PARQUET = "proteingym_bacterial.parquet"
 
 
 def _single_aa_missense(ref: str, var: str) -> bool:
-    """True iff same length and exactly one amino-acid substitution."""
-    if not ref or not var or len(ref) != len(var) or ref == var:
-        return False
-    n = 0
-    for a, b in zip(ref, var):
-        if a != b:
-            n += 1
-            if n > 1:
-                return False
-    return n == 1
+    """True iff same length and Hamming 1 or 2 (matches predict max-of-sites)."""
+    return is_mlof_missense(ref, var)
 
 
 def _stratify_mlof_per_protein(df: pd.DataFrame, cap: int, seed: int) -> pd.DataFrame:
@@ -221,7 +222,7 @@ def _stratify_mlof_per_protein(df: pd.DataFrame, cap: int, seed: int) -> pd.Data
 
 
 def load_mlof_dms(pg: pd.DataFrame) -> pd.DataFrame:
-    """All ProteinGym substitution genes, single-site missense, mean z per pair."""
+    """All ProteinGym substitution genes, Hamming-1/2 missense, mean z per pair."""
     dms = pg.copy()
     if "protein_id" not in dms.columns:
         dms["protein_id"] = dms["ref_protein"].map(pid)
@@ -255,9 +256,15 @@ def load_mlof_dms(pg: pd.DataFrame) -> pd.DataFrame:
         .agg(agg)
         .reset_index()
     )
+    n_sites = [
+        len(missense_sites(a, b))
+        for a, b in zip(grouped["ref_protein"].astype(str), grouped["var_protein"].astype(str))
+    ]
+    grouped["n_sites"] = n_sites
+    n_multi = int(sum(1 for n in n_sites if n >= 2))
     logger.info(
-        "MLoF DMS singles=%s proteins=%s assays_as_gene=%s",
-        len(grouped), grouped["protein_id"].nunique(), grouped["gene"].nunique(),
+        "MLoF DMS missense=%s proteins=%s assays_as_gene=%s Hamming-2=%s",
+        len(grouped), grouped["protein_id"].nunique(), grouped["gene"].nunique(), n_multi,
     )
     return grouped
 
@@ -318,7 +325,15 @@ def write_task(df: pd.DataFrame, task_dir: Path) -> None:
     task_dir.mkdir(parents=True, exist_ok=True)
     for col in COLS:
         if col not in df.columns:
-            df[col] = 0 if col in {"target", "sample_weight", "lof_score", "label", "is_wreck", "is_missense", "site_index"} else ""
+            if col == "site_index_2":
+                df[col] = -1
+            elif col in {
+                "target", "sample_weight", "lof_score", "label", "is_wreck",
+                "is_missense", "site_index", "n_sites",
+            }:
+                df[col] = 0
+            else:
+                df[col] = ""
     df = df[COLS]
     for split in ("train", "val", "test", "protein_test"):
         sub = df[df["split"] == split]
@@ -496,6 +511,8 @@ def build_mlof(dms: pd.DataFrame, args) -> pd.DataFrame:
             is_missense=True,
             sample_weight=1.0,
             label=0 if score >= 0.4 else 1,
+            taxon=str(getattr(rec, "taxon", "") or ""),
+            assay=str(getattr(rec, "coarse_selection_type", "") or getattr(rec, "assay", "") or ""),
         ))
     of_df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=COLS)
 
@@ -524,6 +541,8 @@ def build_mlof(dms: pd.DataFrame, args) -> pd.DataFrame:
             sample_weight=1.0,
             label=1,
             site_index=0,
+            taxon=getattr(rec, "taxon", "") or "",
+            assay=getattr(rec, "assay", "") or "",
         ))
     id_df = pd.DataFrame(id_rows) if id_rows else pd.DataFrame(columns=COLS)
     mlof = pd.concat([of_df, id_df], ignore_index=True) if not of_df.empty or not id_df.empty else pd.DataFrame(columns=COLS)
@@ -719,7 +738,7 @@ def main() -> None:
     p.add_argument("--gof-neg-ratio", type=float, default=10.0)
     p.add_argument(
         "--mlof-per-protein", type=int, default=2000,
-        help="Max single-site missense variants per WT (stratified by z). 0 = keep all.",
+        help="Max Hamming-1/2 missense variants per WT (stratified by z). 0 = keep all.",
     )
     p.add_argument(
         "--tasks", nargs="+", default=None,
@@ -772,7 +791,7 @@ def main() -> None:
     if "mlof" in want:
         mlof_src = load_mlof_dms(pg)
         if mlof_src.empty:
-            raise SystemExit("No single-site missense rows in the ProteinGym substitutions parquet")
+            raise SystemExit("No Hamming-1/2 missense rows in the ProteinGym substitutions parquet")
 
     syn_path = args.processed / "synthetic_lof.parquet"
     if syn_path.exists():

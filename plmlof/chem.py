@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import torch
 
-from plmlof.constants import NUM_SITE_CHEM
+from plmlof.constants import (
+    CHEM_EXTRA_DOMAIN,
+    CHEM_IN_DOMAIN,
+    CHEM_LLR,
+    LLR_SCALE,
+    NUM_SITE_CHEM,
+    NUM_SUB_CHEM,
+)
 
 # BLOSUM62, rows/cols ACDEFGHIKLMNPQRSTVWY
 _AA = "ACDEFGHIKLMNPQRSTVWY"
@@ -21,12 +28,12 @@ _BLOSUM62 = (
     (-1, -1, -4, -3,  0, -4, -3,  2, -2,  4,  2, -3, -3, -2, -2, -2, -1,  1, -2, -1),
     (-1, -1, -3, -2,  0, -3, -2,  1, -1,  2,  5, -2, -2,  0, -1, -1, -1,  1, -1, -1),
     (-2, -3,  1,  0, -3,  0,  1, -3,  0, -3, -2,  6, -2,  0,  0,  1,  0, -3, -4, -2),
-    (-1, -3, -1, -1, -4, -2, -2, -3, -1, -3, -2, -2,  7, -1, -2, -1, -1, -2, -4, -3),
+    (-1, -3, -1, -1, -4, -2, -2, -3, -1, -3, -2,  7, -1, -2, -1, -1, -2, -4, -3),
     (-1, -3,  0,  2, -3, -2,  0, -3,  1, -2,  0,  0, -1,  5,  1,  0, -1, -2, -2, -1),
     (-1, -3, -2,  0, -3, -2,  0, -3,  2, -2, -1,  0, -2,  1,  5, -1, -1, -3, -3, -2),
     ( 1, -1,  0,  0, -2,  0, -1, -2,  0, -2, -1,  1, -1,  0, -1,  4,  1, -2, -3, -2),
     ( 0, -1, -1, -1, -2, -2, -2, -1, -1, -1, -1,  0, -1, -1, -1,  1,  5,  0, -2, -2),
-    ( 0, -1, -3, -2, -1, -3, -3,  3, -2,  1,  1, -3, -2, -2, -3, -2,  0,  4, -3, -1),
+    ( 0, -1, -3, -2, -1, -3, -3,  3, -2,  1, -1, -3, -2, -2, -3, -2,  0,  4, -3, -1),
     (-3, -2, -4, -3,  1, -2, -2, -3, -3, -2, -1, -4, -4, -2, -3, -3, -2, -3, 11,  2),
     (-2, -2, -3, -2,  3, -3,  2, -1, -2, -1, -1, -2, -3, -1, -2, -2, -2, -1,  2,  7),
 )
@@ -57,7 +64,7 @@ def substitution_features(ref_aa: str, var_aa: str) -> torch.Tensor:
     ra = (ref_aa or "X")[:1].upper()
     va = (var_aa or "X")[:1].upper()
     if ra not in _INDEX or va not in _INDEX:
-        return torch.zeros(NUM_SITE_CHEM, dtype=torch.float32)
+        return torch.zeros(NUM_SUB_CHEM, dtype=torch.float32)
     return torch.tensor(
         [
             _blosum(ra, va) / 11.0,
@@ -70,7 +77,95 @@ def substitution_features(ref_aa: str, var_aa: str) -> torch.Tensor:
     )
 
 
-def site_chem_at(ref: str, var: str, center: int) -> torch.Tensor:
+def pack_site_chem(
+    ref_aa: str,
+    var_aa: str,
+    *,
+    llr: float = 0.0,
+    in_domain: float = 0.0,
+    extra_domain: float = 0.0,
+) -> torch.Tensor:
+    """BLOSUM block plus ESM2 log-odds and Pfam bits. Always ``NUM_SITE_CHEM``."""
+    extra = torch.tensor(
+        [float(llr), float(in_domain), float(extra_domain)],
+        dtype=torch.float32,
+    )
+    return torch.cat([substitution_features(ref_aa, var_aa), extra], dim=0)
+
+
+def site_chem_at(
+    ref: str,
+    var: str,
+    center: int,
+    *,
+    llr: float = 0.0,
+    in_domain: float = 0.0,
+    extra_domain: float = 0.0,
+) -> torch.Tensor:
     if center < 0 or not ref or not var or center >= len(ref) or center >= len(var):
         return torch.zeros(NUM_SITE_CHEM, dtype=torch.float32)
-    return substitution_features(ref[center], var[center])
+    return pack_site_chem(
+        ref[center], var[center],
+        llr=llr, in_domain=in_domain, extra_domain=extra_domain,
+    )
+
+
+def pad_site_chem(chem: torch.Tensor, dim: int = NUM_SITE_CHEM) -> torch.Tensor:
+    """Pad or truncate ``[N, C]`` chemistry to ``dim`` (old caches are C=5)."""
+    if chem.ndim != 2:
+        raise ValueError(f"site_chem must be [N, C], got {tuple(chem.shape)}")
+    width = int(chem.size(1))
+    want = int(dim)
+    if width == want:
+        return chem
+    if width > want:
+        return chem[:, :want]
+    return torch.cat([chem, chem.new_zeros(chem.size(0), want - width)], dim=1)
+
+
+def aa_token_ids(tokenizer) -> dict[str, int]:
+    unk = getattr(tokenizer, "unk_token_id", None)
+    out: dict[str, int] = {}
+    for aa in _AA:
+        tid = tokenizer.convert_tokens_to_ids(aa)
+        if tid is None:
+            continue
+        tid = int(tid)
+        if unk is not None and tid == int(unk):
+            continue
+        out[aa] = tid
+    return out
+
+
+def site_llr(logits, wt: str, mut: str, aa_ids: dict[str, int], scale: float = LLR_SCALE) -> float:
+    """Unmasked ``logit[mut] - logit[wt]`` at a WT residue, scaled into chem range."""
+    wi = aa_ids.get((wt or "X")[:1].upper())
+    mi = aa_ids.get((mut or "X")[:1].upper())
+    if wi is None or mi is None:
+        return 0.0
+    import numpy as np
+
+    vec = np.asarray(logits, dtype=np.float64).reshape(-1)
+    if wi >= vec.size or mi >= vec.size:
+        return 0.0
+    den = float(scale) if float(scale) else 1.0
+    return float((vec[mi] - vec[wi]) / den)
+
+
+def ablate_chem_channels(
+    chem: torch.Tensor,
+    *,
+    logodds: bool = False,
+    domain: bool = False,
+) -> torch.Tensor:
+    """Zero log-odds and/or Pfam bits without touching the BLOSUM block."""
+    if chem is None or not (logodds or domain):
+        return chem
+    out = chem.clone()
+    width = int(out.size(-1))
+    if logodds and width > CHEM_LLR:
+        out[..., CHEM_LLR] = 0
+    if domain and width > CHEM_EXTRA_DOMAIN:
+        out[..., CHEM_IN_DOMAIN] = 0
+        out[..., CHEM_EXTRA_DOMAIN] = 0
+    return out

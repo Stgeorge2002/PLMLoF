@@ -17,7 +17,10 @@ from torch.utils.data import DataLoader, Subset
 
 from plmlof.applicability import save_gallery
 from plmlof.constants import NUM_SITE_CHEM, SITE_WINDOW
-from plmlof.dataset import CachedDataset, ProteinGroupBatchSampler, lof_train_keep_indices
+from plmlof.dataset import (
+    CachedDataset, ProteinGroupBatchSampler, lof_train_keep_indices,
+    mlof_train_indices, scale_prokaryote_weights,
+)
 from plmlof.encoders import HIDDEN_SIZE, esm2_for_task, read_encoder_meta
 from plmlof.model import TaskNet
 from plmlof.trainer import Trainer
@@ -57,6 +60,15 @@ def main() -> None:
         "--drop-sure-wrecks",
         action="store_true",
         help="Drop sure wrecks from the train set (always on for MLoF; optional for LoF)",
+    )
+    p.add_argument("--prokaryote-weight", type=float, default=1.0)
+    p.add_argument("--prokaryote-only", action="store_true")
+    p.add_argument("--ablate-logodds", action="store_true")
+    p.add_argument("--ablate-domain", action="store_true")
+    p.add_argument(
+        "--drop-multi",
+        action="store_true",
+        help="Drop Hamming-2 rows from the MLoF train set (eval still scores them)",
     )
     args = p.parse_args()
 
@@ -102,8 +114,34 @@ def main() -> None:
             f"{task_emb} site window is {train_full.site_window}, code expects {SITE_WINDOW}. "
             "Delete that task's embedding dir and re-run scripts/precompute.py"
         )
+    if args.task == "mlof" and (
+        args.prokaryote_weight != 1.0 or args.prokaryote_only
+    ) and not any(str(t).strip() for t in train_full.taxon):
+        raise SystemExit(
+            "prokaryote weight/filter requested but embeddings have no taxon. "
+            "Rebuild mlof parquet and re-run scripts/precompute.py"
+        )
+    if args.task == "mlof" and args.prokaryote_weight != 1.0:
+        train_full.weights = scale_prokaryote_weights(
+            train_full.weights, train_full.taxon, args.prokaryote_weight,
+        )
+        n_prok = sum(1 for t in train_full.taxon if str(t).strip().lower() == "prokaryote")
+        logger.info("prokaryote_weight=%s  n_prok=%s / %s", args.prokaryote_weight, n_prok, len(train_full))
     filter_wrecks = args.task == "mlof" or args.drop_sure_wrecks
-    if filter_wrecks:
+    if args.task == "mlof":
+        keep = mlof_train_indices(
+            train_full, args.seed,
+            prokaryote_only=args.prokaryote_only,
+            drop_multi=args.drop_multi,
+        )
+        train_ds = Subset(train_full, keep)
+        logger.info(
+            "mlof train filter %s → %s (no sure wrecks%s%s)",
+            len(train_full), len(train_ds),
+            ", prokaryote-only" if args.prokaryote_only else "",
+            ", Hamming-1 only" if args.drop_multi else "",
+        )
+    elif filter_wrecks:
         keep = lof_train_keep_indices(
             train_full.is_wreck, train_full.is_missense, train_full.targets,
             channels=list(train_full.channels), seed=args.seed,
@@ -158,6 +196,8 @@ def main() -> None:
         site_window=SITE_WINDOW,
         chem_dim=NUM_SITE_CHEM if args.task == "mlof" else 0,
     )
+    net.ablate_logodds = bool(args.ablate_logodds)
+    net.ablate_domain = bool(args.ablate_domain)
     precision = args.mixed_precision or train_cfg.get("mixed_precision", "bf16")
     trainer = Trainer(
         net=net,
@@ -209,6 +249,11 @@ def main() -> None:
         "dropout": float(model_cfg.get("dropout", 0.2)),
         "site_window": SITE_WINDOW if args.task == "mlof" else None,
         "chem_dim": NUM_SITE_CHEM if args.task == "mlof" else 0,
+        "ablate_logodds": bool(args.ablate_logodds),
+        "ablate_domain": bool(args.ablate_domain),
+        "prokaryote_weight": float(args.prokaryote_weight),
+        "prokaryote_only": bool(args.prokaryote_only),
+        "drop_multi": bool(args.drop_multi),
     }
     (Path(args.output_dir) / "model_config.json").write_text(json.dumps(meta, indent=2))
     logger.info("Done → %s", args.output_dir)

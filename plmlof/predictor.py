@@ -8,19 +8,19 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoModelForMaskedLM, AutoTokenizer
 
 from plmlof.applicability import in_family_flags, load_gallery
-from plmlof.chem import site_chem_at
+from plmlof.chem import aa_token_ids, site_chem_at, site_llr
 from plmlof.constants import GOF_CALL_THRESHOLD, IN_FAMILY_COSINE, SITE_RADIUS, TRAIN_TASKS
 from plmlof.data.features import extract_nucleotide_features
-from plmlof.domains import DomainIndex
+from plmlof.domains import DomainIndex, classify_position
 from plmlof.embed import _pool
 from plmlof.encoders import esm2_for_task
 from plmlof.inference.vcf_handler import VariantRecord, parse_fasta_pairs, parse_protein_fasta
 from plmlof.labels import display_bin
 from plmlof.model import TaskNet
-from plmlof.sites import aligned_site_index, gather_site_windows, missense_sites
+from plmlof.sites import aligned_site_index, gather_site_windows, missense_sites, token_index
 from plmlof.stats import benjamini_hochberg, empirical_p
 from plmlof.wreck import wreck_grade
 
@@ -73,6 +73,8 @@ def _load_net(ckpt_path: Path, device: torch.device) -> TaskNet:
         dropout=dropout,
         **extra,
     )
+    net.ablate_logodds = bool(cfg.get("ablate_logodds", False))
+    net.ablate_domain = bool(cfg.get("ablate_domain", False))
     net.load_state_dict(ckpt["state_dict"])
     net.eval()
     return net.to(device)
@@ -156,33 +158,37 @@ class Predictor:
                 return str(name)
         return esm2_for_task(task)
 
-    def _get_encoder(self, esm_name: str):
-        if esm_name not in self._encoders:
-            logger.info("Loading ESM2 %s", esm_name)
+    def _get_encoder(self, esm_name: str, *, masked_lm: bool = False):
+        key = f"{esm_name}|mlm" if masked_lm else esm_name
+        if key not in self._encoders:
+            logger.info("Loading ESM2 %s%s", esm_name, " (MLM)" if masked_lm else "")
             tokenizer = AutoTokenizer.from_pretrained(esm_name)
-            encoder = AutoModel.from_pretrained(esm_name).to(self.device)
+            loader = AutoModelForMaskedLM if masked_lm else AutoModel
+            encoder = loader.from_pretrained(esm_name).to(self.device)
             encoder.eval()
             for p in encoder.parameters():
                 p.requires_grad = False
-            self._encoders[esm_name] = (tokenizer, encoder)
-        return self._encoders[esm_name]
+            self._encoders[key] = (tokenizer, encoder)
+        return self._encoders[key]
 
     @torch.no_grad()
-    def _embed_hidden(self, seqs: list[str], esm_name: str):
-        tokenizer, encoder = self._get_encoder(esm_name)
+    def _embed_hidden(self, seqs: list[str], esm_name: str, *, masked_lm: bool = False):
+        tokenizer, encoder = self._get_encoder(esm_name, masked_lm=masked_lm)
         enc = tokenizer(
             seqs, padding=True, truncation=True,
             max_length=self.max_seq_length, return_tensors="pt",
         )
         ids = enc["input_ids"].to(self.device)
         mask = enc["attention_mask"].to(self.device)
-        hidden = encoder(ids, attention_mask=mask).last_hidden_state
+        out = encoder(ids, attention_mask=mask)
+        hidden = out.last_hidden_state
         mean_p, max_p = _pool(hidden, mask)
-        return hidden, mean_p, max_p
+        logits = getattr(out, "logits", None)
+        return hidden, mean_p, max_p, logits
 
     @torch.no_grad()
     def _embed_seqs(self, seqs: list[str], esm_name: str) -> tuple[torch.Tensor, torch.Tensor]:
-        _, mean_p, max_p = self._embed_hidden(seqs, esm_name)
+        _, mean_p, max_p, _ = self._embed_hidden(seqs, esm_name)
         return mean_p, max_p
 
     @torch.no_grad()
@@ -192,7 +198,7 @@ class Predictor:
         nuc = torch.stack([
             extract_nucleotide_features(r, v) for r, v in zip(refs, vars_)
         ]).to(self.device)
-        _, mean_p, max_p = self._embed_hidden(refs + vars_, esm_name)
+        _, mean_p, max_p, _ = self._embed_hidden(refs + vars_, esm_name)
         n = len(refs)
         return mean_p[:n], max_p[:n], mean_p[n:], max_p[n:], nuc, None, None
 
@@ -213,8 +219,9 @@ class Predictor:
             "avg": np.full(n, np.nan),
             "ref_mean": None,
         }
-        hidden, mean_p, max_p = self._embed_hidden(refs + vars_, esm_name)
+        hidden, mean_p, max_p, logits = self._embed_hidden(refs + vars_, esm_name, masked_lm=True)
         h_ref, h_var = hidden[:n], hidden[n:]
+        logit_ref = logits[:n] if logits is not None else None
         rows: list[tuple[int, int]] = []
         for i, (ref, var) in enumerate(zip(refs, vars_)):
             sites = missense_sites(ref, var)
@@ -233,7 +240,29 @@ class Predictor:
         centers = [s for _, s in rows]
         site_ref = gather_site_windows(h_ref[rec_idx], seqs_ref, centers, radius=radius)
         site_var = gather_site_windows(h_var[rec_idx], seqs_var, centers, radius=radius)
-        chem = torch.stack([site_chem_at(r, v, c) for r, v, c in zip(seqs_ref, seqs_var, centers)]).to(self.device)
+        tokenizer, _ = self._get_encoder(esm_name, masked_lm=True)
+        aa_ids = aa_token_ids(tokenizer)
+        chem_rows = []
+        for k, (i, center) in enumerate(rows):
+            ref, var = seqs_ref[k], seqs_var[k]
+            llr = 0.0
+            if logit_ref is not None and 0 <= center < len(ref) and center < len(var):
+                tok = token_index(center)
+                if 0 <= tok < logit_ref.size(1):
+                    llr = site_llr(logit_ref[i, tok].detach().float().cpu().numpy(), ref[center], var[center], aa_ids)
+            in_domain = extra = 0.0
+            if self.domains is not None:
+                spans = self.domains.spans(ref)
+                if spans:
+                    geom = classify_position(center + 1, spans)
+                    if geom == "in_domain":
+                        in_domain = 1.0
+                    elif geom in {"pre_domain", "linker", "tail"}:
+                        extra = 1.0
+            chem_rows.append(site_chem_at(
+                ref, var, center, llr=llr, in_domain=in_domain, extra_domain=extra,
+            ))
+        chem = torch.stack(chem_rows).to(self.device)
         dummy = torch.zeros(len(rows), dtype=mean_p.dtype, device=self.device)
         dummy_vec = dummy[:, None].expand(-1, mean_p.size(1))
         dummy_nuc = torch.zeros(len(rows), 12, device=self.device)

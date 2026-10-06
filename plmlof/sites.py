@@ -1,15 +1,15 @@
 """Aligned missense residue index and ESM2 token windows.
 
 ESM2 (HuggingFace) is ``[CLS] + residues + [EOS]``. Residue ``i`` (0-based) sits
-at token ``i + 1``. Training is Hamming-1; predict scores every same-length
-substitution and aggregates.
+at token ``i + 1``. Training keeps Hamming ≤ 2 so the ranker sees the same max-of-sites
+rule used at predict. Identity is Hamming 0.
 """
 
 from __future__ import annotations
 
 import torch
 
-from plmlof.constants import SITE_RADIUS
+from plmlof.constants import MLOF_MAX_HAMMING, SITE_RADIUS
 
 ESM_CLS_OFFSET = 1
 
@@ -31,6 +31,16 @@ def missense_sites(ref: str, var: str) -> list[int]:
     if not ref or not var or len(ref) != len(var):
         return []
     return [i for i, (a, b) in enumerate(zip(ref, var)) if a != b]
+
+
+def aa_hamming(ref: str, var: str) -> int:
+    """Number of substitutions on same-length proteins; 0 if unaligned or identity."""
+    return len(missense_sites(ref, var))
+
+
+def is_mlof_missense(ref: str, var: str, max_hamming: int = MLOF_MAX_HAMMING) -> bool:
+    n = aa_hamming(ref, var)
+    return 1 <= n <= int(max_hamming)
 
 
 def window_indices(center: int, length: int, radius: int = SITE_RADIUS) -> tuple[int, ...]:

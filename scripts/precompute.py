@@ -1,8 +1,8 @@
 """Pre-compute ESM2 embeddings for task splits.
 
 LoF uses ESM2-35M (pooled allele). MLoF/GoF share ESM2-650M; MLoF also
-banks a 5-residue window at the substitution plus BLOSUM chemistry so the
-ranker never sees gene identity from a pooled ref vector.
+banks a 5-residue window at each substitution plus BLOSUM chemistry,
+unmasked ESM2 log-odds, and Pfam in-domain bits.
 
     python scripts/precompute.py \
         --data-dir data/processed \
@@ -19,13 +19,14 @@ from pathlib import Path
 
 import torch
 import yaml
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoModelForMaskedLM, AutoTokenizer
 
-from plmlof.chem import site_chem_at
-from plmlof.constants import NUM_SITE_CHEM, SITE_WINDOW, TRAIN_TASKS
+from plmlof.chem import aa_token_ids, site_chem_at, site_llr
+from plmlof.constants import MLOF_MAX_HAMMING, NUM_SITE_CHEM, SITE_WINDOW, TRAIN_TASKS
 from plmlof.dataset import PairDataset
+from plmlof.domains import DomainIndex, classify_position
 from plmlof.embed import SiteBank, embed_unique_sequences
-from plmlof.encoders import ESM2_PAIR, esm2_for_task, read_encoder_meta, write_encoder_meta
+from plmlof.encoders import esm2_for_task, read_encoder_meta, write_encoder_meta
 from plmlof.sites import window_indices
 
 logger = logging.getLogger(__name__)
@@ -53,8 +54,40 @@ def _fill_site_windows(
     return out
 
 
-def _fill_site_chem(refs: list[str], vars_: list[str], centers: list[int]) -> torch.Tensor:
-    return torch.stack([site_chem_at(r, v, c) for r, v, c in zip(refs, vars_, centers)])
+def _domain_bits(ref: str, center: int, domains: DomainIndex | None) -> tuple[float, float]:
+    if domains is None or center < 0 or not ref:
+        return 0.0, 0.0
+    spans = domains.spans(ref)
+    if not spans:
+        return 0.0, 0.0
+    geom = classify_position(center + 1, spans)
+    if geom == "in_domain":
+        return 1.0, 0.0
+    if geom in {"pre_domain", "linker", "tail"}:
+        return 0.0, 1.0
+    return 0.0, 0.0
+
+
+def _fill_site_chem(
+    refs: list[str],
+    vars_: list[str],
+    centers: list[int],
+    logit_bank: SiteBank | None,
+    aa_ids: dict[str, int],
+    domains: DomainIndex | None,
+) -> torch.Tensor:
+    out = torch.zeros(len(refs), NUM_SITE_CHEM, dtype=torch.float32)
+    for i, (ref, var, center) in enumerate(zip(refs, vars_, centers)):
+        llr = 0.0
+        if logit_bank is not None and center >= 0 and ref and center < len(ref) and center < len(var):
+            vec = logit_bank.get(ref, center)
+            if vec is not None:
+                llr = site_llr(vec, ref[center], var[center], aa_ids)
+        in_domain, extra = _domain_bits(ref, center, domains)
+        out[i].copy_(site_chem_at(
+            ref, var, center, llr=llr, in_domain=in_domain, extra_domain=extra,
+        ))
+    return out
 
 
 def scatter(
@@ -65,21 +98,35 @@ def scatter(
     out: Path,
     site_bank: SiteBank | None = None,
     store_sites: bool = False,
+    logit_bank: SiteBank | None = None,
+    aa_ids: dict[str, int] | None = None,
+    domains: DomainIndex | None = None,
 ) -> None:
     n = len(dataset)
     hidden = mean_t.shape[1]
     ref_idx = torch.tensor([seq_to_idx[s] for s in dataset._ref], dtype=torch.long)
     var_idx = torch.tensor([seq_to_idx[s] for s in dataset._var], dtype=torch.long)
+    ids = aa_ids or {}
     if store_sites:
         if site_bank is None:
             raise RuntimeError(f"MLoF scatter requires a site bank: {out}")
         site_ref = _fill_site_windows(dataset._ref, dataset._site_index, site_bank, hidden)
         site_var = _fill_site_windows(dataset._var, dataset._site_index, site_bank, hidden)
-        site_chem = _fill_site_chem(dataset._ref, dataset._var, dataset._site_index)
+        site_chem = _fill_site_chem(
+            dataset._ref, dataset._var, dataset._site_index, logit_bank, ids, domains,
+        )
+        site_ref2 = _fill_site_windows(dataset._ref, dataset._site_index_2, site_bank, hidden)
+        site_var2 = _fill_site_windows(dataset._var, dataset._site_index_2, site_bank, hidden)
+        site_chem2 = _fill_site_chem(
+            dataset._ref, dataset._var, dataset._site_index_2, logit_bank, ids, domains,
+        )
     else:
         site_ref = torch.zeros(n, SITE_WINDOW, hidden, dtype=torch.float32)
         site_var = torch.zeros(n, SITE_WINDOW, hidden, dtype=torch.float32)
         site_chem = torch.zeros(n, NUM_SITE_CHEM, dtype=torch.float32)
+        site_ref2 = torch.zeros(n, SITE_WINDOW, hidden, dtype=torch.float32)
+        site_var2 = torch.zeros(n, SITE_WINDOW, hidden, dtype=torch.float32)
+        site_chem2 = torch.zeros(n, NUM_SITE_CHEM, dtype=torch.float32)
     data = {
         "ref_mean": mean_t[ref_idx].contiguous(),
         "ref_max": max_t[ref_idx].contiguous(),
@@ -88,6 +135,10 @@ def scatter(
         "site_ref": site_ref.contiguous(),
         "site_var": site_var.contiguous(),
         "site_chem": site_chem.contiguous(),
+        "site_ref2": site_ref2.contiguous(),
+        "site_var2": site_var2.contiguous(),
+        "site_chem2": site_chem2.contiguous(),
+        "n_sites": torch.tensor(dataset._n_sites, dtype=torch.long),
         "has_sites": bool(store_sites),
         "site_window": SITE_WINDOW,
         "nucleotide_features": dataset._nuc,
@@ -99,6 +150,8 @@ def scatter(
         "genes": dataset._genes,
         "protein_ids": dataset._protein_id,
         "channels": dataset._channel,
+        "taxon": dataset._taxon,
+        "assay": dataset._assay,
         "hidden_size": hidden,
     }
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -126,6 +179,10 @@ def _fresh(parquet: Path, dest: Path, wanted: str, task: str) -> bool:
         not meta.get("site_embeddings")
         or int(meta.get("site_window", 0)) != SITE_WINDOW
         or not meta.get("site_chem")
+        or int(meta.get("site_chem_dim", 0)) != NUM_SITE_CHEM
+        or not meta.get("site_llr")
+        or int(meta.get("max_sites", 1)) < MLOF_MAX_HAMMING
+        or not meta.get("taxon")
     ):
         return False
     return True
@@ -150,6 +207,12 @@ def main() -> None:
     )
     p.add_argument("--no-compile", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--tasks", nargs="*", default=list(TRAIN_TASKS))
+    p.add_argument(
+        "--domains",
+        type=Path,
+        default=Path("data/processed/pfam_domains.parquet"),
+        help="Pfam spans for MDG in-domain bits (skipped if missing)",
+    )
     args = p.parse_args()
 
     model_cfg = _load_model_cfg(args.model_config)
@@ -159,6 +222,13 @@ def main() -> None:
         model_cfg["esm2_model_name_lof"] = args.esm2_model_lof
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    domains = None
+    if args.domains.exists():
+        domains = DomainIndex(parquet=args.domains)
+        logger.info("Pfam domains from %s", args.domains)
+    elif any(t == "mlof" for t in args.tasks):
+        logger.warning("No %s — MDG in-domain bits will be zero", args.domains)
+
     by_encoder: dict[str, list[tuple[str, str, PairDataset, Path]]] = defaultdict(list)
     for task in args.tasks:
         wanted = esm2_for_task(task, model_cfg)
@@ -193,7 +263,10 @@ def main() -> None:
                     residue_requests[seq].update(residues)
         logger.info("Embedding %s unique sequences with %s", len(unique), esm_name)
         tokenizer = AutoTokenizer.from_pretrained(esm_name)
-        model = AutoModel.from_pretrained(esm_name).to(device)
+        if need_sites:
+            model = AutoModelForMaskedLM.from_pretrained(esm_name).to(device)
+        else:
+            model = AutoModel.from_pretrained(esm_name).to(device)
         model.eval()
         for p_ in model.parameters():
             p_.requires_grad = False
@@ -206,12 +279,13 @@ def main() -> None:
             logger.info("torch.compile off (site banking + variable-length ESM)")
 
         site_path = args.output_dir / "_mlof_site_bank.dat" if need_sites else None
-        ordered, mean_t, max_t, site_bank = embed_unique_sequences(
+        ordered, mean_t, max_t, site_bank, logit_bank = embed_unique_sequences(
             list(unique), model, tokenizer, device,
             args.batch_size, args.max_seq_length, num_workers=args.num_workers,
             residue_requests=dict(residue_requests) if need_sites else None,
             site_store_path=site_path,
         )
+        aa_ids = aa_token_ids(tokenizer) if need_sites else {}
         del model
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -224,6 +298,8 @@ def main() -> None:
                 scatter(
                     ds, seq_to_idx, mean_t, max_t, dest,
                     site_bank=site_bank, store_sites=(task == "mlof"),
+                    logit_bank=logit_bank, aa_ids=aa_ids,
+                    domains=domains if task == "mlof" else None,
                 )
                 if task not in stamped:
                     write_encoder_meta(
@@ -231,11 +307,18 @@ def main() -> None:
                         site_embeddings=(task == "mlof"),
                         site_window=SITE_WINDOW if task == "mlof" else None,
                         site_chem=(task == "mlof"),
+                        site_chem_dim=NUM_SITE_CHEM if task == "mlof" else 0,
+                        site_llr=(task == "mlof" and logit_bank is not None),
+                        site_domain=(task == "mlof" and domains is not None),
+                        max_sites=MLOF_MAX_HAMMING if task == "mlof" else 1,
+                        taxon=(task == "mlof"),
                     )
                     stamped.add(task)
         finally:
             if site_bank is not None:
                 site_bank.close()
+            if logit_bank is not None:
+                logit_bank.close()
 
     logger.info("Embeddings complete → %s", args.output_dir)
 

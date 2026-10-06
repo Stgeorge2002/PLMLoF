@@ -29,6 +29,15 @@ FLAG_KEYS = {
     "mlof_proteins_per_batch": "--mlof-proteins-per-batch",
     "head_hidden": "--head-hidden",
     "dropout": "--dropout",
+    "prokaryote_weight": "--prokaryote-weight",
+}
+
+BOOL_FLAGS = {
+    "drop_sure_wrecks": "--drop-sure-wrecks",
+    "ablate_logodds": "--ablate-logodds",
+    "ablate_domain": "--ablate-domain",
+    "drop_multi": "--drop-multi",
+    "prokaryote_only": "--prokaryote-only",
 }
 
 SELECT = {
@@ -44,8 +53,9 @@ def _run(cmd: list[str]) -> None:
 
 def _spec_flags(spec: dict) -> list[str]:
     flags: list[str] = []
-    if spec.get("drop_sure_wrecks"):
-        flags.append("--drop-sure-wrecks")
+    for key, flag in BOOL_FLAGS.items():
+        if spec.get(key):
+            flags.append(flag)
     for key, flag in FLAG_KEYS.items():
         if key in spec and spec[key] is not None:
             flags.extend([flag, str(spec[key])])
@@ -165,15 +175,20 @@ def main() -> None:
                 row["test_strong_vs_wt"] = metrics.get("test", {}).get("strong_vs_wt_auroc")
                 row["protein_test_strong_vs_wt"] = metrics.get("protein_test", {}).get("strong_vs_wt_auroc")
                 row["test_collapse"] = metrics.get("test", {}).get("collapse_fraction")
+                pt = metrics.get("protein_test", {})
+                row["protein_test_prokaryote"] = pt.get("taxon_prokaryote_within_gene_spearman")
+                row["protein_test_eukaryote"] = pt.get("taxon_eukaryote_within_gene_spearman")
+                row["protein_test_human"] = pt.get("taxon_human_within_gene_spearman")
             rows.append(row)
 
     scoreboard = {"selection": SELECT, "rows": rows}
     (root / "scoreboard.json").write_text(json.dumps(scoreboard, indent=2))
-    lines = ["task\tname\ttest\tval\tprotein_test\tnote"]
+    lines = ["task\tname\ttest\tval\tprotein_test\tprotein_test_prok\tnote"]
     for row in rows:
         lines.append(
             f"{row['task']}\t{row['name']}\t{row.get('test')}\t{row.get('val')}\t"
-            f"{row.get('protein_test')}\t{row.get('note', '')}"
+            f"{row.get('protein_test')}\t{row.get('protein_test_prokaryote')}\t"
+            f"{row.get('note', '')}"
         )
     (root / "scoreboard.tsv").write_text("\n".join(lines) + "\n")
     logger.info("Scoreboard → %s", root / "scoreboard.tsv")

@@ -7,7 +7,7 @@
 #   bash isambard/submit.sh pipeline         # embed + train + eval (tables must already be on disk)
 #   bash isambard/submit.sh pipeline --train-only
 #   bash isambard/submit.sh pipeline --eval-only
-#   bash isambard/submit.sh pipeline --sweep     # LoF+MDG head ablations, no GoF
+#   bash isambard/submit.sh pipeline --sweep     # MDG feature ablations (embed first)
 #   bash isambard/submit.sh embed
 #   bash isambard/submit.sh all              # setup, then pipeline after setup succeeds
 #   bash isambard/submit.sh test             # smoke if venv already exists
@@ -53,7 +53,8 @@ case "$ACTION" in
         submit_one pipeline.sbatch "$@"
         ;;
     sweep)
-        # Head-only on cached embeddings: ~1 h. Short limit so Slurm can start it before a drain.
+        # Feature ablations on cached MDG embeddings. Re-embed mlof first if encoder.json
+        # is missing site_llr / taxon. 7 specs × 2 seeds ≈ 1–2 h.
         sbatch --time=02:00:00 "${SBATCH_OUT[@]}" \
             "${ROOT}/isambard/jobs/pipeline.sbatch" --sweep
         ;;

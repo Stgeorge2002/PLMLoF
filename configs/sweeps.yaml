@@ -1,43 +1,37 @@
-# Head-only ablations on frozen ESM2 caches. No re-embed, no GoF.
+# MDG feature ablations on frozen ESM2 caches. LoF is done; this screen is
+# protein_test transfer (taxon weight, ESM log-odds, Pfam bits, Hamming-2).
 # Screen with 2 seeds; retrain the winner with 0-4 after the scoreboard.
 #
-# LoF selection = wreck AUROC. MDG selection = within-gene Spearman
-# (test sites of seen proteins) plus protein_test (unseen proteins).
+# Embeddings must already include 8-dim site_chem (llr + domain), Hamming-2
+# windows, and taxon. Rebuild mlof parquet on the laptop, rsync, then
+# `bash isambard/submit.sh embed` before this sweep.
+#
+# MDG selection = within-gene Spearman on test sites of seen proteins,
+# plus protein_test (unseen proteins). Taxon slices are diagnostic only.
 
 seeds: [0, 1]
 
-lof:
-  - name: baseline
-    note: current training.yaml (sure wrecks stay in train)
-  - name: no_sure_wrecks
-    drop_sure_wrecks: true
-    note: drop sure wrecks so the net cannot learn length
-  - name: lr_1e4
-    learning_rate: 1.0e-4
-  - name: wide_head
-    head_hidden: 256
-    dropout: 0.1
-  - name: long_train
-    max_epochs: 40
-    patience: 8
+lof: []
 
 mlof:
   - name: baseline
-    note: rank 0.7 + SmoothL1 0.3, 4 proteins/batch
-  - name: rank_only
-    rank_loss_weight: 1.0
-    regression_loss_weight: 0.0
-  - name: balanced
-    rank_loss_weight: 0.5
-    regression_loss_weight: 0.5
-  - name: dense_genes
-    mlof_proteins_per_batch: 8
-  - name: rank_only_dense
-    rank_loss_weight: 1.0
-    regression_loss_weight: 0.0
-    mlof_proteins_per_batch: 8
-  - name: lr_1e4
-    learning_rate: 1.0e-4
-  - name: long_train
-    max_epochs: 40
-    patience: 8
+    note: all new site features (llr + Pfam + Hamming-2)
+  - name: no_logodds
+    ablate_logodds: true
+    note: drop unmasked ESM2 log-odds
+  - name: no_domain
+    ablate_domain: true
+    note: drop Pfam in-domain / extra-domain bits
+  - name: chem_only
+    ablate_logodds: true
+    ablate_domain: true
+    note: BLOSUM chemistry only (old 5-dim)
+  - name: prokaryote_x3
+    prokaryote_weight: 3.0
+    note: up-weight prokaryote rows, keep eukaryotes
+  - name: prokaryote_only
+    prokaryote_only: true
+    note: train on prokaryote proteins only
+  - name: singles_only
+    drop_multi: true
+    note: drop Hamming-2 from train; eval still maxes sites

@@ -5,9 +5,23 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from plmlof.chem import ablate_chem_channels, pad_site_chem
 from plmlof.constants import NUM_SITE_CHEM, REGRESSION_TASKS, SITE_WINDOW, TASKS
 from plmlof.data.features import NUM_NUCLEOTIDE_FEATURES
 from plmlof.models.comparison import ComparisonModule
+
+
+def _align_chem(site_chem: torch.Tensor, dim: int) -> torch.Tensor:
+    """Match chemistry width to the head: pad old 5-dim caches, slice if wider."""
+    if site_chem.ndim == 1:
+        site_chem = site_chem.unsqueeze(0)
+        squeeze = True
+    else:
+        squeeze = False
+    if site_chem.ndim != 2:
+        raise ValueError(f"site_chem must be [B, C], got {tuple(site_chem.shape)}")
+    out = pad_site_chem(site_chem, dim)
+    return out.squeeze(0) if squeeze else out
 
 
 class LofScoreHead(nn.Module):
@@ -133,6 +147,8 @@ class TaskNet(nn.Module):
         self.feature_norm: nn.LayerNorm | None = None
         self.seq_norm: nn.LayerNorm | None = None
         self.chem_norm: nn.LayerNorm | None = None
+        self.ablate_logodds = False
+        self.ablate_domain = False
 
         if self.alignment_free:
             self.seq_norm = nn.LayerNorm(hidden_size * 2)
@@ -158,6 +174,28 @@ class TaskNet(nn.Module):
         input_size = self.comparison.output_size + num_nuc_features
         self.head = BinaryLogitHead(input_size, hidden_dim=head_hidden, dropout=dropout)
 
+    def _prep_chem(self, site_chem: torch.Tensor | None, batch: int, like: torch.Tensor) -> torch.Tensor | None:
+        if not self.chem_dim:
+            return None
+        if site_chem is None:
+            return like.new_zeros(batch, self.chem_dim)
+        chem = _align_chem(site_chem.float(), self.chem_dim)
+        return ablate_chem_channels(
+            chem, logodds=self.ablate_logodds, domain=self.ablate_domain,
+        )
+
+    def _score_site(
+        self,
+        site_ref: torch.Tensor,
+        site_var: torch.Tensor,
+        site_chem: torch.Tensor | None,
+    ) -> torch.Tensor:
+        feat = self.site_compare(site_ref, site_var)
+        chem = self._prep_chem(site_chem, feat.size(0), feat)
+        if chem is not None:
+            feat = torch.cat([feat, self.chem_norm(chem)], dim=-1)
+        return self.head(feat)
+
     def forward_from_cache(
         self,
         ref_mean: torch.Tensor,
@@ -168,6 +206,10 @@ class TaskNet(nn.Module):
         site_ref: torch.Tensor | None = None,
         site_var: torch.Tensor | None = None,
         site_chem: torch.Tensor | None = None,
+        site_ref2: torch.Tensor | None = None,
+        site_var2: torch.Tensor | None = None,
+        site_chem2: torch.Tensor | None = None,
+        n_sites: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.alignment_free:
             return self.head(self.seq_norm(torch.cat([var_mean, var_max], dim=-1)))
@@ -176,12 +218,15 @@ class TaskNet(nn.Module):
                 raise ValueError(
                     f"MLoF requires site_ref and site_var [B, {self.site_window}, D]"
                 )
-            feat = self.site_compare(site_ref, site_var)
-            if self.chem_dim:
-                if site_chem is None:
-                    site_chem = feat.new_zeros(feat.size(0), self.chem_dim)
-                feat = torch.cat([feat, self.chem_norm(site_chem.float())], dim=-1)
-            return self.head(feat)
+            score = self._score_site(site_ref, site_var, site_chem)
+            if site_ref2 is None or site_var2 is None:
+                return score
+            score2 = self._score_site(site_ref2, site_var2, site_chem2)
+            both = torch.maximum(score, score2)
+            if n_sites is None:
+                live = site_ref2.abs().reshape(site_ref2.size(0), -1).sum(dim=-1) > 0
+                return torch.where(live, both, score)
+            return torch.where(n_sites.reshape(-1) >= 2, both, score)
         comparison = self.comparison.compare_pooled(ref_mean, ref_max, var_mean, var_max)
         nuc = nucleotide_features
         nuc = self.feature_norm(nuc)
@@ -197,10 +242,16 @@ class TaskNet(nn.Module):
         site_ref: torch.Tensor | None = None,
         site_var: torch.Tensor | None = None,
         site_chem: torch.Tensor | None = None,
+        site_ref2: torch.Tensor | None = None,
+        site_var2: torch.Tensor | None = None,
+        site_chem2: torch.Tensor | None = None,
+        n_sites: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.forward_from_cache(
             ref_mean, ref_max, var_mean, var_max, nucleotide_features,
             site_ref=site_ref, site_var=site_var, site_chem=site_chem,
+            site_ref2=site_ref2, site_var2=site_var2, site_chem2=site_chem2,
+            n_sites=n_sites,
         )
 
     def probability(self, raw: torch.Tensor) -> torch.Tensor:

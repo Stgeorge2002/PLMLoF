@@ -81,6 +81,8 @@ class Trainer:
             ),
             "site_window": int(net.site_window) if net.uses_sites else None,
             "chem_dim": int(getattr(net, "chem_dim", 0)),
+            "ablate_logodds": bool(getattr(net, "ablate_logodds", False)),
+            "ablate_domain": bool(getattr(net, "ablate_domain", False)),
         }
         self.lof_loss = nn.SmoothL1Loss(reduction="none")
         self.bce = nn.BCEWithLogitsLoss(reduction="none")
@@ -93,6 +95,10 @@ class Trainer:
             site_ref=batch.get("site_ref"),
             site_var=batch.get("site_var"),
             site_chem=batch.get("site_chem"),
+            site_ref2=batch.get("site_ref2"),
+            site_var2=batch.get("site_var2"),
+            site_chem2=batch.get("site_chem2"),
+            n_sites=batch.get("n_sites"),
         )
 
     def _step(self, batch: dict) -> tuple[torch.Tensor, torch.Tensor]:

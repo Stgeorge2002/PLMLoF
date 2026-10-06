@@ -112,8 +112,8 @@ def embed_unique_sequences(
     num_workers: int = 4,
     residue_requests: dict[str, set[int]] | None = None,
     site_store_path: Path | str | None = None,
-) -> tuple[list[str], torch.Tensor, torch.Tensor, SiteBank | None]:
-    """Pool unique sequences; optionally bank only the requested residue tokens."""
+) -> tuple[list[str], torch.Tensor, torch.Tensor, SiteBank | None, SiteBank | None]:
+    """Pool unique sequences; optionally bank residue tokens and MLM logits."""
     ds = _LenSortedSeqs(sequences)
 
     def collate(batch: list[str]) -> dict:
@@ -129,6 +129,9 @@ def embed_unique_sequences(
     )
     means, maxes, ordered = [], [], []
     site_bank: SiteBank | None = None
+    logit_bank: SiteBank | None = None
+    vocab = int(getattr(getattr(model, "config", None), "vocab_size", 0) or 0)
+    has_lm = hasattr(model, "lm_head") and vocab > 0
     if residue_requests:
         n_slots = sum(len(v) for v in residue_requests.values())
         path = Path(site_store_path) if site_store_path is not None else None
@@ -137,6 +140,10 @@ def embed_unique_sequences(
             "Site bank  slots=%s  D=%s  store=%s",
             n_slots, site_bank.dim, path if path is not None else "ram",
         )
+        if has_lm:
+            logit_path = path.with_name(path.name + ".logits") if path is not None else None
+            logit_bank = SiteBank(n_slots, vocab, logit_path)
+            logger.info("Logit bank  slots=%s  V=%s", n_slots, vocab)
     use_amp = device.type == "cuda"
     amp_dtype = torch.bfloat16
     if use_amp:
@@ -147,7 +154,9 @@ def embed_unique_sequences(
         ids = batch["input_ids"].to(device, non_blocking=True)
         mask = batch["attention_mask"].to(device, non_blocking=True)
         with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-            hidden = model(ids, attention_mask=mask).last_hidden_state
+            out = model(ids, attention_mask=mask)
+            hidden = out.last_hidden_state
+            logits = getattr(out, "logits", None)
         mean_p, max_p = _pool(hidden, mask)
         means.append(mean_p.float().cpu())
         maxes.append(max_p.float().cpu())
@@ -170,6 +179,9 @@ def embed_unique_sequences(
                     continue
                 tok_t = torch.tensor(toks, device=hidden.device, dtype=torch.long)
                 site_bank.add(seq, residues, hidden[b].index_select(0, tok_t))
+                if logit_bank is not None and logits is not None:
+                    logit_bank.add(seq, residues, logits[b].index_select(0, tok_t))
         del hidden
+        del logits
 
-    return ordered, torch.cat(means), torch.cat(maxes), site_bank
+    return ordered, torch.cat(means), torch.cat(maxes), site_bank, logit_bank

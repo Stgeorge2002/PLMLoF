@@ -5,9 +5,10 @@ from __future__ import annotations
 import random
 
 import numpy as np
+import pytest
 import torch
 
-from plmlof.constants import NUM_SITE_CHEM, SITE_WINDOW
+from plmlof.constants import NUM_SITE_CHEM, NUM_SUB_CHEM, SITE_WINDOW
 from plmlof.data.features import LOF_LEAK_NUC_INDICES
 from plmlof.dataset import ProteinGroupBatchSampler, lof_train_keep_indices
 from plmlof.domains import lof_prior, sample_events
@@ -538,9 +539,9 @@ class TestTrainTasks:
 
         payload = yaml.safe_load(Path("configs/sweeps.yaml").read_text())
         for task in ("lof", "mlof"):
-            names = [row["name"] for row in payload[task]]
-            assert names
+            names = [row["name"] for row in (payload.get(task) or [])]
             assert len(names) == len(set(names))
+        assert payload["mlof"]
 
 
 class TestSubstitutionChem:
@@ -549,10 +550,23 @@ class TestSubstitutionChem:
 
         ident = substitution_features("A", "A")
         rad = substitution_features("A", "W")
-        assert ident.shape == (NUM_SITE_CHEM,)
+        assert ident.shape == (NUM_SUB_CHEM,)
         assert float(ident[0]) > float(rad[0])
         assert float(ident[1]) == 1.0
         assert float(rad[1]) == 0.0
+
+    def test_pack_adds_llr_and_domain(self):
+        from plmlof.chem import pack_site_chem, site_chem_at
+        from plmlof.constants import CHEM_EXTRA_DOMAIN, CHEM_IN_DOMAIN, CHEM_LLR
+
+        packed = pack_site_chem("A", "W", llr=0.5, in_domain=1.0, extra_domain=0.0)
+        assert packed.shape == (NUM_SITE_CHEM,)
+        assert packed[CHEM_LLR].item() == pytest.approx(0.5)
+        assert packed[CHEM_IN_DOMAIN].item() == pytest.approx(1.0)
+        assert packed[CHEM_EXTRA_DOMAIN].item() == pytest.approx(0.0)
+        full = site_chem_at("AAAAA", "AWAAA", 1, llr=-0.2, in_domain=0.0, extra_domain=1.0)
+        assert full.shape == (NUM_SITE_CHEM,)
+        assert full[CHEM_LLR].item() == pytest.approx(-0.2)
 
     def test_chem_moves_mlof_score(self):
         net = TaskNet(hidden_size=16, task="mlof")

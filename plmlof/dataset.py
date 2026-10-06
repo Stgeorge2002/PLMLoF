@@ -10,9 +10,10 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset, Sampler
 
+from plmlof.chem import pad_site_chem
 from plmlof.constants import NUM_SITE_CHEM, SITE_RADIUS, SITE_WINDOW
 from plmlof.data.features import extract_nucleotide_features
-from plmlof.sites import aligned_site_index, window_indices
+from plmlof.sites import aligned_site_index, missense_sites, window_indices
 
 
 REQUIRED_COLUMNS = {"ref_protein", "var_protein", "target", "sample_weight"}
@@ -154,12 +155,28 @@ class PairDataset(Dataset):
             self._is_missense = ["missense" in c for c in self._channel]
 
         stored = self.df["site_index"] if "site_index" in self.df.columns else None
+        stored2 = self.df["site_index_2"] if "site_index_2" in self.df.columns else None
+        stored_n = self.df["n_sites"] if "n_sites" in self.df.columns else None
         self._site_index = []
+        self._site_index_2 = []
+        self._n_sites = []
         for i, (ref, var) in enumerate(zip(self._ref, self._var)):
+            sites = missense_sites(ref, var)
             if stored is not None and pd.notna(stored.iloc[i]) and int(stored.iloc[i]) >= 0:
                 self._site_index.append(int(stored.iloc[i]))
             else:
                 self._site_index.append(aligned_site_index(ref, var))
+            if stored2 is not None and pd.notna(stored2.iloc[i]) and int(stored2.iloc[i]) >= 0:
+                self._site_index_2.append(int(stored2.iloc[i]))
+            else:
+                self._site_index_2.append(sites[1] if len(sites) > 1 else -1)
+            if stored_n is not None and pd.notna(stored_n.iloc[i]):
+                self._n_sites.append(int(stored_n.iloc[i]))
+            else:
+                self._n_sites.append(len(sites))
+        n = len(self._ref)
+        self._taxon = [str(v).strip() for v in self.df.get("taxon", [""] * n)]
+        self._assay = [str(v).strip() for v in self.df.get("assay", [""] * n)]
 
         self._nuc = torch.stack([
             extract_nucleotide_features(r, v) for r, v in zip(self._ref, self._var)
@@ -169,16 +186,19 @@ class PairDataset(Dataset):
         return len(self._ref)
 
     def residue_requests(self) -> dict[str, set[int]]:
-        """Seq → residue indices needed for the MDG site window."""
+        """Seq → residue indices needed for every MDG site window (Hamming ≤ 2)."""
         need: dict[str, set[int]] = {}
-        for ref, var, center in zip(self._ref, self._var, self._site_index):
-            if center < 0:
-                continue
+        for ref, var, center, center2 in zip(
+            self._ref, self._var, self._site_index, self._site_index_2,
+        ):
             for seq, length in ((ref, len(ref)), (var, len(var))):
                 bucket = need.setdefault(seq, set())
-                for residue in window_indices(center, length, SITE_RADIUS):
-                    if residue >= 0:
-                        bucket.add(residue)
+                for site in (center, center2):
+                    if site < 0:
+                        continue
+                    for residue in window_indices(site, length, SITE_RADIUS):
+                        if residue >= 0:
+                            bucket.add(residue)
         return need
 
     def __getitem__(self, idx: int) -> dict:
@@ -231,7 +251,17 @@ class CachedDataset(Dataset):
         hidden = int(self.ref_mean.shape[1])
         self.site_ref = data.get("site_ref", _empty_sites(len(self.targets), hidden))
         self.site_var = data.get("site_var", _empty_sites(len(self.targets), hidden))
-        self.site_chem = data.get("site_chem", _empty_chem(len(self.targets)))
+        self.site_chem = pad_site_chem(data.get("site_chem", _empty_chem(len(self.targets))))
+        self.site_ref2 = data.get("site_ref2", _empty_sites(len(self.targets), hidden))
+        self.site_var2 = data.get("site_var2", _empty_sites(len(self.targets), hidden))
+        self.site_chem2 = pad_site_chem(data.get("site_chem2", _empty_chem(len(self.targets))))
+        n = len(self.targets)
+        self.n_sites = data.get("n_sites", torch.zeros(n, dtype=torch.long))
+        if not torch.is_tensor(self.n_sites):
+            self.n_sites = torch.tensor(self.n_sites, dtype=torch.long)
+        self.n_sites = self.n_sites.long()
+        self.taxon = list(data.get("taxon", [""] * n))
+        self.assay = list(data.get("assay", [""] * n))
         self.has_sites = bool(data.get("has_sites", False))
         self.site_window = int(self.site_ref.shape[1]) if self.site_ref.ndim == 3 else SITE_WINDOW
 
@@ -248,6 +278,10 @@ class CachedDataset(Dataset):
             "site_ref": self.site_ref[idx],
             "site_var": self.site_var[idx],
             "site_chem": self.site_chem[idx],
+            "site_ref2": self.site_ref2[idx],
+            "site_var2": self.site_var2[idx],
+            "site_chem2": self.site_chem2[idx],
+            "n_sites": self.n_sites[idx],
             "target": self.targets[idx],
             "sample_weight": self.weights[idx],
             "dms_zscore": self.z[idx],
@@ -256,4 +290,47 @@ class CachedDataset(Dataset):
             "gene": self.genes[idx],
             "protein_id": self.protein_ids[idx],
             "channel": self.channels[idx],
+            "taxon": self.taxon[idx],
+            "assay": self.assay[idx],
         }
+
+
+def scale_prokaryote_weights(weights: torch.Tensor, taxon: Sequence[str], scale: float) -> torch.Tensor:
+    """Up-weight prokaryote rows. Identity of a prokaryote protein keeps that taxon."""
+    w = weights.clone()
+    if float(scale) == 1.0:
+        return w
+    mask = torch.tensor(
+        [str(t).strip().lower() == "prokaryote" for t in taxon],
+        dtype=torch.bool,
+    )
+    if mask.numel() != w.numel():
+        raise ValueError(f"taxon length {mask.numel()} != weights {w.numel()}")
+    w[mask] *= float(scale)
+    return w
+
+
+def mlof_train_indices(
+    ds: CachedDataset,
+    seed: int,
+    *,
+    prokaryote_only: bool = False,
+    drop_multi: bool = False,
+) -> list[int]:
+    """Wreck/identity filter, then optional prokaryote-only and Hamming-1-only."""
+    keep = lof_train_keep_indices(
+        ds.is_wreck, ds.is_missense, ds.targets,
+        channels=list(ds.channels), seed=seed,
+    )
+    if prokaryote_only:
+        if not any(str(t).strip() for t in ds.taxon):
+            raise SystemExit(
+                "prokaryote-only requested but embeddings have no taxon. "
+                "Rebuild mlof parquet and re-run scripts/precompute.py"
+            )
+        keep = [i for i in keep if str(ds.taxon[i]).strip().lower() == "prokaryote"]
+    if drop_multi:
+        keep = [i for i in keep if int(ds.n_sites[i]) <= 1]
+    if not keep:
+        raise SystemExit("MLoF train filter removed every row")
+    return keep
