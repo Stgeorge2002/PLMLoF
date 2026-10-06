@@ -63,6 +63,7 @@ class Trainer:
         self.scaler = torch.amp.GradScaler("cuda", enabled=(mixed_precision == "fp16" and self.use_amp))
         self.best_metric = -1e9
         self.best_epoch = -1
+        mlp = net.head.mlp
         self.model_config = {
             "plmlof": True,
             "task": net.task,
@@ -71,6 +72,8 @@ class Trainer:
             "seed": seed,
             "gof_threshold": gof_threshold,
             "hidden_size": net.hidden_size,
+            "head_hidden": int(mlp[0].out_features),
+            "dropout": float(getattr(mlp[2], "p", 0.2)),
             "alignment_free": net.alignment_free,
             "uses_sites": net.uses_sites,
             "use_cross_attention": (

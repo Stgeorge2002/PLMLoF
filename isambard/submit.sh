@@ -53,7 +53,9 @@ case "$ACTION" in
         submit_one pipeline.sbatch "$@"
         ;;
     sweep)
-        submit_one pipeline.sbatch --sweep
+        # Head-only on cached embeddings: ~1 h. Short limit so Slurm can start it before a drain.
+        sbatch --time=02:00:00 "${SBATCH_OUT[@]}" \
+            "${ROOT}/isambard/jobs/pipeline.sbatch" --sweep
         ;;
     embed)
         submit_one pipeline.sbatch --embed-only

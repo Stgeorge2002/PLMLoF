@@ -25,14 +25,27 @@ from plmlof.wreck import wreck_grade
 logger = logging.getLogger(__name__)
 
 
+def _head_hparams(ckpt: dict) -> tuple[int, float]:
+    """Head width/dropout as trained. Infer width from weights if older ckpts omit it."""
+    cfg = ckpt.get("model_config") or {}
+    hidden = cfg.get("head_hidden")
+    if hidden is None:
+        weight = ckpt["state_dict"].get("head.mlp.0.weight")
+        hidden = int(weight.shape[0]) if weight is not None else 128
+    return int(hidden), float(cfg.get("dropout", 0.2))
+
+
 def _load_net(ckpt_path: Path, device: torch.device) -> TaskNet:
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     cfg = ckpt["model_config"]
+    head_hidden, dropout = _head_hparams(ckpt)
     net = TaskNet(
         hidden_size=cfg["hidden_size"],
         task=ckpt["task"],
         pool_strategy=cfg.get("pool_strategy", "mean_max"),
         use_cross_attention=cfg.get("use_cross_attention", False),
+        head_hidden=head_hidden,
+        dropout=dropout,
     )
     net.load_state_dict(ckpt["state_dict"])
     net.eval()

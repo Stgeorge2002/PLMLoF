@@ -197,6 +197,8 @@ def main() -> None:
         "seed": args.seed,
         "esm2_model_name": esm_name,
         "hidden_size": hidden,
+        "head_hidden": int(model_cfg.get("head_hidden", 128)),
+        "dropout": float(model_cfg.get("dropout", 0.2)),
     }
     (Path(args.output_dir) / "model_config.json").write_text(json.dumps(meta, indent=2))
     logger.info("Done → %s", args.output_dir)

@@ -334,6 +334,28 @@ class TestTaskNet:
         else:
             raise AssertionError("MLoF must refuse pooled-only forward")
 
+    def test_load_net_matches_nondefault_head(self, tmp_path):
+        from plmlof.predictor import _load_net
+
+        net = TaskNet(hidden_size=16, task="lof", head_hidden=256, dropout=0.1)
+        net.eval()
+        path = tmp_path / "model_best.pt"
+        torch.save(
+            {
+                "task": "lof",
+                "state_dict": net.state_dict(),
+                "model_config": {"hidden_size": 16, "pool_strategy": "mean_max"},
+            },
+            path,
+        )
+        loaded = _load_net(path, torch.device("cpu"))
+        assert loaded.head.mlp[0].out_features == 256
+        x = torch.randn(3, 16)
+        with torch.no_grad():
+            a = net.forward_from_cache(x, x, x, x, torch.zeros(3, 12))
+            b = loaded.forward_from_cache(x, x, x, x, torch.zeros(3, 12))
+        assert torch.allclose(a, b, atol=1e-6)
+
 
 class TestLofTrainFilter:
     def test_drops_wrecks_and_caps_identity(self):

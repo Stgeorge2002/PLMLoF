@@ -111,6 +111,10 @@ def main() -> None:
             extra = _spec_flags(spec)
             for seed in seeds:
                 out = exp_dir / f"seed{seed}"
+                ckpt = out / "checkpoints" / "model_best.pt"
+                if ckpt.exists():
+                    logger.info("skip train %s (exists)", ckpt)
+                    continue
                 _run([
                     py, "scripts/train.py",
                     "--task", task,
@@ -132,14 +136,17 @@ def main() -> None:
                 if not split_emb.exists():
                     continue
                 json_out = exp_dir / f"metrics_{split}.json"
-                _run([
-                    py, "scripts/evaluate.py",
-                    "--task", task,
-                    "--ensemble-dir", str(exp_dir),
-                    "--embeddings", str(split_emb),
-                    "--device", args.device,
-                    "--json-out", str(json_out),
-                ])
+                if json_out.exists():
+                    logger.info("skip eval %s (exists)", json_out)
+                else:
+                    _run([
+                        py, "scripts/evaluate.py",
+                        "--task", task,
+                        "--ensemble-dir", str(exp_dir),
+                        "--embeddings", str(split_emb),
+                        "--device", args.device,
+                        "--json-out", str(json_out),
+                    ])
                 metrics[split] = _load_metrics(json_out)
             key = SELECT[task]
             row = {
