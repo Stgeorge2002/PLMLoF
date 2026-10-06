@@ -554,6 +554,10 @@ class TestSubstitutionChem:
         assert float(ident[0]) > float(rad[0])
         assert float(ident[1]) == 1.0
         assert float(rad[1]) == 0.0
+        # P-row used to be 19-wide; Y is the last alphabet column.
+        py = substitution_features("P", "Y")
+        assert py.shape == (NUM_SUB_CHEM,)
+        assert float(py[0]) < 0.0
 
     def test_pack_adds_llr_and_domain(self):
         from plmlof.chem import pack_site_chem, site_chem_at
