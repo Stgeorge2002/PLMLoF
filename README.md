@@ -121,6 +121,15 @@ Alignment-free LoF (no reference pair; loads ESM2-35M only):
 python scripts/predict.py --model "$PLMLOF_OUTPUT_DIR" --proteins alleles.faa --device cuda
 ```
 
+For the N44 ST258 frozen-head batch, submit `bash isambard/submit.sh predict`
+from the login node after setup succeeds. Git keeps the analysis scripts,
+PLMLoF package, runtime configuration, and job scripts, not the outbreak data
+or inference assets. The entire `N44_ST258_results/` and `best-models/` trees,
+their `plmlof_input.tar*` / `best-models.tar*` transfer archives, and generated
+`examples/blaOXA1/` data are ignored. Transfer data and the complete model bundle
+(including JSON metadata) separately with rsync; example Python scripts remain
+trackable.
+
 Columns include `lof_score`, `lof_sd`, `lof_p`, `lof_q`, `mlof_score`, `mlof_bin` (0 / 0.40 / 0.70 display), `in_family`, wreck flags, and growth/AMR GoF probabilities + calls.
 
 Held-out Dewachter exam (never in training):

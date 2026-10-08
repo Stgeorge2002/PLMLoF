@@ -9,6 +9,7 @@
 #   bash isambard/submit.sh pipeline --eval-only
 #   bash isambard/submit.sh pipeline --sweep     # MDG feature ablations (embed first)
 #   bash isambard/submit.sh embed
+#   bash isambard/submit.sh predict           # batch-score N44_ST258_results/plmlof_input with best-models/
 #   bash isambard/submit.sh all              # setup, then pipeline after setup succeeds
 #   bash isambard/submit.sh test             # smoke if venv already exists
 #
@@ -61,6 +62,9 @@ case "$ACTION" in
     embed)
         submit_one pipeline.sbatch --embed-only
         ;;
+    predict)
+        submit_one predict.sbatch "$@"
+        ;;
     data)
         echo "Training data is prepared on a laptop, not on Isambard." >&2
         echo "  bash scripts/prepare_local.sh" >&2
@@ -80,7 +84,7 @@ case "$ACTION" in
         sed -n '2,20p' "$0"
         ;;
     *)
-        echo "Unknown action: $ACTION (expected smoke|setup|pipeline|sweep|embed|test|all)" >&2
+        echo "Unknown action: $ACTION (expected smoke|setup|pipeline|sweep|embed|predict|test|all)" >&2
         exit 1
         ;;
 esac

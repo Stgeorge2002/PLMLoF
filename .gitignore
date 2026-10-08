@@ -19,6 +19,22 @@ data/scripts/data/
 # IGNORE ALL OUTPUTS
 outputs/
 
+# Outbreak source data, generated FASTA pairs, and predictions (rsync, not git)
+/N44_ST258_results/
+
+# Frozen model bundles, including metadata (rsync the complete directory)
+/best-models/
+
+# Transfer archives, including bundles created at the repo root
+plmlof_input.tar
+plmlof_input.tar.*
+best-models.tar
+best-models.tar.*
+
+# Generated example assets; keep the analysis scripts trackable
+/examples/blaOXA1/*
+!/examples/blaOXA1/*.py
+
 # IGNORE ALL MODELS
 *.pt
 *.pth
