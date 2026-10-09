@@ -122,7 +122,9 @@ python scripts/predict.py --model "$PLMLOF_OUTPUT_DIR" --proteins alleles.faa --
 ```
 
 For the N44 ST258 frozen-head batch, submit `bash isambard/submit.sh predict`
-from the login node after setup succeeds. Git keeps the analysis scripts,
+from the login node after setup succeeds. The submission helper sets the repo
+as Slurm's submission directory; the job loads its environment from there,
+not from the location of Slurm's copied batch script. Git keeps the analysis scripts,
 PLMLoF package, runtime configuration, and job scripts, not the outbreak data
 or inference assets. The entire `N44_ST258_results/` and `best-models/` trees,
 their `plmlof_input.tar*` / `best-models.tar*` transfer archives, and generated

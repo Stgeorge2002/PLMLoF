@@ -33,9 +33,10 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     exit 1
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Slurm executes a spooled copy; submit.sh sets the submission directory to the repo.
+cd "${SLURM_SUBMIT_DIR:?}"
 # shellcheck source=../env.sh
-source "${SCRIPT_DIR}/../env.sh"
+source isambard/env.sh
 cd "$PLMLOF_ROOT"
 
 if [[ ! -x "${PLMLOF_VENV}/bin/python" ]]; then
