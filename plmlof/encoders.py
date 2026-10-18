@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 
 ESM2_LOF = "facebook/esm2_t12_35M_UR50D"
+# Distilled / fast predict path (same LoF head architecture, smaller encoder).
+ESM2_LOF_FAST = "facebook/esm2_t6_8M_UR50D"
 
 HIDDEN_SIZE = {
     "facebook/esm2_t6_8M_UR50D": 320,

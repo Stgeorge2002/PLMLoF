@@ -37,6 +37,7 @@ class Trainer:
         esm2_model_name: str = "facebook/esm2_t12_35M_UR50D",
         pool_strategy: str = "mean_max",
         seed: int = 0,
+        distill_alpha: float = 0.0,
     ):
         self.net = net.to(device)
         self.train_loader = train_loader
@@ -46,6 +47,9 @@ class Trainer:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.task = net.task
         self.seed = seed
+        self.distill_alpha = float(distill_alpha)
+        if not 0.0 <= self.distill_alpha <= 1.0:
+            raise ValueError(f"distill_alpha must be in [0, 1], got {self.distill_alpha}")
         self.use_amp = mixed_precision in ("fp16", "bf16") and self.device.type == "cuda"
         self.amp_dtype = (
             torch.float16 if mixed_precision == "fp16"
@@ -69,6 +73,7 @@ class Trainer:
             "use_cross_attention": (
                 net.comparison is not None and net.comparison.cross_attn is not None
             ),
+            "distill_alpha": self.distill_alpha,
         }
         self.lof_loss = nn.SmoothL1Loss(reduction="none")
 
@@ -83,7 +88,12 @@ class Trainer:
         raw = self._raw(batch)
         target = batch["target"].float()
         weight = batch["sample_weight"].float().clamp(min=1e-6)
-        per = self.lof_loss(raw, target)
+        hard = self.lof_loss(raw, target)
+        if self.distill_alpha > 0.0 and "soft_target" in batch:
+            soft = self.lof_loss(raw, batch["soft_target"].float())
+            per = (1.0 - self.distill_alpha) * hard + self.distill_alpha * soft
+        else:
+            per = hard
         loss = (per * weight).sum() / weight.sum()
         measure = self.net.probability(raw)
         return loss, measure
@@ -117,7 +127,7 @@ class Trainer:
     @torch.no_grad()
     def _eval_epoch(self) -> dict[str, float]:
         self.net.eval()
-        preds, targets, zs, wrecks, misses = [], [], [], [], []
+        preds, targets, softs, zs, wrecks, misses = [], [], [], [], [], []
         genes: list[str] = []
         pids: list[str] = []
         total = 0.0
@@ -129,6 +139,8 @@ class Trainer:
             n += 1
             preds.append(measure.float().cpu().numpy())
             targets.append(batch["target"].float().cpu().numpy())
+            if "soft_target" in batch:
+                softs.append(batch["soft_target"].float().cpu().numpy())
             zs.append(batch["dms_zscore"].float().cpu().numpy())
             wrecks.append(batch["is_wreck"].cpu().numpy())
             misses.append(batch["is_missense"].cpu().numpy())
@@ -141,6 +153,9 @@ class Trainer:
         is_missense = np.concatenate(misses).astype(bool) if misses else np.array([], dtype=bool)
         metrics: dict[str, float] = {"loss": total / max(n, 1)}
         metrics.update(lof_metrics(pred, target, z, is_wreck, is_missense))
+        if softs:
+            soft = np.concatenate(softs)
+            metrics["teacher_mae"] = float(np.mean(np.abs(pred - soft)))
         return metrics
 
     def _save(self, epoch: int, metrics: dict) -> None:

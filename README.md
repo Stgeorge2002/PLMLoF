@@ -103,6 +103,35 @@ bash isambard/submit.sh embed
 
 One GPU-hour = **0.25 NHR**. Do not add `--exclusive`.
 
+### Distill 35M → 8M (faster predict)
+
+After the 35M teacher ensemble exists (`best-models/lof` or `outputs/lof`) and
+its embeddings are under `$PLMLOF_EMB_DIR/lof/`, distill a student head on
+ESM2-8M pooled embeddings. Soft labels from the teacher are mixed with hard
+table targets (`--distill-alpha`, default 0.85).
+
+```bash
+bash isambard/submit.sh distill
+# or with flags:
+bash isambard/submit.sh distill --teacher-dir best-models/lof --distill-alpha 0.85
+```
+
+This precomputes `$PLMLOF_EMB_DIR_8M/lof/` if needed, trains
+`$PLMLOF_OUTPUT_DIR/lof_8m/`, scores nulls, and evaluates the test split.
+Point predict at the student dir (encoder is read from checkpoint meta):
+
+```bash
+python scripts/predict.py \
+  --model "$PLMLOF_OUTPUT_DIR/lof_8m" \
+  --reference ref.fasta \
+  --variants var.fasta \
+  --output predictions_8m.tsv \
+  --device cuda
+```
+
+Optional promote: copy `outputs/lof_8m` → `best-models/lof_8m` and use that as
+`--model` for batch predict.
+
 ---
 
 ## 3. Predict (compute node)

@@ -14,7 +14,7 @@
 #
 #   bash isambard/submit.sh predict
 #   bash isambard/submit.sh predict /custom/input_dir /custom/model_dir /custom/out.tsv
-#   bash isambard/submit.sh predict /custom/input_dir /custom/model_dir /custom/out.tsv --lof-only
+#   bash isambard/submit.sh predict ... $PLMLOF_OUTPUT_DIR/lof_8m predictions_8m.tsv
 
 #SBATCH --job-name=plmlof-predict
 #SBATCH --nodes=1
@@ -47,17 +47,12 @@ source "${PLMLOF_VENV}/bin/activate"
 INPUT_DIR="${PLMLOF_SCRATCH}/N44_ST258_results/plmlof_input"
 MODEL_DIR="${PLMLOF_ROOT}/best-models"
 OUT="${PLMLOF_ROOT}/N44_ST258_results/predictions.tsv"
-LOF_ONLY=0
 POSITIONAL=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --lof-only)
-            LOF_ONLY=1
-            shift
-            ;;
         -h|--help)
-            echo "Usage: predict.sbatch [INPUT_DIR] [MODEL_DIR] [OUT.tsv] [--lof-only]" >&2
+            echo "Usage: predict.sbatch [INPUT_DIR] [MODEL_DIR] [OUT.tsv]" >&2
             exit 0
             ;;
         -*)
@@ -75,7 +70,7 @@ if [[ ${#POSITIONAL[@]} -ge 1 ]]; then INPUT_DIR="${POSITIONAL[0]}"; fi
 if [[ ${#POSITIONAL[@]} -ge 2 ]]; then MODEL_DIR="${POSITIONAL[1]}"; fi
 if [[ ${#POSITIONAL[@]} -ge 3 ]]; then OUT="${POSITIONAL[2]}"; fi
 if [[ ${#POSITIONAL[@]} -gt 3 ]]; then
-    echo "ERROR: too many positional args (expected ≤3 + optional --lof-only)" >&2
+    echo "ERROR: too many positional args (expected ≤3)" >&2
     exit 1
 fi
 
@@ -83,8 +78,14 @@ if [[ ! -d "$INPUT_DIR" ]]; then
     echo "ERROR: $INPUT_DIR missing. rsync a tar of plmlof_input/ to scratch and extract it first." >&2
     exit 1
 fi
-if [[ ! -f "${MODEL_DIR}/lof/ensemble.json" ]]; then
-    echo "ERROR: ${MODEL_DIR}/lof/ensemble.json missing. rsync best-models/ from the laptop first (weights are gitignored)." >&2
+# Accept best-models/ (with lof/ subdir) or a distilled ensemble dir (ensemble.json at root).
+if [[ -f "${MODEL_DIR}/lof/ensemble.json" ]]; then
+    PREDICT_MODEL="$MODEL_DIR"
+elif [[ -f "${MODEL_DIR}/ensemble.json" ]]; then
+    PREDICT_MODEL="$MODEL_DIR"
+else
+    echo "ERROR: no ensemble.json under ${MODEL_DIR}/lof/ or ${MODEL_DIR}/." >&2
+    echo "  Use best-models/ (35M) or outputs/lof_8m (distilled)." >&2
     exit 1
 fi
 
@@ -94,20 +95,13 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 echo "Logging to: $LOG_FILE"
 echo "Job: $SLURM_JOB_ID  node=$(hostname)  gpus=${SLURM_GPUS:-$SLURM_GPUS_ON_NODE}"
 echo "Input:  $INPUT_DIR"
-echo "Model:  $MODEL_DIR"
+echo "Model:  $PREDICT_MODEL"
 echo "Output: $OUT"
-echo "LoF-only: $LOF_ONLY"
-
-EXTRA_ARGS=()
-if [[ "$LOF_ONLY" -eq 1 ]]; then
-    EXTRA_ARGS+=(--lof-only)
-fi
 
 python scripts/run_predict_batch.py \
     --input-dir "$INPUT_DIR" \
-    --model "$MODEL_DIR" \
+    --model "$PREDICT_MODEL" \
     --output "$OUT" \
-    --device cuda \
-    "${EXTRA_ARGS[@]}"
+    --device cuda
 
 echo "Done. $OUT"

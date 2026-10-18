@@ -10,7 +10,7 @@ import torch
 
 from plmlof.dataset import lof_train_keep_indices
 from plmlof.domains import PRIOR_SURE, PRIOR_TAIL_STOP, lof_prior, sample_events
-from plmlof.encoders import ESM2_LOF, esm2_for_task
+from plmlof.encoders import ESM2_LOF, ESM2_LOF_FAST, esm2_for_task
 from plmlof.hmmer import parse_domtblout
 from plmlof.labels import channel_for_lof, damage_from_z, display_bin, lof_score_for_pair, lof_score_from_z
 from plmlof.metrics import lof_metrics
@@ -400,8 +400,8 @@ class TestEncoders:
         assert "35M" in esm2_for_task("lof")
 
     def test_yaml_override(self):
-        cfg = {"esm2_model_name_lof": "facebook/esm2_t6_8M_UR50D"}
-        assert esm2_for_task("lof", cfg).endswith("8M_UR50D")
+        cfg = {"esm2_model_name_lof": ESM2_LOF_FAST}
+        assert esm2_for_task("lof", cfg) == ESM2_LOF_FAST
 
     def test_rejects_non_lof(self):
         with pytest.raises(ValueError, match="lof"):
@@ -414,6 +414,62 @@ class TestTrainTasks:
 
         assert TRAIN_TASKS == ("lof",)
         assert TASKS == ("lof",)
+
+
+class TestDistillSoftTargets:
+    def test_soft_target_dataset_length(self):
+        from plmlof.dataset import SoftTargetDataset
+
+        class _Tiny:
+            def __len__(self):
+                return 3
+
+            def __getitem__(self, idx):
+                return {"target": float(idx), "sample_weight": 1.0}
+
+        soft = torch.tensor([0.1, 0.5, 0.9])
+        ds = SoftTargetDataset(_Tiny(), soft)  # type: ignore[arg-type]
+        assert len(ds) == 3
+        assert float(ds[1]["soft_target"]) == pytest.approx(0.5)
+
+    def test_trainer_distill_alpha_mixes_soft(self):
+        from torch.utils.data import DataLoader
+
+        from plmlof.model import TaskNet
+        from plmlof.trainer import Trainer
+
+        class _Row(torch.utils.data.Dataset):
+            def __len__(self):
+                return 4
+
+            def __getitem__(self, idx):
+                d = 8
+                return {
+                    "ref_mean": torch.randn(d),
+                    "ref_max": torch.randn(d),
+                    "var_mean": torch.randn(d),
+                    "var_max": torch.randn(d),
+                    "nucleotide_features": torch.zeros(12),
+                    "target": torch.tensor(0.0),
+                    "soft_target": torch.tensor(1.0),
+                    "sample_weight": torch.tensor(1.0),
+                    "dms_zscore": torch.tensor(float("nan")),
+                    "is_wreck": torch.tensor(False),
+                    "is_missense": torch.tensor(False),
+                    "gene": "g",
+                    "protein_id": "p",
+                }
+
+        loader = DataLoader(_Row(), batch_size=2)
+        net = TaskNet(hidden_size=8, task="lof")
+        trainer = Trainer(
+            net, loader, loader, device="cpu", output_dir=".", distill_alpha=1.0,
+        )
+        batch = next(iter(loader))
+        loss_soft, _ = trainer._step(batch)
+        trainer.distill_alpha = 0.0
+        loss_hard, _ = trainer._step(batch)
+        assert torch.isfinite(loss_soft) and torch.isfinite(loss_hard)
 
 
 class TestDomainIndex:

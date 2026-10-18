@@ -114,6 +114,26 @@ class PairDataset(Dataset):
         }
 
 
+class SoftTargetDataset(Dataset):
+    """Wrap a CachedDataset with per-row teacher soft labels for distillation."""
+
+    def __init__(self, base: Dataset, soft_targets: torch.Tensor):
+        if len(base) != int(soft_targets.numel()):
+            raise ValueError(
+                f"soft targets length {soft_targets.numel()} != dataset {len(base)}"
+            )
+        self.base = base
+        self.soft_targets = soft_targets.float().reshape(-1)
+
+    def __len__(self) -> int:
+        return len(self.base)
+
+    def __getitem__(self, idx: int) -> dict:
+        row = self.base[idx]
+        row["soft_target"] = self.soft_targets[idx]
+        return row
+
+
 class CachedDataset(Dataset):
     """Precomputed ESM2 pooled embeddings plus targets/weights/channels."""
 

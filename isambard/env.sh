@@ -54,11 +54,14 @@ export PLMLOF_SCRATCH="${PLMLOF_SCRATCH:-${SCRATCHDIR}/plmlof}"
 
 export PLMLOF_DATA_DIR="${PLMLOF_DATA_DIR:-${PLMLOF_ROOT}/data/processed}"
 export PLMLOF_EMB_DIR="${PLMLOF_EMB_DIR:-${PLMLOF_SCRATCH}/embeddings}"
+# Separate root for distilled 8M student embeddings (do not mix with 35M caches).
+export PLMLOF_EMB_DIR_8M="${PLMLOF_EMB_DIR_8M:-${PLMLOF_SCRATCH}/embeddings_8m}"
 export PLMLOF_OUTPUT_DIR="${PLMLOF_OUTPUT_DIR:-${PLMLOF_ROOT}/outputs}"
 export PLMLOF_LOG_DIR="${PLMLOF_LOG_DIR:-${PLMLOF_SCRATCH}/logs}"
 
 export PLMLOF_TRAIN_CFG="${PLMLOF_TRAIN_CFG:-${PLMLOF_ROOT}/configs/training.yaml}"
 export PLMLOF_MODEL_CFG="${PLMLOF_MODEL_CFG:-${PLMLOF_ROOT}/configs/model.yaml}"
+export PLMLOF_MODEL_CFG_8M="${PLMLOF_MODEL_CFG_8M:-${PLMLOF_ROOT}/configs/model_8m.yaml}"
 
 # HuggingFace / Torch / pip / uv / inductor — never ~/.cache
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${PLMLOF_CACHE}/xdg}"

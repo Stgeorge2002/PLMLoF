@@ -8,6 +8,7 @@
 #   bash isambard/submit.sh pipeline --train-only
 #   bash isambard/submit.sh pipeline --eval-only
 #   bash isambard/submit.sh embed
+#   bash isambard/submit.sh distill          # 35M teacher → 8M student (needs teacher ensemble + emb)
 #   bash isambard/submit.sh predict           # batch-score N44_ST258_results/plmlof_input with best-models/
 #   bash isambard/submit.sh all              # setup, then pipeline after setup succeeds
 #   bash isambard/submit.sh test             # smoke if venv already exists
@@ -59,6 +60,9 @@ case "$ACTION" in
     embed)
         submit_one pipeline.sbatch --embed-only
         ;;
+    distill)
+        submit_one distill.sbatch "$@"
+        ;;
     predict)
         submit_one predict.sbatch "$@"
         ;;
@@ -81,7 +85,7 @@ case "$ACTION" in
         sed -n '2,20p' "$0"
         ;;
     *)
-        echo "Unknown action: $ACTION (expected smoke|setup|pipeline|sweep|embed|predict|test|all)" >&2
+        echo "Unknown action: $ACTION (expected smoke|setup|pipeline|sweep|embed|distill|predict|test|all)" >&2
         exit 1
         ;;
 esac

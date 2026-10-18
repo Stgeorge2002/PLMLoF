@@ -1,4 +1,4 @@
-"""Inference: comparative LoF (ref↔var ESM2-35M)."""
+"""Inference: comparative LoF (ref↔var ESM2; 35M teacher or 8M distilled)."""
 
 from __future__ import annotations
 
@@ -74,7 +74,7 @@ def discover_ensemble(task_dir: Path) -> list[Path]:
 
 
 class Predictor:
-    """Comparative LoF on ESM2-35M. Encoder loads lazily."""
+    """Comparative LoF. Encoder (35M or distilled 8M) loads lazily from checkpoint meta."""
 
     def __init__(
         self,

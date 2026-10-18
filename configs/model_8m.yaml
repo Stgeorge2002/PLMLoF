@@ -1,0 +1,8 @@
+# Distilled LoF student: frozen ESM2-8M + comparative TaskNet.
+# Train with scripts/distill_lof.py against a 35M teacher ensemble.
+model:
+  esm2_model_name_lof: "facebook/esm2_t6_8M_UR50D"
+  pool_strategy: "mean_max"
+  use_cross_attention: false
+  head_hidden: 128
+  dropout: 0.2
