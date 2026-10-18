@@ -49,7 +49,7 @@ bash scripts/prepare_local.sh --skip-genomes
 Copy tables to the cluster (parquet is gitignored):
 
 ```bash
-rsync -avP data/processed/lof HOST:/projects/b6bh/tbea20.b6bh/PLMLoF/data/processed/
+rsync -avP data/processed/lof HOST:$PROJECTDIR/$USER/PLMLoF/data/processed/
 ```
 
 Do **not** run `prepare_local.sh` on an Isambard login node.
@@ -61,8 +61,8 @@ Do **not** run `prepare_local.sh` on an Isambard login node.
 Clone on **project space**, never `$HOME`. Connecting and cloning cost 0 NHR.
 
 ```bash
-cd /projects/b6bh/tbea20.b6bh
-git clone https://github.com/Stgeorge2002/PLMLoF.git
+cd "$PROJECTDIR/$USER"
+git clone <your-PLMLoF-remote>
 cd PLMLoF
 ```
 
