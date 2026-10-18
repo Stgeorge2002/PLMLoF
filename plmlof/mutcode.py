@@ -19,6 +19,7 @@ renumbered. Unlisted positions keep the reference base.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -28,13 +29,30 @@ from typing import Iterable, Sequence
 # Literal IUPAC DNA accepted in MutCode inserted_sequence (either case).
 _IUPAC_RE = re.compile(r"^[ACGTRYSWKMBDHVNacgtryswkmbdhvn]*$")
 
+# Outbreak LoF-matrix columns. Reference_Length / Sample_Length are annotation
+# bookkeeping and are NOT MutCode's authoritative reference_length — that is
+# always len(pan_genome_reference.fa[gene]). Codes [] copy the FASTA unchanged.
 REQUIRED_LOF_COLUMNS = (
     "Replicon",
     "Gene",
     "Sample",
+    "Mutation_Codes",
+)
+
+OPTIONAL_LOF_LENGTH_COLUMNS = (
     "Reference_Length",
     "Sample_Length",
-    "Mutation_Codes",
+)
+
+# Native MutCode mutation_codes.tsv columns (after the #mutcode metadata line).
+MUTCODE_NATIVE_COLUMNS = (
+    "sample",
+    "gene",
+    "reference_length",
+    "reference_sha256",
+    "target_length",
+    "target_sha256",
+    "codes",
 )
 
 
@@ -152,26 +170,39 @@ def apply_edits(reference: str, edits: Sequence[Edit] | str | Sequence[Sequence]
     return "".join(parts)
 
 
+def sha256_seq(sequence: str) -> str:
+    """Lowercase SHA-256 of sequence bytes only (MutCode hashing rule)."""
+    return hashlib.sha256(sequence.encode("ascii")).hexdigest()
+
+
 def reconstruct(
     reference: str,
     codes: str | Sequence[Sequence] | Sequence[Edit] | None,
     *,
-    reference_length: int | None = None,
     target_length: int | None = None,
+    reference_sha256: str | None = None,
+    target_sha256: str | None = None,
 ) -> str:
-    """Apply codes and optionally check declared lengths from a LoF-matrix row."""
-    if reference_length is not None and len(reference) != reference_length:
+    """Apply MutCode edits. The FASTA ``reference`` is the sole length authority.
+
+    Optional ``target_length`` / SHA-256 fields are checked when supplied
+    (native MutCode tables). LoF-matrix ``Reference_Length`` must not be passed
+    here — it is not the MutCode reference length.
+    """
+    if reference_sha256 is not None and sha256_seq(reference) != reference_sha256.lower():
         raise MutCodeError(
-            f"reference length {len(reference)} != declared Reference_Length "
-            f"{reference_length}"
+            "reference SHA-256 does not match the supplied FASTA sequence "
+            "(wrong pan_genome_reference.fa for these codes)"
         )
     edits = _as_edits(codes)
     out = apply_edits(reference, edits)
     if target_length is not None and len(out) != target_length:
         raise MutCodeError(
-            f"reconstructed length {len(out)} != declared Sample_Length {target_length} "
+            f"reconstructed length {len(out)} != target_length {target_length} "
             f"(MutCode expected {expected_target_length(len(reference), edits)})"
         )
+    if target_sha256 is not None and sha256_seq(out) != target_sha256.lower():
+        raise MutCodeError("reconstructed target SHA-256 mismatch")
     return out
 
 

@@ -101,18 +101,30 @@ class TestReconstruct:
         out = reconstruct(
             "ACGTACGT",
             '[[5,0,"AA"]]',
-            reference_length=8,
             target_length=10,
         )
         assert out == "ACGTAAAACGT"
 
-    def test_bad_reference_length(self):
-        with pytest.raises(MutCodeError, match="Reference_Length"):
-            reconstruct("ACGT", "[]", reference_length=8)
-
     def test_bad_target_length(self):
-        with pytest.raises(MutCodeError, match="Sample_Length"):
+        with pytest.raises(MutCodeError, match="target_length"):
             reconstruct("ACGT", "[]", target_length=9)
+
+    def test_sha256_roundtrip(self):
+        from plmlof.mutcode import sha256_seq
+
+        ref = "ACGTACGT"
+        out = reconstruct(
+            ref,
+            '[[5,0,"AA"]]',
+            reference_sha256=sha256_seq(ref),
+            target_sha256=sha256_seq("ACGTAAAACGT"),
+            target_length=10,
+        )
+        assert out == "ACGTAAAACGT"
+
+    def test_wrong_reference_sha_rejected(self):
+        with pytest.raises(MutCodeError, match="SHA-256"):
+            reconstruct("ACGT", "[]", reference_sha256="0" * 64)
 
     def test_expected_target_length(self):
         edits = parse_codes('[[12,1,"T"],[20,0,"AC"],[30,3,""]]')
@@ -203,6 +215,52 @@ class TestImport:
         assert "ACGTACGT" in var_text.replace("\n", "")  # s2 identical
         assert (out / "manifest_all.tsv").is_file()
         assert len(manifest) == 3
+
+    def test_empty_codes_ignores_matrix_reference_length(self, tmp_path: Path):
+        """thyA-style: matrix Reference_Length 792, Panaroo FASTA 795, codes []."""
+        from plmlof.lof_import import build_from_lof_matrix
+
+        pan = tmp_path / "panaroo" / "chromosome" / "panaroo_output"
+        pan.mkdir(parents=True)
+        fasta_seq = "A" * 795  # includes terminal stop relative to matrix 792
+        write_fasta(pan / "pan_genome_reference.fa", [("thyA", fasta_seq)])
+
+        matrix = tmp_path / "lof_matrix.tsv"
+        with open(matrix, "w", newline="") as fh:
+            w = csv.DictWriter(
+                fh,
+                fieldnames=[
+                    "Replicon", "Gene", "Sample", "Description",
+                    "Reference_Length", "Sample_Length", "Mutation_Codes",
+                ],
+                delimiter="\t",
+            )
+            w.writeheader()
+            w.writerow({
+                "Replicon": "chromosome",
+                "Gene": "thyA",
+                "Sample": "SRR1",
+                "Description": "thymidylate synthase",
+                "Reference_Length": "792",
+                "Sample_Length": "792",
+                "Mutation_Codes": "[]",
+            })
+
+        out = tmp_path / "plmlof_input"
+        manifest, stats = build_from_lof_matrix(
+            lof_matrix=matrix,
+            results_dir=tmp_path,
+            out_dir=out,
+            strict_sample_length=False,
+            skip_missing_genes=False,
+            min_samples=1,
+        )
+        assert stats[0]["n_identical"] == 1
+        assert stats[0]["n_matrix_ref_length_mismatch"] == 1
+        var = (out / "chromosome" / "thyA" / "var.fasta").read_text().replace("\n", "")
+        assert "A" * 795 in var
+        assert manifest[0]["ref_length_nt"] == 795
+        assert manifest[0]["var_length_nt"] == 795
 
     def test_resolve_panaroo_flat_and_nested(self, tmp_path: Path):
         nested = tmp_path / "a" / "panaroo" / "chromosome" / "panaroo_output"

@@ -101,16 +101,27 @@ One GPU-hour = **0.25 NHR**. Do not add `--exclusive`.
 
 ## 3. Predict (compute node)
 
-### Import (LoF matrix + Panaroo → FASTA pairs)
+### Import (MutCode + Panaroo → FASTA pairs)
 
-Main outbreak import rebuilds every allele from MutCode ``Mutation_Codes`` on
-the matching Panaroo ``pan_genome_reference.fa``:
+Main outbreak import decodes MutCode ``Mutation_Codes`` against Panaroo
+``pan_genome_reference.fa`` (``[]`` = exact FASTA copy). LoF-matrix
+``Reference_Length`` is annotation metadata only and is not used as the
+MutCode reference length.
 
 ```bash
 python scripts/build_from_lof_matrix.py \
   --lof-matrix N44_ST258/lof_matrix/lof_matrix.tsv \
   --results-dir N44_ST258 \
   --out-dir N44_ST258/plmlof_input
+```
+
+Native MutCode tables (with SHA-256 columns) are also accepted:
+
+```bash
+python scripts/build_from_lof_matrix.py \
+  --mutcode-table mutation_codes.tsv.gz \
+  --reference pan_genome_reference.fa \
+  --out-dir plmlof_input
 ```
 
 Then score with ``scripts/run_predict_batch.py --input-dir .../plmlof_input``.
