@@ -186,6 +186,12 @@ python scripts/build_from_lof_matrix.py \
 ```
 
 Then score with ``scripts/run_predict_batch.py --input-dir .../plmlof_input``.
+Annotate the original matrix (auto-finds ``plmlof_input/predictions_8m.tsv``,
+writes ``lof_matrix_plmlof.tsv`` beside the input):
+
+```bash
+python scripts/join_lof_predictions.py N44_ST258/lof_matrix/lof_matrix.tsv
+```
 
 Paired FASTA (protein or CDS) can also be passed directly to ``predict.py``.
 
