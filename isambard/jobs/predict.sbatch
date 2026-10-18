@@ -1,7 +1,7 @@
 #!/bin/bash
 # Batch-score every gene produced by scripts/build_gene_fasta_pairs.py /
-# scripts/build_from_lof_matrix.py with the frozen best-models/ heads,
-# loading ESM2 once for the whole run.
+# scripts/build_from_lof_matrix.py with a production LoF ensemble
+# (1–2 seeds, torch.compile, length-sorted unique embeds, rule short-circuit).
 # 1 GPU-hour = 0.25 NHR. Do not add --exclusive.
 #
 # Inputs must already be on this filesystem (rsync from a laptop, not git —
@@ -15,6 +15,13 @@
 #   bash isambard/submit.sh predict
 #   bash isambard/submit.sh predict /custom/input_dir /custom/model_dir /custom/out.tsv
 #   bash isambard/submit.sh predict ... $PLMLOF_OUTPUT_DIR/lof_8m predictions_8m.tsv
+#
+# Optional env overrides:
+#   PLMLOF_PREDICT_BATCH=256
+#   PLMLOF_PREDICT_MEMBERS=1
+#   PLMLOF_PREDICT_QUANTIZE=none|int8|fp8
+#   PLMLOF_PREDICT_COMPILE=1
+#   PLMLOF_PREDICT_SHORT_CIRCUIT=1
 
 #SBATCH --job-name=plmlof-predict
 #SBATCH --nodes=1
@@ -89,6 +96,17 @@ else
     exit 1
 fi
 
+BATCH="${PLMLOF_PREDICT_BATCH:-256}"
+MEMBERS="${PLMLOF_PREDICT_MEMBERS:-1}"
+QUANTIZE="${PLMLOF_PREDICT_QUANTIZE:-none}"
+COMPILE="${PLMLOF_PREDICT_COMPILE:-1}"
+SHORT="${PLMLOF_PREDICT_SHORT_CIRCUIT:-1}"
+
+COMPILE_FLAG=(--compile)
+if [[ "$COMPILE" == "0" ]]; then COMPILE_FLAG=(--no-compile); fi
+SHORT_FLAG=(--rule-short-circuit)
+if [[ "$SHORT" == "0" ]]; then SHORT_FLAG=(--no-rule-short-circuit); fi
+
 mkdir -p "$PLMLOF_LOG_DIR" "$(dirname "$OUT")"
 LOG_FILE="$PLMLOF_LOG_DIR/predict_${SLURM_JOB_ID}.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
@@ -97,11 +115,17 @@ echo "Job: $SLURM_JOB_ID  node=$(hostname)  gpus=${SLURM_GPUS:-$SLURM_GPUS_ON_NO
 echo "Input:  $INPUT_DIR"
 echo "Model:  $PREDICT_MODEL"
 echo "Output: $OUT"
+echo "Speed:  batch=$BATCH members=$MEMBERS quantize=$QUANTIZE compile=$COMPILE short_circuit=$SHORT"
 
 python scripts/run_predict_batch.py \
     --input-dir "$INPUT_DIR" \
     --model "$PREDICT_MODEL" \
     --output "$OUT" \
-    --device cuda
+    --device cuda \
+    --batch-size "$BATCH" \
+    --max-ensemble-members "$MEMBERS" \
+    --quantize "$QUANTIZE" \
+    "${COMPILE_FLAG[@]}" \
+    "${SHORT_FLAG[@]}"
 
 echo "Done. $OUT"

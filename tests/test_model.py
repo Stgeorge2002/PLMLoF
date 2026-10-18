@@ -84,3 +84,53 @@ class TestTaskNetLof:
             assert "lof" in str(exc)
         else:
             raise AssertionError("expected ValueError for non-lof task")
+
+
+class TestUniqueSequenceCache:
+    def test_unique_in_order(self):
+        from plmlof.predictor import unique_in_order
+
+        assert unique_in_order(["A", "B", "A", "C", "B"]) == ["A", "B", "C"]
+        assert unique_in_order([]) == []
+
+    def test_gather_uses_cache_without_reembed(self):
+        from plmlof.predictor import Predictor
+
+        # Bypass __init__ GPU/checkpoint load; exercise cache helpers only.
+        pred = object.__new__(Predictor)
+        pred.device = torch.device("cpu")
+        pred.batch_size = 8
+        pred.max_seq_length = 1024
+        pred.esm_name = "dummy"
+        pred._seq_pool = {}
+        pred._encoders = {}
+
+        calls = {"n": 0}
+
+        def fake_ensure(sequences):
+            missing = [s for s in sequences if s not in pred._seq_pool]
+            # dedupe like production
+            seen = set()
+            uniq = []
+            for s in missing:
+                if s not in seen and s not in pred._seq_pool:
+                    seen.add(s)
+                    uniq.append(s)
+            for s in uniq:
+                pred._seq_pool[s] = (torch.ones(4) * (ord(s[0]) % 7), torch.zeros(4))
+            calls["n"] += len(uniq)
+            return len(uniq)
+
+        pred._ensure_embedded = fake_ensure  # type: ignore[method-assign]
+        refs = ["AAA", "BBB", "AAA"]
+        vars_ = ["AAA", "CCC", "BBB"]
+        # First pass embeds AAA,BBB,CCC
+        assert pred._ensure_embedded(refs + vars_) == 3
+        assert calls["n"] == 3
+        # Second pass is free
+        assert pred._ensure_embedded(refs + vars_) == 0
+        ref_mean, ref_max = pred._gather_pooled(refs)
+        var_mean, _ = pred._gather_pooled(vars_)
+        assert ref_mean.shape == (3, 4)
+        assert torch.equal(ref_mean[0], ref_mean[2])  # same AAA ref
+        assert torch.equal(ref_mean[1], var_mean[2])  # BBB as ref then var

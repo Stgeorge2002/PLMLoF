@@ -118,19 +118,45 @@ bash isambard/submit.sh distill --teacher-dir best-models/lof --distill-alpha 0.
 
 This precomputes `$PLMLOF_EMB_DIR_8M/lof/` if needed, trains
 `$PLMLOF_OUTPUT_DIR/lof_8m/`, scores nulls, and evaluates the test split.
-Point predict at the student dir (encoder is read from checkpoint meta):
+Keep the **5-seed** student for training/eval. For batch predict, export 1–2
+seeds and use production speed defaults (compile, large batches, length-sorted
+unique embeds, rule short-circuit):
 
 ```bash
+# Slim artifact (seed0 only; use --members 2 for mean-of-2)
+python scripts/export_production_ensemble.py \
+  --src "$PLMLOF_OUTPUT_DIR/lof_8m" \
+  --dst best-models/lof_8m_prod \
+  --members 1
+
 python scripts/predict.py \
-  --model "$PLMLOF_OUTPUT_DIR/lof_8m" \
+  --model best-models/lof_8m_prod \
   --reference ref.fasta \
   --variants var.fasta \
   --output predictions_8m.tsv \
-  --device cuda
+  --device cuda \
+  --batch-size 256 \
+  --max-ensemble-members 1 \
+  --compile \
+  --rule-short-circuit
 ```
 
-Optional promote: copy `outputs/lof_8m` → `best-models/lof_8m` and use that as
-`--model` for batch predict.
+Optional weight-only quantize (validate first; needs torchao and/or bitsandbytes):
+
+```bash
+python scripts/validate_quantize.py \
+  --model best-models/lof_8m_prod \
+  --reference ref.fasta --variants var.fasta \
+  --quantize int8 --max-rows 400 --device cuda
+# if OK:
+python scripts/predict.py ... --quantize int8
+```
+
+There is no ESM2 smaller than 8M worth chasing for wreck AUROC; stay on the
+distilled 8M student.
+
+Optional promote: copy `outputs/lof_8m` → `best-models/lof_8m` (full teacher)
+or use `lof_8m_prod` as `--model` for batch predict.
 
 ---
 
@@ -182,9 +208,12 @@ python scripts/predict.py --model "$PLMLOF_OUTPUT_DIR" --proteins alleles.faa --
 ```
 
 For the N44 ST258 frozen-head batch, submit `bash isambard/submit.sh predict`
-from the login node after setup succeeds. The submission helper sets the repo
-as Slurm's submission directory; the job loads its environment from there,
-not from the location of Slurm's copied batch script. Git keeps the analysis scripts,
+from the login node after setup succeeds. Defaults: `--batch-size 256`,
+`--max-ensemble-members 1`, `--compile`, `--rule-short-circuit`. Override via
+`PLMLOF_PREDICT_BATCH`, `PLMLOF_PREDICT_MEMBERS`, `PLMLOF_PREDICT_QUANTIZE`,
+`PLMLOF_PREDICT_COMPILE`, `PLMLOF_PREDICT_SHORT_CIRCUIT`. The submission helper
+sets the repo as Slurm's submission directory; the job loads its environment
+from there, not from the location of Slurm's copied batch script. Git keeps the analysis scripts,
 PLMLoF package, runtime configuration, and job scripts, not the outbreak data
 or inference assets. The entire `N44_ST258_results/` and `best-models/` trees,
 their `plmlof_input.tar*` / `best-models.tar*` transfer archives, and generated

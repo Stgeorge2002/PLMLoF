@@ -1,6 +1,6 @@
 """Inference entry point for PLMLoF (comparative LoF head).
 
-    python scripts/predict.py --model outputs --reference ref.fasta --variants var.fasta
+    python scripts/predict.py --model outputs/lof_8m --reference ref.fasta --variants var.fasta
     python scripts/predict.py --model outputs --proteins alleles.faa
 """
 
@@ -14,7 +14,15 @@ from pathlib import Path
 
 import torch
 
+from plmlof.predict_args import add_predictor_speed_args, predictor_kwargs_from_args, resolve_model_dir
+
 logger = logging.getLogger(__name__)
+
+TSV_KEYS = [
+    "gene", "wreck", "wreck_kind", "wreck_prior",
+    "lof_score", "lof_sd", "lof_p", "lof_q",
+    "in_family", "nearest_train_gene", "ref_cosine", "route",
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,7 +33,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vcf", type=str, default=None, help="VCF file")
     parser.add_argument("--model", type=str, required=True, help="Output dir with lof/ ensemble")
     parser.add_argument("--device", type=str, default=None, help="Device (auto/cpu/cuda)")
-    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--output", type=str, default=None, help="Output file (JSON or TSV)")
     parser.add_argument("--format", type=str, choices=["json", "tsv"], default="tsv")
     parser.add_argument(
@@ -34,19 +41,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--hmm", type=str, default=None, help="Pfam-A.hmm for refs missing from --domains")
     parser.add_argument("--hmm-cpus", type=int, default=1)
+    add_predictor_speed_args(parser)
     return parser.parse_args()
 
 
 def _write_tsv(results: list[dict], path: Path) -> None:
-    keys = [
-        "gene", "wreck", "wreck_kind", "wreck_prior",
-        "lof_score", "lof_sd", "lof_p", "lof_q",
-        "in_family", "nearest_train_gene", "ref_cosine",
-    ]
     with open(path, "w") as f:
-        f.write("\t".join(keys) + "\n")
+        f.write("\t".join(TSV_KEYS) + "\n")
         for r in results:
-            f.write("\t".join(_fmt(r.get(k, "")) for k in keys) + "\n")
+            f.write("\t".join(_fmt(r.get(k, "")) for k in TSV_KEYS) + "\n")
 
 
 def _fmt(v) -> str:
@@ -79,12 +82,10 @@ def main() -> None:
     from plmlof.inference.vcf_handler import load_reference_dna, parse_vcf_variants
     from plmlof.predictor import Predictor
 
-    model_path = Path(args.model)
-    pred_dir = model_path if model_path.is_dir() else model_path.parent.parent.parent
     pred = Predictor(
-        pred_dir, device=device, batch_size=args.batch_size,
-        domains=args.domains, hmm=args.hmm, hmm_cpus=args.hmm_cpus,
-        lof_only=True,
+        resolve_model_dir(args.model),
+        device=device,
+        **predictor_kwargs_from_args(args),
     )
     if args.proteins:
         results = pred.predict_proteins(args.proteins)
@@ -104,11 +105,12 @@ def main() -> None:
         logger.info("Wrote %s (%s rows)", out, len(results))
         return
 
-    print(f"{'gene':<24} {'lof':>7} {'wreck':<12} {'in_fam':>6}")
+    print(f"{'gene':<24} {'lof':>7} {'wreck':<12} {'route':<12} {'in_fam':>6}")
     for r in results[:50]:
         print(
             f"{r['gene']:<24} {r['lof_score']:7.3f} "
-            f"{r['wreck_kind']:<12} {int(bool(r.get('in_family'))):6d}"
+            f"{r['wreck_kind']:<12} {r.get('route', 'model'):<12} "
+            f"{int(bool(r.get('in_family'))):6d}"
         )
     print(f"Total {len(results)} pairs")
 

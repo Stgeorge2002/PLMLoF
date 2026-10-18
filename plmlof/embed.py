@@ -1,4 +1,4 @@
-"""ESM2 unique-sequence embedding used by the precompute script."""
+"""ESM2 unique-sequence embedding used by precompute and predict."""
 
 from __future__ import annotations
 
@@ -12,6 +12,8 @@ logger = logging.getLogger(__name__)
 
 
 class _LenSortedSeqs(Dataset):
+    """Sort by length so padded ESM2 batches waste less compute."""
+
     def __init__(self, sequences: list[str]):
         self.sequences = sorted(sequences, key=len)
 
@@ -30,6 +32,25 @@ def _pool(hidden: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch
     max_p = hidden.masked_fill(mask.unsqueeze(-1) == 0, float("-inf")).max(dim=1).values
     max_p = torch.where(torch.isfinite(max_p), max_p, torch.zeros_like(max_p))
     return mean_p, max_p
+
+
+def resolve_amp_dtype(device: torch.device, prefer: str | None = None) -> torch.dtype | None:
+    """Return autocast dtype for CUDA, or None to disable autocast."""
+    if device.type != "cuda":
+        return None
+    if prefer == "fp32":
+        return None
+    if prefer == "fp8":
+        dtype = getattr(torch, "float8_e4m3fn", None)
+        if dtype is not None:
+            return dtype
+        logger.warning("FP8 not available in this torch build; falling back to bf16/fp16")
+    if prefer == "fp16":
+        return torch.float16
+    if prefer in (None, "bf16", "auto", "fp8"):
+        major, _ = torch.cuda.get_device_capability(device)
+        return torch.bfloat16 if major >= 8 else torch.float16
+    raise ValueError(f"unknown amp prefer={prefer!r}")
 
 
 def forward_hidden_and_logits(model, ids: torch.Tensor, mask: torch.Tensor):
@@ -56,8 +77,9 @@ def embed_unique_sequences(
     batch_size: int,
     max_length: int,
     num_workers: int = 4,
+    amp_dtype: torch.dtype | None | str = "auto",
 ) -> tuple[list[str], torch.Tensor, torch.Tensor]:
-    """Pool unique sequences with ESM2."""
+    """Pool unique sequences with ESM2 (length-sorted batches)."""
     ds = _LenSortedSeqs(sequences)
 
     def collate(batch: list[str]) -> dict:
@@ -72,16 +94,16 @@ def embed_unique_sequences(
         num_workers=num_workers, pin_memory=(device.type == "cuda"),
     )
     means, maxes, ordered = [], [], []
-    use_amp = device.type == "cuda"
-    amp_dtype = torch.bfloat16
-    if use_amp:
-        major, _ = torch.cuda.get_device_capability(device)
-        amp_dtype = torch.bfloat16 if major >= 8 else torch.float16
+    if isinstance(amp_dtype, str) or amp_dtype == "auto":
+        resolved = resolve_amp_dtype(device, prefer=None if amp_dtype == "auto" else str(amp_dtype))
+    else:
+        resolved = amp_dtype
+    use_amp = resolved is not None and device.type == "cuda"
 
     for batch in tqdm(loader, desc="ESM2 unique sequences"):
         ids = batch["input_ids"].to(device, non_blocking=True)
         mask = batch["attention_mask"].to(device, non_blocking=True)
-        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+        with torch.amp.autocast("cuda", dtype=resolved, enabled=use_amp):
             hidden, _logits = forward_hidden_and_logits(model, ids, mask)
         mean_p, max_p = _pool(hidden, mask)
         means.append(mean_p.float().cpu())

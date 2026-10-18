@@ -26,6 +26,10 @@ dependencies = [
 [project.optional-dependencies]
 tracking = ["wandb>=0.15"]
 hmmer = ["pyhmmer>=0.10.4"]
+quantize = [
+    "bitsandbytes>=0.43",
+    "torchao>=0.4",
+]
 dev = [
     "pytest>=7.4",
     "pytest-cov>=4.1",

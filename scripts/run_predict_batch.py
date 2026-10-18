@@ -1,18 +1,19 @@
 """Run PLMLoF LoF over every gene produced by
 scripts/build_gene_fasta_pairs.py, in a single process.
 
-Loads ESM2-35M once, walks N44_ST258_results/plmlof_input/{chromosome,plasmid/mge_*}/<gene>/
-{ref.fasta,var.fasta,manifest.tsv}, scores everything with one Predictor,
+Loads ESM2 once, walks N44_ST258_results/plmlof_input/{chromosome,plasmid/mge_*}/<gene>/
+{ref.fasta,var.fasta,manifest.tsv}, scores everything with one Predictor
+(unique protein sequences are embedded once and scattered into pairs),
 and writes a combined TSV joined back to gene/sample/category via the
 per-record manifest rows.
 
-This is NOT run automatically — invoke it yourself once you are ready to
-classify, e.g.:
+Production defaults: 1 ensemble seed, torch.compile, batch 256, rule short-circuit.
+Keep a 5-seed teacher for training/eval; ship seed0 (or export 2) for batch predict.
 
     python scripts/run_predict_batch.py \\
         --input-dir N44_ST258_results/plmlof_input \\
-        --model best-models \\
-        --output N44_ST258_results/plmlof_input/predictions.tsv \\
+        --model best-models/lof_8m \\
+        --output N44_ST258_results/predictions.tsv \\
         --device cuda
 """
 
@@ -23,6 +24,8 @@ import csv
 import logging
 from pathlib import Path
 
+from plmlof.predict_args import add_predictor_speed_args, predictor_kwargs_from_args, resolve_model_dir
+
 logger = logging.getLogger(__name__)
 
 
@@ -32,10 +35,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model", type=str, required=True, help="Output dir with lof/ ensemble (best-models)")
     p.add_argument("--output", type=str, required=True)
     p.add_argument("--device", type=str, default=None)
-    p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--domains", type=str, default=None)
     p.add_argument("--hmm", type=str, default=None)
     p.add_argument("--hmm-cpus", type=int, default=1)
+    add_predictor_speed_args(p)
     return p.parse_args()
 
 
@@ -85,9 +88,9 @@ def main() -> None:
     logger.info("Loaded %d ref/var records from %s", len(records), input_dir)
 
     pred = Predictor(
-        Path(args.model), device=device, batch_size=args.batch_size,
-        domains=args.domains, hmm=args.hmm, hmm_cpus=args.hmm_cpus,
-        lof_only=True,
+        resolve_model_dir(args.model),
+        device=device,
+        **predictor_kwargs_from_args(args),
     )
     results = pred.predict_records(records, pair=True)
 
@@ -96,7 +99,7 @@ def main() -> None:
     base_cols = [
         "gene", "wreck", "wreck_kind", "wreck_prior",
         "lof_score", "lof_sd", "lof_p", "lof_q",
-        "in_family", "nearest_train_gene", "ref_cosine",
+        "in_family", "nearest_train_gene", "ref_cosine", "route",
     ]
     with open(out_path, "w", newline="") as fh:
         writer = csv.writer(fh, delimiter="\t")
@@ -105,9 +108,19 @@ def main() -> None:
             m = manifest_rows.get(r["gene"], {})
             writer.writerow(
                 [m.get(c, "") for c in extra_cols]
-                + [r.get(c, "") for c in base_cols]
+                + [_fmt(r.get(c, "")) for c in base_cols]
             )
     logger.info("Wrote %d predictions -> %s", len(results), out_path)
+
+
+def _fmt(v) -> str:
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, float):
+        if v != v:
+            return ""
+        return f"{v:.6g}"
+    return str(v)
 
 
 if __name__ == "__main__":
