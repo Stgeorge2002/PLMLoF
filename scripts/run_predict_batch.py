@@ -101,9 +101,12 @@ def main() -> None:
     base_cols = [
         "gene", "wreck", "wreck_kind", "wreck_prior",
         "lof_score", "lof_sd", "lof_p", "lof_q",
-        "mlof_score", "mlof_bin", "mlof_mean", "mlof_n_sites", "mlof_sd", "mlof_p", "mlof_q",
-        "in_family", "nearest_train_gene", "ref_cosine",
     ]
+    if not args.lof_only:
+        base_cols.extend([
+            "mlof_score", "mlof_bin", "mlof_mean", "mlof_n_sites", "mlof_sd", "mlof_p", "mlof_q",
+        ])
+    base_cols.extend(["in_family", "nearest_train_gene", "ref_cosine"])
     with open(out_path, "w", newline="") as fh:
         writer = csv.writer(fh, delimiter="\t")
         writer.writerow(extra_cols + base_cols)

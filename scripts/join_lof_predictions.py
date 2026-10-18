@@ -2,14 +2,14 @@
 """Left-join PLMLoF predictions onto the original LoF matrix.
 
 Keeps every matrix column and row (including rows skipped at import). After
-``Mutation_Codes`` appends only:
+``Mutation_Codes`` appends:
 
     LoF_score  continuous LoF head
     lof_p      empirical p vs WT-like null
     lof_q      BH-adjusted FDR
-    mlof_score continuous MLoF head
-    mlof_p     empirical p for MLoF
-    mlof_q     BH-adjusted FDR for MLoF
+    mlof_score continuous MLoF head   (omitted with --lof-only)
+    mlof_p     empirical p for MLoF   (omitted with --lof-only)
+    mlof_q     BH-adjusted FDR for MLoF (omitted with --lof-only)
 
 Pass ``--extras-output`` to also write wreck / bin / diagnostics (and join
 keys) to a sidecar TSV.
@@ -40,15 +40,17 @@ logger = logging.getLogger(__name__)
 csv.field_size_limit(10_000_000)
 
 # Matrix column name → predictor field name.
-MAIN_SCORE_COLS: list[tuple[str, str]] = [
+LOF_SCORE_COLS: list[tuple[str, str]] = [
     ("LoF_score", "lof_score"),
     ("lof_p", "lof_p"),
     ("lof_q", "lof_q"),
+]
+MLOF_SCORE_COLS: list[tuple[str, str]] = [
     ("mlof_score", "mlof_score"),
     ("mlof_p", "mlof_p"),
     ("mlof_q", "mlof_q"),
 ]
-
+MAIN_SCORE_COLS = LOF_SCORE_COLS + MLOF_SCORE_COLS
 MAIN_OUT_NAMES = [name for name, _ in MAIN_SCORE_COLS]
 
 # Join keys shared with the matrix so the extras file can be re-merged.
@@ -105,6 +107,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=None,
         help="Optional sidecar with wreck/bin/diagnostics + join keys",
+    )
+    p.add_argument(
+        "--lof-only",
+        action="store_true",
+        help="Append only LoF_score/lof_p/lof_q (omit mlof_* columns)",
     )
     return p.parse_args(argv)
 
@@ -208,17 +215,24 @@ def _matrix_base_fields(fieldnames: list[str]) -> list[str]:
     return [c for c in fieldnames if c not in drop]
 
 
-def _insert_scores_after_mutation_codes(base_fields: list[str]) -> list[str]:
-    """Place the six score columns immediately after Mutation_Codes."""
+def _insert_scores_after_mutation_codes(
+    base_fields: list[str], score_names: list[str]
+) -> list[str]:
+    """Place score columns immediately after Mutation_Codes."""
     if "Mutation_Codes" in base_fields:
         i = base_fields.index("Mutation_Codes") + 1
-        return base_fields[:i] + MAIN_OUT_NAMES + base_fields[i:]
-    return base_fields + MAIN_OUT_NAMES
+        return base_fields[:i] + score_names + base_fields[i:]
+    return base_fields + score_names
 
 
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     args = parse_args(argv)
+
+    score_cols = list(LOF_SCORE_COLS)
+    if not args.lof_only:
+        score_cols.extend(MLOF_SCORE_COLS)
+    score_out_names = [name for name, _ in score_cols]
 
     logger.info("Loading predictions from %s", args.predictions)
     preds = load_predictions(args.predictions)
@@ -250,7 +264,7 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit(f"empty or headerless matrix: {args.lof_matrix}")
 
         base_fields = _matrix_base_fields(list(reader.fieldnames))
-        out_fields = _insert_scores_after_mutation_codes(base_fields)
+        out_fields = _insert_scores_after_mutation_codes(base_fields, score_out_names)
         writer = csv.DictWriter(
             fout,
             fieldnames=out_fields,
@@ -282,11 +296,11 @@ def main(argv: list[str] | None = None) -> int:
                 out = {c: row.get(c, "") for c in base_fields}
                 if pred is None:
                     n_unmatched += 1
-                    for out_name, _src in MAIN_SCORE_COLS:
+                    for out_name, _src in score_cols:
                         out[out_name] = ""
                 else:
                     n_matched += 1
-                    for out_name, src in MAIN_SCORE_COLS:
+                    for out_name, src in score_cols:
                         out[out_name] = pred.get(src, "")
                 writer.writerow(out)
 

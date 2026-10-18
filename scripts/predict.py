@@ -42,17 +42,22 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _write_tsv(results: list[dict], path: Path) -> None:
+def _write_tsv(results: list[dict], path: Path, *, lof_only: bool = False) -> None:
     keys = [
         "gene", "wreck", "wreck_kind", "wreck_prior",
         "lof_score", "lof_sd", "lof_p", "lof_q",
-        "mlof_score", "mlof_bin", "mlof_mean", "mlof_n_sites", "mlof_sd", "mlof_p", "mlof_q",
+    ]
+    if not lof_only:
+        keys.extend([
+            "mlof_score", "mlof_bin", "mlof_mean", "mlof_n_sites", "mlof_sd", "mlof_p", "mlof_q",
+        ])
+    keys.extend([
         "in_family", "nearest_train_gene", "ref_cosine",
         "growth_gof_p", "growth_gof_sd", "growth_gof_p_emp", "growth_gof_q", "growth_gof_call",
         "growth_gof_in_family", "growth_gof_nearest",
         "amr_gof_p", "amr_gof_sd", "amr_gof_p_emp", "amr_gof_q", "amr_gof_call",
         "amr_gof_in_family", "amr_gof_nearest",
-    ]
+    ])
     with open(path, "w") as f:
         f.write("\t".join(keys) + "\n")
         for r in results:
@@ -110,7 +115,7 @@ def main() -> None:
         if args.format == "json":
             out.write_text(json.dumps(results, indent=2, default=str))
         else:
-            _write_tsv(results, out)
+            _write_tsv(results, out, lof_only=args.lof_only)
         logger.info("Wrote %s (%s rows)", out, len(results))
         return
 
