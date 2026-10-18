@@ -101,7 +101,21 @@ One GPU-hour = **0.25 NHR**. Do not add `--exclusive`.
 
 ## 3. Predict (compute node)
 
-Paired FASTA (protein or CDS). Panaroo alleles are the intended input.
+### Import (LoF matrix + Panaroo → FASTA pairs)
+
+Main outbreak import rebuilds every allele from MutCode ``Mutation_Codes`` on
+the matching Panaroo ``pan_genome_reference.fa``:
+
+```bash
+python scripts/build_from_lof_matrix.py \
+  --lof-matrix N44_ST258/lof_matrix/lof_matrix.tsv \
+  --results-dir N44_ST258 \
+  --out-dir N44_ST258/plmlof_input
+```
+
+Then score with ``scripts/run_predict_batch.py --input-dir .../plmlof_input``.
+
+Paired FASTA (protein or CDS) can also be passed directly to ``predict.py``.
 
 ```bash
 srun --nodes=1 --gpus=1 --time=01:00:00 --pty bash --login

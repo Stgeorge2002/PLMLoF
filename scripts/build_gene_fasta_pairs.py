@@ -1,4 +1,8 @@
-"""Build per-gene reference/variant CDS FASTA pairs for PLMLoF inference.
+"""Build per-gene reference/variant CDS FASTA pairs from Panaroo alleles.
+
+Prefer ``scripts/build_from_lof_matrix.py`` when a MutCode LoF matrix is
+available — that is the main PLMLoF import path (Panaroo reference + codes).
+This helper is for the older Panaroo ``gene_data.csv`` allele path only.
 
 For every gene cluster that Panaroo called from the Bakta GFFs (chromosome
 and, separately, each plasmid backbone group), this writes one folder

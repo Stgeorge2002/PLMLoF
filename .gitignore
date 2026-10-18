@@ -20,6 +20,7 @@ data/scripts/data/
 outputs/
 
 # Outbreak source data, generated FASTA pairs, and predictions (rsync, not git)
+/N44_ST258/
 /N44_ST258_results/
 
 # Frozen model bundles, including metadata (rsync the complete directory)

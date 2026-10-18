@@ -1,0 +1,315 @@
+"""Build PLMLoF FASTA pairs from a MutCode-backed LoF matrix + Panaroo refs."""
+
+from __future__ import annotations
+
+import csv
+import gzip
+import logging
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from plmlof.mutcode import (
+    REQUIRED_LOF_COLUMNS,
+    MutCodeError,
+    apply_edits,
+    category_from_replicon,
+    expected_target_length,
+    mge_group_from_replicon,
+    parse_codes,
+    read_fasta,
+    resolve_panaroo_dir,
+    write_fasta,
+)
+
+logger = logging.getLogger(__name__)
+
+csv.field_size_limit(10_000_000)
+
+
+class LofImportError(RuntimeError):
+    """Fatal LoF-matrix / Panaroo import failure."""
+
+
+@dataclass
+class GeneBucket:
+    """Accumulated FASTA records for one (category, mge, gene) folder."""
+
+    gene_id: str
+    category: str
+    mge_group: str
+    description: str = ""
+    ref_seq: str = ""
+    ref_records: list[tuple[str, str]] = field(default_factory=list)
+    var_records: list[tuple[str, str]] = field(default_factory=list)
+    manifest: list[dict] = field(default_factory=list)
+    sample_counts: dict[str, int] = field(default_factory=dict)
+
+
+def open_text(path: Path):
+    if str(path).endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8", newline="")
+    return open(path, newline="", encoding="utf-8")
+
+
+def reference_for_row(
+    cache: dict[str, dict[str, str]], replicon: str, gene: str
+) -> str | None:
+    if replicon == "chromosome":
+        return cache.get("chromosome", {}).get(gene)
+    return cache.get(mge_group_from_replicon(replicon), {}).get(gene)
+
+
+def record_id(gene_id: str, sample: str, paralog_index: int) -> str:
+    if paralog_index == 0:
+        return f"{gene_id}__{sample}"
+    return f"{gene_id}__{sample}__p{paralog_index}"
+
+
+def build_from_lof_matrix(
+    *,
+    lof_matrix: Path,
+    results_dir: Path,
+    out_dir: Path,
+    strict_sample_length: bool = False,
+    skip_missing_genes: bool = False,
+    min_samples: int = 1,
+) -> tuple[list[dict], list[dict]]:
+    """Reconstruct all alleles and write PLMLoF ``ref.fasta`` / ``var.fasta`` pairs.
+
+    Returns ``(manifest_rows, stats_rows)``.
+    """
+    buckets: dict[tuple[str, str, str], GeneBucket] = {}
+    ref_cache: dict[str, dict[str, str]] = {}
+    seen_replicons: set[str] = set()
+
+    n_rows = 0
+    n_mutated = 0
+    n_identical = 0
+    n_skipped_missing = 0
+    n_sample_len_mismatch = 0
+    errors: list[str] = []
+
+    with open_text(lof_matrix) as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        if reader.fieldnames is None:
+            raise LofImportError(f"empty LoF matrix: {lof_matrix}")
+        missing_cols = [c for c in REQUIRED_LOF_COLUMNS if c not in reader.fieldnames]
+        if missing_cols:
+            raise LofImportError(
+                f"LoF matrix missing columns {missing_cols}; "
+                f"have {list(reader.fieldnames)}"
+            )
+
+        for row in reader:
+            n_rows += 1
+            replicon = row["Replicon"].strip()
+            gene_id = row["Gene"].strip()
+            sample = row["Sample"].strip()
+            description = (row.get("Description") or "").strip()
+            codes_raw = row["Mutation_Codes"]
+
+            try:
+                ref_len = int(float(row["Reference_Length"]))
+                sample_len = int(float(row["Sample_Length"]))
+            except (TypeError, ValueError) as exc:
+                raise LofImportError(
+                    f"row {n_rows}: bad lengths for {gene_id}/{sample}: {exc}"
+                ) from exc
+
+            if replicon not in seen_replicons:
+                seen_replicons.add(replicon)
+                key = (
+                    "chromosome"
+                    if replicon == "chromosome"
+                    else mge_group_from_replicon(replicon)
+                )
+                if key not in ref_cache:
+                    pan_dir = resolve_panaroo_dir(results_dir, replicon)
+                    ref_cache[key] = read_fasta(pan_dir / "pan_genome_reference.fa")
+                    logger.info(
+                        "Loaded %d genes from %s (%s)",
+                        len(ref_cache[key]),
+                        pan_dir,
+                        key,
+                    )
+
+            ref_seq = reference_for_row(ref_cache, replicon, gene_id)
+            if ref_seq is None:
+                msg = f"gene {gene_id!r} absent from Panaroo reference for {replicon}"
+                if skip_missing_genes:
+                    n_skipped_missing += 1
+                    logger.warning("skip: %s", msg)
+                    continue
+                raise LofImportError(msg)
+
+            try:
+                edits = parse_codes(codes_raw)
+                if len(ref_seq) != ref_len:
+                    raise MutCodeError(
+                        f"FASTA length {len(ref_seq)} != Reference_Length {ref_len}"
+                    )
+                var_seq = apply_edits(ref_seq, edits)
+                mutcode_len = expected_target_length(len(ref_seq), edits)
+                if len(var_seq) != mutcode_len:
+                    raise MutCodeError(
+                        f"internal length mismatch {len(var_seq)} != {mutcode_len}"
+                    )
+                if mutcode_len != sample_len:
+                    n_sample_len_mismatch += 1
+                    detail = (
+                        f"{gene_id}/{sample}: MutCode length {mutcode_len} != "
+                        f"Sample_Length {sample_len} (codes={codes_raw})"
+                    )
+                    if strict_sample_length:
+                        raise MutCodeError(detail)
+                    if n_sample_len_mismatch <= 20:
+                        logger.warning("Sample_Length mismatch: %s", detail)
+            except MutCodeError as exc:
+                errors.append(f"{gene_id}/{sample}: {exc}")
+                if len(errors) >= 50:
+                    break
+                continue
+
+            category, mge_group = category_from_replicon(replicon)
+            bkey = (category, mge_group, gene_id)
+            bucket = buckets.get(bkey)
+            if bucket is None:
+                bucket = GeneBucket(
+                    gene_id=gene_id,
+                    category=category,
+                    mge_group=mge_group,
+                    description=description,
+                    ref_seq=ref_seq,
+                )
+                buckets[bkey] = bucket
+            elif bucket.ref_seq != ref_seq:
+                errors.append(f"{gene_id}: conflicting reference sequences across rows")
+                continue
+
+            p_idx = bucket.sample_counts.get(sample, 0)
+            bucket.sample_counts[sample] = p_idx + 1
+            rid = record_id(gene_id, sample, p_idx)
+            bucket.ref_records.append((rid, ref_seq))
+            bucket.var_records.append((rid, var_seq))
+            bucket.manifest.append({
+                "record_id": rid,
+                "gene_id": gene_id,
+                "category": category,
+                "mge_group": mge_group,
+                "sample": sample,
+                "locus_tag": "",
+                "gene_name": gene_id,
+                "description": description or bucket.description,
+                "ref_length_nt": len(ref_seq),
+                "var_length_nt": len(var_seq),
+                "sample_length_matrix": sample_len,
+                "n_edits": len(edits),
+                "ref_source": "pan_genome_reference+mutcode",
+                "genome_contig": (row.get("Genome_Contig") or "").strip(),
+                "genome_start": (row.get("Genome_Start") or "").strip(),
+                "genome_end": (row.get("Genome_End") or "").strip(),
+                "genome_strand": (row.get("Genome_Strand") or "").strip(),
+            })
+            if edits:
+                n_mutated += 1
+            else:
+                n_identical += 1
+
+    if errors:
+        for err in errors[:20]:
+            logger.error("%s", err)
+        raise LofImportError(
+            f"failed to reconstruct {len(errors)} row(s) "
+            f"(showing up to 20); fix the matrix/reference or re-run"
+        )
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    all_manifest: list[dict] = []
+    index_rows: list[dict] = []
+    n_dirs = 0
+
+    for category, mge_group, gene_id in sorted(buckets):
+        bucket = buckets[(category, mge_group, gene_id)]
+        n_samples = len(bucket.sample_counts)
+        if n_samples < min_samples:
+            continue
+
+        if category == "chromosome":
+            gene_dir = out_dir / "chromosome" / gene_id
+        else:
+            gene_dir = out_dir / "plasmid" / mge_group / gene_id
+
+        gene_dir.mkdir(parents=True, exist_ok=True)
+        write_fasta(gene_dir / "ref.fasta", bucket.ref_records)
+        write_fasta(gene_dir / "var.fasta", bucket.var_records)
+        with open(gene_dir / "manifest.tsv", "w", newline="") as fh:
+            writer = csv.DictWriter(
+                fh, fieldnames=list(bucket.manifest[0].keys()), delimiter="\t"
+            )
+            writer.writeheader()
+            writer.writerows(bucket.manifest)
+
+        all_manifest.extend(bucket.manifest)
+        index_rows.append({
+            "gene_id": gene_id,
+            "category": category,
+            "mge_group": mge_group,
+            "description": bucket.description,
+            "n_records": len(bucket.var_records),
+            "n_samples": n_samples,
+            "ref_length_nt": len(bucket.ref_seq),
+            "dir": str(gene_dir),
+        })
+        n_dirs += 1
+
+    by_cat: dict[Path, list[dict]] = defaultdict(list)
+    for row in index_rows:
+        if row["category"] == "chromosome":
+            by_cat[out_dir / "chromosome"].append(row)
+        else:
+            by_cat[out_dir / "plasmid" / row["mge_group"]].append(row)
+    for cat_path, rows in by_cat.items():
+        with open(cat_path / "index.tsv", "w", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=list(rows[0].keys()), delimiter="\t")
+            writer.writeheader()
+            writer.writerows(rows)
+
+    with open(out_dir / "manifest_all.tsv", "w", newline="") as fh:
+        if all_manifest:
+            writer = csv.DictWriter(
+                fh, fieldnames=list(all_manifest[0].keys()), delimiter="\t"
+            )
+            writer.writeheader()
+            writer.writerows(all_manifest)
+
+    stats = [{
+        "n_matrix_rows": n_rows,
+        "n_gene_dirs": n_dirs,
+        "n_records": len(all_manifest),
+        "n_identical": n_identical,
+        "n_mutated": n_mutated,
+        "n_skipped_missing_genes": n_skipped_missing,
+        "n_sample_length_mismatch": n_sample_len_mismatch,
+        "n_replicons": len(seen_replicons),
+    }]
+    with open(out_dir / "build_stats.tsv", "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(stats[0].keys()), delimiter="\t")
+        writer.writeheader()
+        writer.writerows(stats)
+
+    logger.info(
+        "Wrote %d gene folders, %d records (%d mutated, %d identical) → %s",
+        n_dirs,
+        len(all_manifest),
+        n_mutated,
+        n_identical,
+        out_dir,
+    )
+    if n_sample_len_mismatch:
+        logger.warning(
+            "%d rows had Sample_Length ≠ MutCode DNA length "
+            "(Panaroo allele vs called consensus); sequences follow MutCode",
+            n_sample_len_mismatch,
+        )
+    return all_manifest, stats
