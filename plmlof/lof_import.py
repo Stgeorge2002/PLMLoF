@@ -84,13 +84,30 @@ def _ensure_ref_cache(
     ref_cache: dict[str, dict[str, str]],
     results_dir: Path,
     replicon: str,
-) -> None:
+    *,
+    missing_replicons: set[str],
+) -> bool:
+    """Load Panaroo FASTA for this replicon. Return False if no reference exists.
+
+    ``mge_unclustered__...`` singleton plasmids have no panaroo_output tree.
+    """
     key = "chromosome" if replicon == "chromosome" else mge_group_from_replicon(replicon)
     if key in ref_cache:
-        return
-    pan_dir = resolve_panaroo_dir(results_dir, replicon)
+        return True
+    if key in missing_replicons:
+        return False
+    try:
+        pan_dir = resolve_panaroo_dir(results_dir, replicon)
+    except FileNotFoundError:
+        missing_replicons.add(key)
+        logger.info(
+            "No Panaroo pan_genome_reference.fa for %s — skipping those matrix rows",
+            key,
+        )
+        return False
     ref_cache[key] = read_fasta(pan_dir / "pan_genome_reference.fa")
     logger.info("Loaded %d genes from %s (%s)", len(ref_cache[key]), pan_dir, key)
+    return True
 
 
 def _write_buckets(
@@ -199,10 +216,12 @@ def build_from_lof_matrix(
     n_mutated = 0
     n_identical = 0
     n_skipped_missing = 0
+    n_skipped_no_replicon_ref = 0
     n_sample_len_mismatch = 0
     n_matrix_ref_len_mismatch = 0
     n_matrix_ref_len_mismatch_mutated = 0
     missing_genes: set[str] = set()
+    missing_replicons: set[str] = set()
     errors: list[str] = []
 
     with open_text(lof_matrix) as fh:
@@ -249,7 +268,11 @@ def build_from_lof_matrix(
 
             if replicon not in seen_replicons:
                 seen_replicons.add(replicon)
-            _ensure_ref_cache(ref_cache, results_dir, replicon)
+            if not _ensure_ref_cache(
+                ref_cache, results_dir, replicon, missing_replicons=missing_replicons
+            ):
+                n_skipped_no_replicon_ref += 1
+                continue
 
             ref_seq = reference_for_row(ref_cache, replicon, gene_id)
             if ref_seq is None:
@@ -364,6 +387,8 @@ def build_from_lof_matrix(
         "n_mutated": n_mutated,
         "n_skipped_missing_gene_rows": n_skipped_missing,
         "n_missing_gene_ids": len(missing_genes),
+        "n_skipped_no_replicon_ref_rows": n_skipped_no_replicon_ref,
+        "n_missing_replicon_refs": len(missing_replicons),
         "n_sample_length_mismatch": n_sample_len_mismatch,
         "n_matrix_ref_length_mismatch_rows": n_matrix_ref_len_mismatch,
         "n_matrix_ref_length_mismatch_genes": len(warned_ref_len),
@@ -375,6 +400,15 @@ def build_from_lof_matrix(
         writer.writeheader()
         writer.writerows(stats)
 
+    if missing_replicons:
+        path = out_dir / "missing_replicon_refs.txt"
+        path.write_text("\n".join(sorted(missing_replicons)) + "\n")
+        logger.info(
+            "Skipped %d rows for %d replicons with no Panaroo reference → %s",
+            n_skipped_no_replicon_ref,
+            len(missing_replicons),
+            path,
+        )
     if missing_genes:
         miss_path = out_dir / "missing_genes.txt"
         miss_path.write_text("\n".join(sorted(missing_genes)) + "\n")
