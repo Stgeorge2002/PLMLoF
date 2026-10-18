@@ -264,7 +264,11 @@ class Predictor:
             raw = net.forward_from_cache(ref_mean, ref_max, var_mean, var_max, nuc)
             measures.append(net.probability(raw).float().cpu())
         stacked = torch.stack(measures, dim=0)
-        return stacked.mean(0).numpy(), stacked.std(0).numpy()
+        mean = stacked.mean(0).numpy()
+        # One production seed → no ensemble dispersion (unbiased std is undefined).
+        if stacked.shape[0] < 2:
+            return mean, np.zeros_like(mean)
+        return mean, stacked.std(0, correction=0).numpy()
 
     def _normalize_pair(self, rec: VariantRecord) -> tuple[str, str]:
         ref = rec.ref_protein.replace("*", "")[: self.max_seq_length]
