@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Left-join PLMLoF predictions onto the original LoF matrix.
+"""Left-join PLMLoF LoF predictions onto the original LoF matrix.
 
 Keeps every matrix column and row (including rows skipped at import). After
 ``Mutation_Codes`` appends:
@@ -7,11 +7,8 @@ Keeps every matrix column and row (including rows skipped at import). After
     LoF_score  continuous LoF head
     lof_p      empirical p vs WT-like null
     lof_q      BH-adjusted FDR
-    mlof_score continuous MLoF head   (omitted with --lof-only)
-    mlof_p     empirical p for MLoF   (omitted with --lof-only)
-    mlof_q     BH-adjusted FDR for MLoF (omitted with --lof-only)
 
-Pass ``--extras-output`` to also write wreck / bin / diagnostics (and join
+Pass ``--extras-output`` to also write wreck / diagnostics (and join
 keys) to a sidecar TSV.
 
 Match key is Gene + Sample + genomic coordinates when present (paralog-safe);
@@ -45,12 +42,7 @@ LOF_SCORE_COLS: list[tuple[str, str]] = [
     ("lof_p", "lof_p"),
     ("lof_q", "lof_q"),
 ]
-MLOF_SCORE_COLS: list[tuple[str, str]] = [
-    ("mlof_score", "mlof_score"),
-    ("mlof_p", "mlof_p"),
-    ("mlof_q", "mlof_q"),
-]
-MAIN_SCORE_COLS = LOF_SCORE_COLS + MLOF_SCORE_COLS
+MAIN_SCORE_COLS = LOF_SCORE_COLS
 MAIN_OUT_NAMES = [name for name, _ in MAIN_SCORE_COLS]
 
 # Join keys shared with the matrix so the extras file can be re-merged.
@@ -66,14 +58,10 @@ JOIN_KEY_COLS = [
 
 # Predictor fields written only to --extras-output (order preserved).
 EXTRAS_PRED_COLS = [
-    "mlof_bin",
     "wreck",
     "wreck_kind",
     "wreck_prior",
     "lof_sd",
-    "mlof_sd",
-    "mlof_mean",
-    "mlof_n_sites",
     "in_family",
     "nearest_train_gene",
     "ref_cosine",
@@ -107,11 +95,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=None,
         help="Optional sidecar with wreck/bin/diagnostics + join keys",
-    )
-    p.add_argument(
-        "--lof-only",
-        action="store_true",
-        help="Append only LoF_score/lof_p/lof_q (omit mlof_* columns)",
     )
     return p.parse_args(argv)
 
@@ -235,14 +218,9 @@ def main(argv: list[str] | None = None) -> int:
     preds, pred_fields = load_predictions(args.predictions)
     logger.info("Loaded %d prediction rows", len(preds))
 
-    # Auto LoF-only when the predictions TSV has no mlof columns (e.g. --lof-only predict).
-    lof_only = args.lof_only or ("mlof_score" not in pred_fields)
+    del pred_fields  # field list kept for logging/future checks
     score_cols = list(LOF_SCORE_COLS)
-    if not lof_only:
-        score_cols.extend(MLOF_SCORE_COLS)
     score_out_names = [name for name, _ in score_cols]
-    if lof_only:
-        logger.info("LoF-only join (no mlof_* columns in output)")
 
     logger.info("Loading manifest index from %s", args.manifest)
     by_coord, by_gene_sample = load_manifest_index(args.manifest)

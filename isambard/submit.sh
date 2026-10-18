@@ -7,7 +7,6 @@
 #   bash isambard/submit.sh pipeline         # embed + train + eval (tables must already be on disk)
 #   bash isambard/submit.sh pipeline --train-only
 #   bash isambard/submit.sh pipeline --eval-only
-#   bash isambard/submit.sh pipeline --sweep     # MDG feature ablations (embed first)
 #   bash isambard/submit.sh embed
 #   bash isambard/submit.sh predict           # batch-score N44_ST258_results/plmlof_input with best-models/
 #   bash isambard/submit.sh all              # setup, then pipeline after setup succeeds
@@ -15,7 +14,7 @@
 #
 # Training data is NOT downloaded here. On a laptop:
 #   bash scripts/prepare_local.sh
-#   rsync -avP data/processed/{lof,mlof,growth_gof,amr_gof} HOST:$PROJECTDIR/$USER/PLMLoF/data/processed/
+#   rsync -avP data/processed/lof HOST:$PROJECTDIR/$USER/PLMLoF/data/processed/
 
 set -euo pipefail
 
@@ -54,10 +53,8 @@ case "$ACTION" in
         submit_one pipeline.sbatch "$@"
         ;;
     sweep)
-        # Feature ablations on cached MDG embeddings. Re-embed mlof first if encoder.json
-        # is missing site_llr / taxon. 7 specs × 2 seeds ≈ 1–2 h.
-        sbatch --time=02:00:00 "${SBATCH_OUT[@]}" \
-            "${ROOT}/isambard/jobs/pipeline.sbatch" --sweep
+        echo "ERROR: sweep is disabled while PLMLoF is LoF-only." >&2
+        exit 1
         ;;
     embed)
         submit_one pipeline.sbatch --embed-only
@@ -68,7 +65,7 @@ case "$ACTION" in
     data)
         echo "Training data is prepared on a laptop, not on Isambard." >&2
         echo "  bash scripts/prepare_local.sh" >&2
-        echo "  rsync -avP data/processed/{lof,mlof,growth_gof,amr_gof} HOST:\$PROJECTDIR/\$USER/PLMLoF/data/processed/" >&2
+        echo "  rsync -avP data/processed/lof HOST:\$PROJECTDIR/\$USER/PLMLoF/data/processed/" >&2
         exit 1
         ;;
     test)

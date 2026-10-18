@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "plmlof"
 version = "1.0.0"
-description = "Graded bacterial LoF score plus conservative growth/AMR GoF flags"
+description = "Comparative bacterial LoF score (ref↔var ESM2)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}

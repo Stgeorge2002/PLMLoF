@@ -1,20 +1,14 @@
-"""Parquet + cached-embedding datasets for task heads."""
+"""Parquet + cached-embedding datasets for the LoF head."""
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset, Sampler
+from torch.utils.data import Dataset
 
-from plmlof.chem import pad_site_chem
-from plmlof.constants import NUM_SITE_CHEM, SITE_RADIUS, SITE_WINDOW
 from plmlof.data.features import extract_nucleotide_features
-from plmlof.sites import aligned_site_index, missense_sites, window_indices
-
 
 REQUIRED_COLUMNS = {"ref_protein", "var_protein", "target", "sample_weight"}
 IDENTITY_TARGET_EPS = 0.05
@@ -29,16 +23,15 @@ def lof_train_keep_indices(
     seed: int = 0,
     identity_per_missense: float = 1.0,
 ) -> list[int]:
-    """LoF/MLoF train rows: drop sure wrecks; cap identity WT to ~1× missense count.
-
-    Inference still applies wreck_grade. Training on sure wrecks teaches length.
-    Identity WT is `channel == wt` and not missense when channels exist; otherwise
-    non-wreck / non-missense with target ≈ 0 (works on older embedding caches).
-    """
+    """Drop sure wrecks; cap identity WT to ~1× missense count."""
     wreck = is_wreck.bool()
     miss = is_missense.bool()
     keep = ~wreck
-    have_wt = channels is not None and len(channels) == int(keep.numel()) and any(c == "wt" for c in channels)
+    have_wt = (
+        channels is not None
+        and len(channels) == int(keep.numel())
+        and any(c == "wt" for c in channels)
+    )
     if have_wt:
         ident = keep & ~miss & torch.tensor([c == "wt" for c in channels], dtype=torch.bool)
     else:
@@ -54,67 +47,8 @@ def lof_train_keep_indices(
     return torch.cat([other, ident_idx]).sort().values.tolist()
 
 
-class ProteinGroupBatchSampler(Sampler[list[int]]):
-    """Yield batches that keep many variants of the same protein together.
-
-    RankNet needs in-batch pairs from one gene. A shuffled 256-row batch of
-    174 proteins is ~1.5 rows/gene — no pairs. Chunk each protein, then pack
-    ``n_proteins_per_batch`` chunks into a batch.
-    """
-
-    def __init__(
-        self,
-        protein_ids: Sequence[str],
-        batch_size: int,
-        n_proteins_per_batch: int = 4,
-        seed: int = 0,
-    ):
-        if batch_size < 2:
-            raise ValueError("batch_size must be >= 2 for ranking")
-        self.protein_ids = [str(p) for p in protein_ids]
-        self.batch_size = int(batch_size)
-        self.n_proteins_per_batch = max(1, int(n_proteins_per_batch))
-        self.seed = int(seed)
-        self.epoch = 0
-        self.by_prot: dict[str, list[int]] = {}
-        for i, pid in enumerate(self.protein_ids):
-            self.by_prot.setdefault(pid, []).append(i)
-        self._len = max(1, (len(self.protein_ids) + self.batch_size - 1) // self.batch_size)
-
-    def set_epoch(self, epoch: int) -> None:
-        self.epoch = int(epoch)
-
-    def __len__(self) -> int:
-        return self._len
-
-    def __iter__(self) -> Iterator[list[int]]:
-        rng = np.random.RandomState(self.seed + self.epoch * 10007)
-        take = max(8, self.batch_size // self.n_proteins_per_batch)
-        chunks: list[list[int]] = []
-        proteins = list(self.by_prot)
-        rng.shuffle(proteins)
-        for pid in proteins:
-            idxs = list(self.by_prot[pid])
-            rng.shuffle(idxs)
-            for start in range(0, len(idxs), take):
-                chunks.append(idxs[start:start + take])
-        rng.shuffle(chunks)
-        batch: list[int] = []
-        n_out = 0
-        for chunk in chunks:
-            if batch and len(batch) + len(chunk) > self.batch_size:
-                yield batch
-                n_out += 1
-                batch = []
-            batch.extend(chunk)
-        if batch:
-            yield batch
-            n_out += 1
-        self._len = max(1, n_out)
-
-
 class PairDataset(Dataset):
-    """On-disk rows (used for embedding scatter and live ESM2)."""
+    """On-disk rows (used for embedding scatter)."""
 
     def __init__(self, data_path: str | Path, max_seq_length: int = 1024):
         self.max_seq_length = max_seq_length
@@ -153,53 +87,15 @@ class PairDataset(Dataset):
             self._is_missense = [bool(v) for v in miss]
         else:
             self._is_missense = ["missense" in c for c in self._channel]
-
-        stored = self.df["site_index"] if "site_index" in self.df.columns else None
-        stored2 = self.df["site_index_2"] if "site_index_2" in self.df.columns else None
-        stored_n = self.df["n_sites"] if "n_sites" in self.df.columns else None
-        self._site_index = []
-        self._site_index_2 = []
-        self._n_sites = []
-        for i, (ref, var) in enumerate(zip(self._ref, self._var)):
-            sites = missense_sites(ref, var)
-            if stored is not None and pd.notna(stored.iloc[i]) and int(stored.iloc[i]) >= 0:
-                self._site_index.append(int(stored.iloc[i]))
-            else:
-                self._site_index.append(aligned_site_index(ref, var))
-            if stored2 is not None and pd.notna(stored2.iloc[i]) and int(stored2.iloc[i]) >= 0:
-                self._site_index_2.append(int(stored2.iloc[i]))
-            else:
-                self._site_index_2.append(sites[1] if len(sites) > 1 else -1)
-            if stored_n is not None and pd.notna(stored_n.iloc[i]):
-                self._n_sites.append(int(stored_n.iloc[i]))
-            else:
-                self._n_sites.append(len(sites))
         n = len(self._ref)
         self._taxon = [str(v).strip() for v in self.df.get("taxon", [""] * n)]
         self._assay = [str(v).strip() for v in self.df.get("assay", [""] * n)]
-
         self._nuc = torch.stack([
             extract_nucleotide_features(r, v) for r, v in zip(self._ref, self._var)
         ])
 
     def __len__(self) -> int:
         return len(self._ref)
-
-    def residue_requests(self) -> dict[str, set[int]]:
-        """Seq → residue indices needed for every MDG site window (Hamming ≤ 2)."""
-        need: dict[str, set[int]] = {}
-        for ref, var, center, center2 in zip(
-            self._ref, self._var, self._site_index, self._site_index_2,
-        ):
-            for seq, length in ((ref, len(ref)), (var, len(var))):
-                bucket = need.setdefault(seq, set())
-                for site in (center, center2):
-                    if site < 0:
-                        continue
-                    for residue in window_indices(site, length, SITE_RADIUS):
-                        if residue >= 0:
-                            bucket.add(residue)
-        return need
 
     def __getitem__(self, idx: int) -> dict:
         return {
@@ -215,20 +111,11 @@ class PairDataset(Dataset):
             "gene": self._genes[idx],
             "species": self._species[idx],
             "protein_id": self._protein_id[idx],
-            "site_index": self._site_index[idx],
         }
 
 
-def _empty_sites(n: int, hidden: int, window: int = SITE_WINDOW) -> torch.Tensor:
-    return torch.zeros(n, window, hidden, dtype=torch.float32)
-
-
-def _empty_chem(n: int) -> torch.Tensor:
-    return torch.zeros(n, NUM_SITE_CHEM, dtype=torch.float32)
-
-
 class CachedDataset(Dataset):
-    """Precomputed ESM2 embeddings plus targets/weights/channels."""
+    """Precomputed ESM2 pooled embeddings plus targets/weights/channels."""
 
     def __init__(self, cache_path: str | Path):
         path = Path(cache_path)
@@ -248,22 +135,9 @@ class CachedDataset(Dataset):
         self.genes = data.get("genes", [""] * len(self.targets))
         self.protein_ids = data.get("protein_ids", [""] * len(self.targets))
         self.channels = data.get("channels", ["unknown"] * len(self.targets))
-        hidden = int(self.ref_mean.shape[1])
-        self.site_ref = data.get("site_ref", _empty_sites(len(self.targets), hidden))
-        self.site_var = data.get("site_var", _empty_sites(len(self.targets), hidden))
-        self.site_chem = pad_site_chem(data.get("site_chem", _empty_chem(len(self.targets))))
-        self.site_ref2 = data.get("site_ref2", _empty_sites(len(self.targets), hidden))
-        self.site_var2 = data.get("site_var2", _empty_sites(len(self.targets), hidden))
-        self.site_chem2 = pad_site_chem(data.get("site_chem2", _empty_chem(len(self.targets))))
         n = len(self.targets)
-        self.n_sites = data.get("n_sites", torch.zeros(n, dtype=torch.long))
-        if not torch.is_tensor(self.n_sites):
-            self.n_sites = torch.tensor(self.n_sites, dtype=torch.long)
-        self.n_sites = self.n_sites.long()
         self.taxon = list(data.get("taxon", [""] * n))
         self.assay = list(data.get("assay", [""] * n))
-        self.has_sites = bool(data.get("has_sites", False))
-        self.site_window = int(self.site_ref.shape[1]) if self.site_ref.ndim == 3 else SITE_WINDOW
 
     def __len__(self) -> int:
         return len(self.targets)
@@ -275,13 +149,6 @@ class CachedDataset(Dataset):
             "var_mean": self.var_mean[idx],
             "var_max": self.var_max[idx],
             "nucleotide_features": self.nuc_features[idx],
-            "site_ref": self.site_ref[idx],
-            "site_var": self.site_var[idx],
-            "site_chem": self.site_chem[idx],
-            "site_ref2": self.site_ref2[idx],
-            "site_var2": self.site_var2[idx],
-            "site_chem2": self.site_chem2[idx],
-            "n_sites": self.n_sites[idx],
             "target": self.targets[idx],
             "sample_weight": self.weights[idx],
             "dms_zscore": self.z[idx],
@@ -293,44 +160,3 @@ class CachedDataset(Dataset):
             "taxon": self.taxon[idx],
             "assay": self.assay[idx],
         }
-
-
-def scale_prokaryote_weights(weights: torch.Tensor, taxon: Sequence[str], scale: float) -> torch.Tensor:
-    """Up-weight prokaryote rows. Identity of a prokaryote protein keeps that taxon."""
-    w = weights.clone()
-    if float(scale) == 1.0:
-        return w
-    mask = torch.tensor(
-        [str(t).strip().lower() == "prokaryote" for t in taxon],
-        dtype=torch.bool,
-    )
-    if mask.numel() != w.numel():
-        raise ValueError(f"taxon length {mask.numel()} != weights {w.numel()}")
-    w[mask] *= float(scale)
-    return w
-
-
-def mlof_train_indices(
-    ds: CachedDataset,
-    seed: int,
-    *,
-    prokaryote_only: bool = False,
-    drop_multi: bool = False,
-) -> list[int]:
-    """Wreck/identity filter, then optional prokaryote-only and Hamming-1-only."""
-    keep = lof_train_keep_indices(
-        ds.is_wreck, ds.is_missense, ds.targets,
-        channels=list(ds.channels), seed=seed,
-    )
-    if prokaryote_only:
-        if not any(str(t).strip() for t in ds.taxon):
-            raise SystemExit(
-                "prokaryote-only requested but embeddings have no taxon. "
-                "Rebuild mlof parquet and re-run scripts/precompute.py"
-            )
-        keep = [i for i in keep if str(ds.taxon[i]).strip().lower() == "prokaryote"]
-    if drop_multi:
-        keep = [i for i in keep if int(ds.n_sites[i]) <= 1]
-    if not keep:
-        raise SystemExit("MLoF train filter removed every row")
-    return keep

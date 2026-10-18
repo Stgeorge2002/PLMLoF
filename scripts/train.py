@@ -16,11 +16,7 @@ import yaml
 from torch.utils.data import DataLoader, Subset
 
 from plmlof.applicability import save_gallery
-from plmlof.constants import NUM_SITE_CHEM, SITE_WINDOW
-from plmlof.dataset import (
-    CachedDataset, ProteinGroupBatchSampler, lof_train_keep_indices,
-    mlof_train_indices, scale_prokaryote_weights,
-)
+from plmlof.dataset import CachedDataset, lof_train_keep_indices
 from plmlof.encoders import HIDDEN_SIZE, esm2_for_task, read_encoder_meta
 from plmlof.model import TaskNet
 from plmlof.trainer import Trainer
@@ -37,8 +33,9 @@ def load_yaml(path: str | None) -> dict:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    p = argparse.ArgumentParser(description="Train a LoF, MLoF, or GoF head")
-    p.add_argument("--task", required=True, choices=["lof", "mlof", "growth_gof", "amr_gof"])
+    p = argparse.ArgumentParser(description="Train the PLMLoF LoF head")
+    p.add_argument("--task", required=True, choices=["lof"],
+                   help="Only LoF is supported")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--precomputed", type=Path, required=True, help="Dir containing <task>/train_embeddings.pt")
     p.add_argument("--output-dir", type=Path, required=True)
@@ -51,24 +48,12 @@ def main() -> None:
     p.add_argument("--learning-rate", type=float, default=None)
     p.add_argument("--patience", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=None)
-    p.add_argument("--rank-loss-weight", type=float, default=None)
-    p.add_argument("--regression-loss-weight", type=float, default=None)
-    p.add_argument("--mlof-proteins-per-batch", type=int, default=None)
     p.add_argument("--head-hidden", type=int, default=None)
     p.add_argument("--dropout", type=float, default=None)
     p.add_argument(
         "--drop-sure-wrecks",
         action="store_true",
-        help="Drop sure wrecks from the train set (always on for MLoF; optional for LoF)",
-    )
-    p.add_argument("--prokaryote-weight", type=float, default=1.0)
-    p.add_argument("--prokaryote-only", action="store_true")
-    p.add_argument("--ablate-logodds", action="store_true")
-    p.add_argument("--ablate-domain", action="store_true")
-    p.add_argument(
-        "--drop-multi",
-        action="store_true",
-        help="Drop Hamming-2 rows from the MLoF train set (eval still scores them)",
+        help="Drop sure wrecks from the train set",
     )
     args = p.parse_args()
 
@@ -80,12 +65,6 @@ def main() -> None:
         train_cfg["early_stopping_patience"] = args.patience
     if args.batch_size is not None:
         train_cfg["batch_size"] = args.batch_size
-    if args.rank_loss_weight is not None:
-        train_cfg["rank_loss_weight"] = args.rank_loss_weight
-    if args.regression_loss_weight is not None:
-        train_cfg["regression_loss_weight"] = args.regression_loss_weight
-    if args.mlof_proteins_per_batch is not None:
-        train_cfg["mlof_proteins_per_batch"] = args.mlof_proteins_per_batch
     if args.head_hidden is not None:
         model_cfg["head_hidden"] = args.head_hidden
     if args.dropout is not None:
@@ -105,43 +84,7 @@ def main() -> None:
         )
     train_full = CachedDataset(task_emb / "train_embeddings.pt")
     val_ds = CachedDataset(task_emb / "val_embeddings.pt")
-    if args.task == "mlof" and not train_full.has_sites:
-        raise SystemExit(
-            f"{task_emb} has pooled embeddings only. Delete that dir and re-run scripts/precompute.py"
-        )
-    if args.task == "mlof" and int(train_full.site_window) != SITE_WINDOW:
-        raise SystemExit(
-            f"{task_emb} site window is {train_full.site_window}, code expects {SITE_WINDOW}. "
-            "Delete that task's embedding dir and re-run scripts/precompute.py"
-        )
-    if args.task == "mlof" and (
-        args.prokaryote_weight != 1.0 or args.prokaryote_only
-    ) and not any(str(t).strip() for t in train_full.taxon):
-        raise SystemExit(
-            "prokaryote weight/filter requested but embeddings have no taxon. "
-            "Rebuild mlof parquet and re-run scripts/precompute.py"
-        )
-    if args.task == "mlof" and args.prokaryote_weight != 1.0:
-        train_full.weights = scale_prokaryote_weights(
-            train_full.weights, train_full.taxon, args.prokaryote_weight,
-        )
-        n_prok = sum(1 for t in train_full.taxon if str(t).strip().lower() == "prokaryote")
-        logger.info("prokaryote_weight=%s  n_prok=%s / %s", args.prokaryote_weight, n_prok, len(train_full))
-    filter_wrecks = args.task == "mlof" or args.drop_sure_wrecks
-    if args.task == "mlof":
-        keep = mlof_train_indices(
-            train_full, args.seed,
-            prokaryote_only=args.prokaryote_only,
-            drop_multi=args.drop_multi,
-        )
-        train_ds = Subset(train_full, keep)
-        logger.info(
-            "mlof train filter %s → %s (no sure wrecks%s%s)",
-            len(train_full), len(train_ds),
-            ", prokaryote-only" if args.prokaryote_only else "",
-            ", Hamming-1 only" if args.drop_multi else "",
-        )
-    elif filter_wrecks:
+    if args.drop_sure_wrecks:
         keep = lof_train_keep_indices(
             train_full.is_wreck, train_full.is_missense, train_full.targets,
             channels=list(train_full.channels), seed=args.seed,
@@ -164,23 +107,10 @@ def main() -> None:
 
     batch = int(train_cfg.get("batch_size", 256))
     pin = device == "cuda"
-    if args.task == "mlof":
-        pids = [train_full.protein_ids[i] for i in train_ds.indices]
-        sampler = ProteinGroupBatchSampler(
-            pids,
-            batch_size=batch,
-            n_proteins_per_batch=int(train_cfg.get("mlof_proteins_per_batch", 4)),
-            seed=args.seed,
-        )
-        train_loader = DataLoader(
-            train_ds, batch_sampler=sampler,
-            num_workers=args.num_workers, pin_memory=pin,
-        )
-    else:
-        train_loader = DataLoader(
-            train_ds, batch_size=batch, shuffle=True,
-            num_workers=args.num_workers, pin_memory=pin,
-        )
+    train_loader = DataLoader(
+        train_ds, batch_size=batch, shuffle=True,
+        num_workers=args.num_workers, pin_memory=pin,
+    )
     val_loader = DataLoader(
         val_ds, batch_size=batch, shuffle=False,
         num_workers=args.num_workers, pin_memory=pin,
@@ -193,11 +123,7 @@ def main() -> None:
         use_cross_attention=model_cfg.get("use_cross_attention", False),
         head_hidden=int(model_cfg.get("head_hidden", 128)),
         dropout=float(model_cfg.get("dropout", 0.2)),
-        site_window=SITE_WINDOW,
-        chem_dim=NUM_SITE_CHEM if args.task == "mlof" else 0,
     )
-    net.ablate_logodds = bool(args.ablate_logodds)
-    net.ablate_domain = bool(args.ablate_domain)
     precision = args.mixed_precision or train_cfg.get("mixed_precision", "bf16")
     trainer = Trainer(
         net=net,
@@ -206,12 +132,9 @@ def main() -> None:
         device=device,
         output_dir=args.output_dir,
         mixed_precision=precision,
-        gof_threshold=float(train_cfg.get("gof_threshold", 0.90)),
         esm2_model_name=esm_name,
         pool_strategy=model_cfg.get("pool_strategy", "mean_max"),
         seed=args.seed,
-        rank_loss_weight=float(train_cfg.get("rank_loss_weight", 0.5)),
-        regression_loss_weight=float(train_cfg.get("regression_loss_weight", 0.5)),
     )
     trainer.train(
         max_epochs=args.max_epochs or int(train_cfg.get("max_epochs", 40)),
@@ -222,19 +145,12 @@ def main() -> None:
         warmup_ratio=float(train_cfg.get("warmup_ratio", 0.1)),
     )
 
-    if args.task == "lof":
-        intact = ~train_full.is_wreck
-        if not bool(intact.any()):
-            intact = torch.ones(len(train_full), dtype=torch.bool)
-        idx = intact.nonzero(as_tuple=False).view(-1).tolist()
-        # Comparative LoF: gallery is reference (WT) embeddings.
-        gal_mean = train_full.ref_mean[intact]
-    else:
-        miss = train_full.is_missense
-        if not bool(miss.any()):
-            miss = torch.ones(len(train_full), dtype=torch.bool)
-        idx = miss.nonzero(as_tuple=False).view(-1).tolist()
-        gal_mean = train_full.ref_mean[miss]
+    intact = ~train_full.is_wreck
+    if not bool(intact.any()):
+        intact = torch.ones(len(train_full), dtype=torch.bool)
+    idx = intact.nonzero(as_tuple=False).view(-1).tolist()
+    # Comparative LoF: gallery is reference (WT) embeddings.
+    gal_mean = train_full.ref_mean[intact]
     save_gallery(
         Path(args.output_dir) / "train_gallery.pt",
         gal_mean,
@@ -248,13 +164,6 @@ def main() -> None:
         "hidden_size": hidden,
         "head_hidden": int(model_cfg.get("head_hidden", 128)),
         "dropout": float(model_cfg.get("dropout", 0.2)),
-        "site_window": SITE_WINDOW if args.task == "mlof" else None,
-        "chem_dim": NUM_SITE_CHEM if args.task == "mlof" else 0,
-        "ablate_logodds": bool(args.ablate_logodds),
-        "ablate_domain": bool(args.ablate_domain),
-        "prokaryote_weight": float(args.prokaryote_weight),
-        "prokaryote_only": bool(args.prokaryote_only),
-        "drop_multi": bool(args.drop_multi),
     }
     (Path(args.output_dir) / "model_config.json").write_text(json.dumps(meta, indent=2))
     logger.info("Done → %s", args.output_dir)

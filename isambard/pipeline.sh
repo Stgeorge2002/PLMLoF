@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# PLMLoF pipeline for Isambard-AI compute nodes.
+# PLMLoF pipeline for Isambard-AI compute nodes (LoF head only).
 # Training tables are prepared on a laptop (scripts/prepare_local.sh) and
-# copied to data/processed/{lof,mlof,growth_gof,amr_gof}/.
-# This job NEVER downloads ProteinGym/CARD/GBFF.
+# copied to data/processed/lof/.
+# This job NEVER downloads GBFF/Pfam or training tables.
 #
 #   bash isambard/submit.sh pipeline
 #   bash isambard/submit.sh pipeline --train-only
@@ -61,7 +61,7 @@ while [[ $i -lt ${#ARGS[@]} ]]; do
         --seeds)       i=$((i+1)); SEEDS="${ARGS[$i]}" ;;
         --max-epochs)  i=$((i+1)); MAX_EPOCHS="${ARGS[$i]}" ;;
         --help|-h)
-            echo "Usage: bash isambard/pipeline.sh [--smoke|--train-only|--eval-only|--embed-only|--sweep|--task lof|mlof|all|--max-epochs N]"
+            echo "Usage: bash isambard/pipeline.sh [--smoke|--train-only|--eval-only|--embed-only|--task lof|all|--max-epochs N]"
             exit 0
             ;;
         *)
@@ -101,7 +101,7 @@ else
 fi
 
 if [[ "$MODE" == "smoke" ]]; then
-    echo "Smoke: ESM2-8M forward + TaskNet (no training tables, no 650M)"
+    echo "Smoke: ESM2-8M forward + TaskNet (no training tables)"
     python - <<'PY'
 import torch
 from transformers import AutoModel, AutoTokenizer
@@ -143,9 +143,7 @@ require_task() {
 
 TASKS=()
 if [[ "$TASK" == "all" ]]; then
-    # GoF frozen. Restore growth_gof amr_gof in this list to train those heads again.
-    for t in lof mlof; do
-        # for t in lof mlof growth_gof amr_gof; do
+    for t in lof; do
         if [[ -f "$DATA_DIR/$t/train.parquet" ]]; then
             n=$(python -c "import pandas as pd; print(len(pd.read_parquet('$DATA_DIR/$t/train.parquet')))")
             if [[ "$n" -gt 0 ]]; then
@@ -166,25 +164,14 @@ if [[ ${#TASKS[@]} -eq 0 ]]; then
     echo "ERROR: no tasks with training parquet under $DATA_DIR" >&2
     echo "This pipeline does not download data. Run on a laptop:" >&2
     echo "  bash scripts/prepare_local.sh" >&2
-    echo "Then rsync data/processed/{lof,mlof,growth_gof,amr_gof} onto this clone." >&2
+    echo "Then rsync data/processed/lof onto this clone." >&2
     exit 1
 fi
 require_task "lof"
 
 if [[ "$MODE" == "sweep" ]]; then
-    require_task "mlof"
-    echo "──────── MDG feature sweep (cached embeddings, no GoF, no LoF retrain) ────────"
-    python scripts/sweep.py \
-        --precomputed "$EMB_DIR" \
-        --output-dir "$OUT_DIR/sweep" \
-        --sweep "${PLMLOF_ROOT}/configs/sweeps.yaml" \
-        --config "$TRAIN_CFG" \
-        --model-config "$MODEL_CFG" \
-        --device "$DEVICE" \
-        --mixed-precision "$PRECISION" \
-        --num-workers 8
-    echo "Sweep complete. Scoreboard: $OUT_DIR/sweep/scoreboard.tsv"
-    exit 0
+    echo "ERROR: hyperparameter sweep is disabled while PLMLoF is LoF-only." >&2
+    exit 1
 fi
 
 if [[ "$MODE" == "full" || "$MODE" == "embed" || "$MODE" == "train" ]]; then

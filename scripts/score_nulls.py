@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     p = argparse.ArgumentParser()
-    p.add_argument("--task", required=True, choices=["lof", "mlof", "growth_gof", "amr_gof"])
+    p.add_argument("--task", required=True, choices=["lof"])
     p.add_argument("--ensemble-dir", type=Path, required=True, help="outputs/<task>")
     p.add_argument("--embeddings", type=Path, required=True, help="null_embeddings.pt")
     p.add_argument("--device", default=None)
@@ -43,13 +43,6 @@ def main() -> None:
                     batch["ref_mean"], batch["ref_max"],
                     batch["var_mean"], batch["var_max"],
                     batch["nucleotide_features"],
-                    site_ref=batch.get("site_ref"),
-                    site_var=batch.get("site_var"),
-                    site_chem=batch.get("site_chem"),
-                    site_ref2=batch.get("site_ref2"),
-                    site_var2=batch.get("site_var2"),
-                    site_chem2=batch.get("site_chem2"),
-                    n_sites=batch.get("n_sites"),
                 )
                 parts.append(net.probability(raw).float().cpu())
             acc.append(torch.stack(parts, dim=0).mean(0))

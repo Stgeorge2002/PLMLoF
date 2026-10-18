@@ -1,4 +1,4 @@
-"""Inference entry point for PLMLoF.
+"""Inference entry point for PLMLoF (comparative LoF head).
 
     python scripts/predict.py --model outputs --reference ref.fasta --variants var.fasta
     python scripts/predict.py --model outputs --proteins alleles.faa
@@ -18,12 +18,12 @@ logger = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="PLMLoF variant effect prediction")
+    parser = argparse.ArgumentParser(description="PLMLoF LoF prediction")
     parser.add_argument("--reference", type=str, default=None, help="Reference FASTA (CDS or protein)")
     parser.add_argument("--variants", type=str, default=None, help="Variant FASTA file")
     parser.add_argument("--proteins", type=str, default=None, help="Alignment-free LoF: protein FASTA, no reference")
     parser.add_argument("--vcf", type=str, default=None, help="VCF file")
-    parser.add_argument("--model", type=str, required=True, help="Output dir with lof/ mlof/ growth_gof/ amr_gof/")
+    parser.add_argument("--model", type=str, required=True, help="Output dir with lof/ ensemble")
     parser.add_argument("--device", type=str, default=None, help="Device (auto/cpu/cuda)")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--output", type=str, default=None, help="Output file (JSON or TSV)")
@@ -34,30 +34,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--hmm", type=str, default=None, help="Pfam-A.hmm for refs missing from --domains")
     parser.add_argument("--hmm-cpus", type=int, default=1)
-    parser.add_argument(
-        "--lof-only",
-        action="store_true",
-        help="Score only the LoF head (skip MLoF / ESM2-650M)",
-    )
     return parser.parse_args()
 
 
-def _write_tsv(results: list[dict], path: Path, *, lof_only: bool = False) -> None:
+def _write_tsv(results: list[dict], path: Path) -> None:
     keys = [
         "gene", "wreck", "wreck_kind", "wreck_prior",
         "lof_score", "lof_sd", "lof_p", "lof_q",
-    ]
-    if not lof_only:
-        keys.extend([
-            "mlof_score", "mlof_bin", "mlof_mean", "mlof_n_sites", "mlof_sd", "mlof_p", "mlof_q",
-        ])
-    keys.extend([
         "in_family", "nearest_train_gene", "ref_cosine",
-        "growth_gof_p", "growth_gof_sd", "growth_gof_p_emp", "growth_gof_q", "growth_gof_call",
-        "growth_gof_in_family", "growth_gof_nearest",
-        "amr_gof_p", "amr_gof_sd", "amr_gof_p_emp", "amr_gof_q", "amr_gof_call",
-        "amr_gof_in_family", "amr_gof_nearest",
-    ])
+    ]
     with open(path, "w") as f:
         f.write("\t".join(keys) + "\n")
         for r in results:
@@ -99,7 +84,7 @@ def main() -> None:
     pred = Predictor(
         pred_dir, device=device, batch_size=args.batch_size,
         domains=args.domains, hmm=args.hmm, hmm_cpus=args.hmm_cpus,
-        lof_only=args.lof_only,
+        lof_only=True,
     )
     if args.proteins:
         results = pred.predict_proteins(args.proteins)
@@ -115,16 +100,15 @@ def main() -> None:
         if args.format == "json":
             out.write_text(json.dumps(results, indent=2, default=str))
         else:
-            _write_tsv(results, out, lof_only=args.lof_only)
+            _write_tsv(results, out)
         logger.info("Wrote %s (%s rows)", out, len(results))
         return
 
-    print(f"{'gene':<24} {'lof':>7} {'mlof':>7} {'wreck':<12} {'gGof':>6} {'amr':>6}")
+    print(f"{'gene':<24} {'lof':>7} {'wreck':<12} {'in_fam':>6}")
     for r in results[:50]:
         print(
-            f"{r['gene']:<24} {r['lof_score']:7.3f} {r.get('mlof_score', float('nan')):7.3f} "
-            f"{r['wreck_kind']:<12} {r.get('growth_gof_p', float('nan')):6.3f} "
-            f"{r.get('amr_gof_p', float('nan')):6.3f}"
+            f"{r['gene']:<24} {r['lof_score']:7.3f} "
+            f"{r['wreck_kind']:<12} {int(bool(r.get('in_family'))):6d}"
         )
     print(f"Total {len(results)} pairs")
 

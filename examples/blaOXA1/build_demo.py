@@ -123,7 +123,7 @@ def samples(wt: str) -> list[tuple[str, str, list[tuple[int, str, str]], str, st
     cons1 = CONS[:8]
     for i, mut in enumerate(cons1, start=2):
         add(f"s{i:02d}_n1_cons_{mut[1]}{mut[0]}{mut[2]}", "conservative", [mut],
-            "single conservative; expect low mlof_score")
+            "single conservative; expect low lof_score")
 
     add("s10_n1_mid_A56E", "intermediate", [(56, "A", "E")], "surface Ala→Glu")
     add("s11_n1_rad_W95G", "radical", [(95, "W", "G")], "Trp loss")

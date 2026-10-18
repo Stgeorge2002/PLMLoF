@@ -1,7 +1,7 @@
-"""Run PLMLoF (lof + mlof heads) over every gene produced by
+"""Run PLMLoF LoF over every gene produced by
 scripts/build_gene_fasta_pairs.py, in a single process.
 
-Loads ESM2 once, walks N44_ST258_results/plmlof_input/{chromosome,plasmid/mge_*}/<gene>/
+Loads ESM2-35M once, walks N44_ST258_results/plmlof_input/{chromosome,plasmid/mge_*}/<gene>/
 {ref.fasta,var.fasta,manifest.tsv}, scores everything with one Predictor,
 and writes a combined TSV joined back to gene/sample/category via the
 per-record manifest rows.
@@ -29,18 +29,13 @@ logger = logging.getLogger(__name__)
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--input-dir", type=str, default="N44_ST258_results/plmlof_input")
-    p.add_argument("--model", type=str, required=True, help="Output dir with lof/ mlof/ (best-models)")
+    p.add_argument("--model", type=str, required=True, help="Output dir with lof/ ensemble (best-models)")
     p.add_argument("--output", type=str, required=True)
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--domains", type=str, default=None)
     p.add_argument("--hmm", type=str, default=None)
     p.add_argument("--hmm-cpus", type=int, default=1)
-    p.add_argument(
-        "--lof-only",
-        action="store_true",
-        help="Score only the LoF head (skip MLoF / ESM2-650M). Much faster.",
-    )
     return p.parse_args()
 
 
@@ -92,7 +87,7 @@ def main() -> None:
     pred = Predictor(
         Path(args.model), device=device, batch_size=args.batch_size,
         domains=args.domains, hmm=args.hmm, hmm_cpus=args.hmm_cpus,
-        lof_only=args.lof_only,
+        lof_only=True,
     )
     results = pred.predict_records(records, pair=True)
 
@@ -101,12 +96,8 @@ def main() -> None:
     base_cols = [
         "gene", "wreck", "wreck_kind", "wreck_prior",
         "lof_score", "lof_sd", "lof_p", "lof_q",
+        "in_family", "nearest_train_gene", "ref_cosine",
     ]
-    if not args.lof_only:
-        base_cols.extend([
-            "mlof_score", "mlof_bin", "mlof_mean", "mlof_n_sites", "mlof_sd", "mlof_p", "mlof_q",
-        ])
-    base_cols.extend(["in_family", "nearest_train_gene", "ref_cosine"])
     with open(out_path, "w", newline="") as fh:
         writer = csv.writer(fh, delimiter="\t")
         writer.writerow(extra_cols + base_cols)

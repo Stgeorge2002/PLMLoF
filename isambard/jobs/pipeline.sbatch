@@ -1,8 +1,8 @@
 #!/bin/bash
-# Full pipeline on 1 GH200. Tables must already be in data/processed/{lof,mlof,...}
+# Full LoF pipeline on 1 GH200. Tables must already be in data/processed/lof/
 # (built on a laptop). This job does not download ProteinGym/CARD/GBFF.
 # 1 GPU-hour = 0.25 NHR. Do not add --exclusive.
-# --mem=0 takes the host RAM attached to this GH200 (needed for 650M site windows).
+# --mem=0 takes the host RAM attached to this GH200.
 
 #SBATCH --job-name=plmlof-pipeline
 #SBATCH --nodes=1

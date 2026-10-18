@@ -22,7 +22,7 @@ the same convention as examples/blaOXA1.
 
 Sequences are DNA/CDS (not protein): ESM2 still only ever embeds translated
 protein internally, but keeping DNA lets plmlof.wreck detect true
-frameshifts/indels and lets the nucleotide features reach the GoF heads.
+frameshifts/indels.
 
 Usage:
 

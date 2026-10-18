@@ -19,7 +19,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from plmlof.metrics import gene_prior_collapse
 from plmlof.predictor import Predictor
 
 logger = logging.getLogger(__name__)
@@ -47,7 +46,7 @@ def main() -> None:
 
     import torch
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    pred = Predictor(args.model_dir, device=device)
+    pred = Predictor(args.model_dir, device=device, lof_only=True)
     rows = pred.predict_fasta(args.reference, args.variants)
     df = pd.DataFrame(rows)
 
@@ -63,19 +62,6 @@ def main() -> None:
         rho_raw = _spearman(df["lof_score"].to_numpy(), df["cc"].to_numpy())
         print(f"Dewachter Spearman(lof_score, -CC) = {rho:.4f}")
         print(f"Dewachter Spearman(lof_score,  CC) = {rho_raw:.4f}")
-        if "mlof_score" in df.columns:
-            rho_m = _spearman(df["mlof_score"].to_numpy(), -df["cc"].to_numpy())
-            print(f"Dewachter Spearman(mlof_score, -CC) = {rho_m:.4f}")
-        collapse = gene_prior_collapse(
-            df["lof_score"].to_numpy(),
-            df["gene"].astype(str).str.replace(r"_.*", "", regex=True).tolist(),
-            df["cc"].to_numpy() if "cc" in df.columns else None,
-        )
-        print(f"collapse_fraction={collapse['collapse_fraction']:.3f}  (gene-prior fail if high)")
-        if "growth_gof_call" in df.columns:
-            print(f"growth GoF calls: {int(df['growth_gof_call'].sum())}  (should be ~0)")
-        if "amr_gof_call" in df.columns:
-            print(f"AMR GoF calls: {int(df['amr_gof_call'].sum())}")
 
     if args.output:
         df.to_csv(args.output, sep="\t", index=False)

@@ -1,14 +1,16 @@
 # PLMLoF
 
-Bacterial **LoF score** for protein alleles (FASTA in), plus two rare flags (growth-fitness, resistance SNP). Not a 3-class LoF/WT/GoF softmax. Not Snippy. Not genome-wide GoF.
-
-Clear wrecks (stop / frameshift / large indel) are a **rule**. HMMER (high-confidence, non-overlapping Pfam) grades how hard that rule is by **domain impact** — how many domains and how much domain mass the wreck destroys; pure C-terminal tails that leave domains intact stay low. The LoF head compares **reference vs allele** pooled ESM2 (identity → ~0). Missense damage is MLoF’s job. Each head also emits ensemble ± and an empirical p-value vs a WT-like null.
+Bacterial **LoF score** for protein alleles (FASTA in). Comparative: the head
+contrasts **reference vs allele** pooled ESM2-35M (identity → ~0). Clear wrecks
+(stop / frameshift / large indel) are a **rule**; MMseqs×Pfam (or a last-10%
+tail proxy) grades how hard that rule is by **domain impact**. Each score also
+carries ensemble ± and an empirical p-value vs a WT-like null.
 
 **Data is downloaded on your laptop. Isambard only embeds, trains, and evaluates.**
 
 ---
 
-## 1. Laptop — build training tables (no GPU)
+## 1. Laptop — build LoF training tables (no GPU)
 
 From the repo root (needs `pandas`, `pyarrow`, `biopython`; GPU is not required):
 
@@ -18,12 +20,10 @@ bash scripts/prepare_local.sh
 
 This:
 
-1. Downloads ProteinGym substitutions → `data/processed/proteingym_substitutions.parquet`
-2. Builds CARD/OF GoF source → `data/processed/gof_growth_amr.parquet`
-3. Downloads ~150 complete bacterial GBFFs and writes synthetic wrecks → `data/processed/synthetic_lof.parquet`
-4. Writes **residue-held-out** tables (MLoF also writes `protein_test.parquet` for never-trained genes) under `data/processed/{lof,mlof,growth_gof,amr_gof}/`
+1. Downloads ~150 complete bacterial GBFFs and writes synthetic wrecks → `data/processed/synthetic_lof.parquet`
+2. Writes residue/species-held-out tables under `data/processed/lof/`
 
-To grade synthetic wrecks with domain coordinates (MMseqs2 × Pfam-A seeds — fast approx, enough for LoF priors):
+To grade synthetic wrecks with domain coordinates (MMseqs2 × Pfam-A seeds):
 
 ```bash
 conda install -c bioconda mmseqs2
@@ -34,7 +34,9 @@ Uses `mmseqs easy-search` against Pfam seed FASTA, then keeps high-confidence
 non-overlapping query spans. Exact HMMER/Pfam-GA remains available via
 `annotate_domains.py --backend hmmer` if you ever need it.
 
-Without Pfam, the last 10% of each ORF is the tail proxy so C-terminal nonsense is not labelled `lof_score = 1.0`. Delete `data/processed/synthetic_lof.parquet` to rebuild after adding a domain map.
+Without Pfam, the last 10% of each ORF is the tail proxy so C-terminal nonsense
+is not labelled `lof_score = 1.0`. Delete `data/processed/synthetic_lof.parquet`
+to rebuild after adding a domain map.
 
 If GBFFs already exist:
 
@@ -47,7 +49,7 @@ bash scripts/prepare_local.sh --skip-genomes
 Copy tables to the cluster (parquet is gitignored):
 
 ```bash
-rsync -avP data/processed/{lof,mlof,growth_gof,amr_gof} HOST:/projects/b6bh/tbea20.b6bh/PLMLoF/data/processed/
+rsync -avP data/processed/lof HOST:/projects/b6bh/tbea20.b6bh/PLMLoF/data/processed/
 ```
 
 Do **not** run `prepare_local.sh` on an Isambard login node.
@@ -70,13 +72,13 @@ Cheap GPU check (ESM2-8M + TaskNet, no training data, ≤ ~0.08 NHR):
 bash isambard/submit.sh smoke
 ```
 
-Full venv + ESM2-35M (LoF) + ESM2-650M (MLoF/GoF):
+Full venv + ESM2-35M (LoF):
 
 ```bash
 bash isambard/submit.sh setup
 ```
 
-Pipeline (1 GH200, up to 24 h). **Fails immediately if `data/processed/lof/` is missing** — it will not download ProteinGym.
+Pipeline (1 GH200, up to 24 h). **Fails immediately if `data/processed/lof/` is missing**.
 
 ```bash
 bash isambard/submit.sh pipeline
@@ -87,7 +89,7 @@ tail -f "$SCRATCHDIR/plmlof/logs/"plmlof-pipeline-*.out
 Checkpoints:
 
 ```text
-$PLMLOF_ROOT/outputs/{lof,mlof,growth_gof,amr_gof}/seed*/checkpoints/model_best.pt
+$PLMLOF_ROOT/outputs/lof/seed*/checkpoints/model_best.pt
 ```
 
 Other job flags:
@@ -144,7 +146,7 @@ python scripts/predict.py \
   --device cuda
 ```
 
-Alignment-free LoF (no reference pair; loads ESM2-35M only):
+Alignment-free LoF (no reference pair; still loads ESM2-35M):
 
 ```bash
 python scripts/predict.py --model "$PLMLOF_OUTPUT_DIR" --proteins alleles.faa --device cuda
@@ -161,7 +163,8 @@ their `plmlof_input.tar*` / `best-models.tar*` transfer archives, and generated
 (including JSON metadata) separately with rsync; example Python scripts remain
 trackable.
 
-Columns include `lof_score`, `lof_sd`, `lof_p`, `lof_q`, `mlof_score`, `mlof_bin` (0 / 0.40 / 0.70 display), `in_family`, wreck flags, and growth/AMR GoF probabilities + calls.
+Output columns: `lof_score`, `lof_sd`, `lof_p`, `lof_q`, wreck flags, and
+`in_family` / nearest-train cosine.
 
 Held-out Dewachter exam (never in training):
 
@@ -176,20 +179,14 @@ python scripts/evaluate_dewachter.py \
 
 ---
 
-## 4. Heads
+## 4. LoF head
 
 | Head | Encoder | Target | Call |
 |------|---------|--------|------|
 | LoF | ESM2-35M pooled **ref↔var** | wreck `lof_score` ∈ [0, 1] from domain impact; identity ~0 | daily score; `wreck_grade` is the overlay |
-| MLoF | ESM2-650M **at the mutated residue** | continuous damage from DMS z; RankNet within protein | score + `mlof_bin`; not a wreck caller |
-| Growth GoF | ESM2-650M pooled | P(z ≥ +2 on OrganismalFitness growth) | only if p≥0.90 **and** in-family **and** empirical p<0.05, and only if eval is caller-ready |
-| AMR GoF | ESM2-650M pooled | P(CARD-like resistance SNP on a **known** family) | same conservative rule |
 
-MLoF `test` is new sites of proteins seen in train. `protein_test` is held-out proteins. Checkpoint on **within-gene Spearman**; gene-prior collapse is a hard fail.
-
-After changing tables or the site embedder, delete `$PLMLOF_EMB_DIR` (or the task subdir) so precompute does not reuse pooled-only caches.
-
-GB1 binding and Tsuboyama stability are **not** GoF training labels; they are MLoF missense-damage signal.
+After changing tables or the embedder, delete `$PLMLOF_EMB_DIR/lof` so precompute
+does not reuse stale caches.
 
 ---
 
@@ -204,10 +201,9 @@ pytest tests/ -v
 
 ## Do not
 
-- Download ProteinGym / CARD / RefSeq inside `isambard/pipeline.sh`
+- Download RefSeq / Pfam inside `isambard/pipeline.sh`
 - Copy the repo or HuggingFace cache into `$HOME`
 - Run `setup.sh` / `pipeline.sh` on a login node
 - Train on Dewachter
-- Reuse old MLoF embedding caches (pooled-only). Delete `$PLMLOF_EMB_DIR/mlof` after this change
 - Treat empirical p as P(the protein is dead)
-- Score Panaroo serotype swaps or missing plasmids as missense LoF
+- Score Panaroo serotype swaps or missing plasmids as LoF

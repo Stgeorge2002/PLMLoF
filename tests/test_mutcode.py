@@ -49,7 +49,7 @@ class TestApplyEdits:
 
     def test_insertion_before_index(self):
         # POS trim example: insert AA before index 5 on ACGTACGT → ACGTA AACGT
-        assert apply_edits("ACGTACGT", '[[5,0,"AA"]]') == "ACGTAAAACGT"
+        assert apply_edits("ACGTACGT", '[[5,0,"AA"]]') == "ACGTAAACGT"
 
     def test_deletion(self):
         # Anchored deletion example: [5,1,""] on ACGTACGT → ACGTAGT
@@ -103,7 +103,7 @@ class TestReconstruct:
             '[[5,0,"AA"]]',
             target_length=10,
         )
-        assert out == "ACGTAAAACGT"
+        assert out == "ACGTAAACGT"
 
     def test_bad_target_length(self):
         with pytest.raises(MutCodeError, match="target_length"):
@@ -117,10 +117,10 @@ class TestReconstruct:
             ref,
             '[[5,0,"AA"]]',
             reference_sha256=sha256_seq(ref),
-            target_sha256=sha256_seq("ACGTAAAACGT"),
+            target_sha256=sha256_seq("ACGTAAACGT"),
             target_length=10,
         )
-        assert out == "ACGTAAAACGT"
+        assert out == "ACGTAAACGT"
 
     def test_wrong_reference_sha_rejected(self):
         with pytest.raises(MutCodeError, match="SHA-256"):
