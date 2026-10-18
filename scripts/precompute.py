@@ -1,8 +1,8 @@
 """Pre-compute ESM2 embeddings for task splits.
 
-LoF uses ESM2-35M (pooled allele). MLoF/GoF share ESM2-650M; MLoF also
-banks a 5-residue window at each substitution plus BLOSUM chemistry,
-unmasked ESM2 log-odds, and Pfam in-domain bits.
+LoF uses ESM2-35M pooled ref+var (comparative head). MLoF/GoF share
+ESM2-650M; MLoF also banks a 5-residue window at each substitution plus
+BLOSUM chemistry, unmasked ESM2 log-odds, and Pfam in-domain bits.
 
     python scripts/precompute.py \
         --data-dir data/processed \

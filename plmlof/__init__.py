@@ -1,4 +1,4 @@
-"""PLMLoF: alignment-free LoF, missense-damage MLoF, conservative GoF flags."""
+"""PLMLoF: comparative LoF, missense-damage MLoF, conservative GoF flags."""
 
 from __future__ import annotations
 

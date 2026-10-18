@@ -1,4 +1,4 @@
-"""Task nets: alignment-free LoF, site-level MLoF, conservative GoF."""
+"""Task nets: comparative LoF, site-level MLoF, conservative GoF."""
 
 from __future__ import annotations
 
@@ -110,13 +110,13 @@ class SiteCompare(nn.Module):
 class TaskNet(nn.Module):
     """One head per task.
 
-    ``lof`` is alignment-free: it scores a single protein (the isolate allele)
-    from pooled ESM2. No ref, no pair features, no MSA.
+    ``lof`` compares pooled ref vs var (ComparisonModule + LoF score head) so
+    identity alleles score near 0 and wrecks score from the allele delta.
 
     ``mlof`` compares residue windows at the substitution. Pooled ref is not
     an input, so gene identity cannot dominate.
 
-    GoF still uses pooled ComparisonModule (missense SNPs plus wreck negatives).
+    GoF uses pooled ComparisonModule with a binary logit head.
     """
 
     def __init__(
@@ -138,7 +138,7 @@ class TaskNet(nn.Module):
             raise ValueError(f"Unknown task: {task}")
         self.task = task
         self.hidden_size = hidden_size
-        self.alignment_free = task == "lof"
+        self.alignment_free = False  # LoF is ref↔var comparative
         self.uses_sites = task == "mlof"
         self.site_window = int(site_window)
         self.chem_dim = int(chem_dim) if self.uses_sites else 0
@@ -149,11 +149,6 @@ class TaskNet(nn.Module):
         self.chem_norm: nn.LayerNorm | None = None
         self.ablate_logodds = False
         self.ablate_domain = False
-
-        if self.alignment_free:
-            self.seq_norm = nn.LayerNorm(hidden_size * 2)
-            self.head = LofScoreHead(hidden_size * 2, hidden_dim=head_hidden, dropout=dropout)
-            return
 
         if self.uses_sites:
             self.site_compare = SiteCompare(hidden_size, dropout=dropout, window=self.site_window)
@@ -172,7 +167,10 @@ class TaskNet(nn.Module):
         )
         self.feature_norm = nn.LayerNorm(num_nuc_features)
         input_size = self.comparison.output_size + num_nuc_features
-        self.head = BinaryLogitHead(input_size, hidden_dim=head_hidden, dropout=dropout)
+        if task == "lof":
+            self.head = LofScoreHead(input_size, hidden_dim=head_hidden, dropout=dropout)
+        else:
+            self.head = BinaryLogitHead(input_size, hidden_dim=head_hidden, dropout=dropout)
 
     def _prep_chem(self, site_chem: torch.Tensor | None, batch: int, like: torch.Tensor) -> torch.Tensor | None:
         if not self.chem_dim:
@@ -211,8 +209,6 @@ class TaskNet(nn.Module):
         site_chem2: torch.Tensor | None = None,
         n_sites: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if self.alignment_free:
-            return self.head(self.seq_norm(torch.cat([var_mean, var_max], dim=-1)))
         if self.uses_sites:
             if site_ref is None or site_var is None:
                 raise ValueError(

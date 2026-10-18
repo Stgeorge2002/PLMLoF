@@ -1,14 +1,9 @@
 """Generate synthetic LoF protein pairs from bacterial GBFFs.
 
-Stops / frameshifts / indels are rules. If Pfam coordinates are available,
-the prior is graded by where the wreck sits relative to domains:
-
-  before or inside a domain  → sure (~1.0)
-  strictly after last domain → tail (~0.4)
-  in-domain missense vs extra-domain conservative missense is the other contrast
-
-Without HMMER, the last 10% of the ORF is the tail proxy (no NMD in bacteria;
-the question is still domain completeness).
+Stops / frameshifts / indels are rules. Pfam domains (HC, non-overlapping)
+grade how hard the label is by **domain impact** — how many domains and how
+much domain residue mass the wreck destroys. Pure C-terminal tails that leave
+every domain intact stay low. Missense is not generated for this head.
 
     python data/scripts/generate_synthetic_lof.py \
         --gbff-dir data/raw/refseq_gbff \
@@ -33,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    p = argparse.ArgumentParser(description="Synthetic bacterial LoF pairs (domain-graded)")
+    p = argparse.ArgumentParser(description="Synthetic bacterial LoF pairs (domain-impact graded)")
     p.add_argument("--gbff-dir", type=Path, required=True)
     p.add_argument("--out", type=Path, default=Path("data/processed/synthetic_lof.parquet"))
     p.add_argument("--domains", type=Path, default=None, help="pfam_domains.parquet from annotate_domains.py")
@@ -102,7 +97,7 @@ def main() -> None:
     logger.info("CDS with Pfam spans: %s / %s", n_with_domains, n_cds)
     logger.info("By wreck_type:\n%s", df["wreck_type"].value_counts().to_string())
     logger.info("By geometry:\n%s", df["geometry"].value_counts().to_string())
-    logger.info("lof_score mean=%.3f  (tail types should sit well below 1.0)", df["lof_score"].mean())
+    logger.info("lof_score mean=%.3f  (pure tails should sit well below in-domain)", df["lof_score"].mean())
     logger.info("Species: %s", df["species"].nunique())
 
 

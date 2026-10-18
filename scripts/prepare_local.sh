@@ -20,6 +20,7 @@ SKIP_GENOMES=0
 WITH_PFAM=0
 GBFF_DIR="${ROOT}/data/raw/refseq_gbff"
 HMM_PATH="${ROOT}/data/raw/pfam/Pfam-A.hmm.gz"
+PFAM_SEED_FAA="${ROOT}/data/raw/pfam/Pfam-A.seed.faa"
 DOMAINS_PATH="${ROOT}/data/processed/pfam_domains.parquet"
 N_GENOMES=150
 CPUS="${CPUS:-20}"
@@ -79,21 +80,22 @@ elif [[ "$SKIP_GENOMES" -eq 1 && -z "$(ls -A "$GBFF_DIR" 2>/dev/null | head -1)"
     echo "  --skip-genomes set and no GBFFs — LoF wreck channel will be empty"
 else
     if [[ "$WITH_PFAM" -eq 1 && ! -f "$DOMAINS_PATH" ]]; then
-        if [[ ! -f "$HMM_PATH" ]]; then
-            echo "  Downloading Pfam-A.hmm.gz (~1 GB) → $HMM_PATH"
-            "$PYTHON" data/scripts/download_pfam.py --out "$HMM_PATH"
-        fi
-        if "$PYTHON" -c "import pyhmmer" 2>/dev/null || command -v hmmscan >/dev/null 2>&1; then
-            echo "  Annotating unique CDS with HMMER/Pfam"
+        if command -v mmseqs >/dev/null 2>&1; then
+            if [[ ! -f "$PFAM_SEED_FAA" ]]; then
+                echo "  Downloading Pfam-A.seed.gz (~185 MB) → seed FASTA for MMseqs"
+                "$PYTHON" data/scripts/download_pfam.py --kind seed
+            fi
+            echo "  Annotating unique CDS with MMseqs2 × Pfam seeds"
             "$PYTHON" data/scripts/annotate_domains.py \
                 --gbff-dir "$GBFF_DIR" \
-                --hmm "$HMM_PATH" \
+                --backend mmseqs \
+                --target "$PFAM_SEED_FAA" \
                 --out "$DOMAINS_PATH" \
-                --cpus "$CPUS" \
-                --max-proteins 25000
+                --threads "$CPUS" \
+                --max-proteins 0
         else
-            echo "  pyhmmer/hmmscan missing — last 10% of each ORF is the tail proxy" >&2
-            echo "  pip install pyhmmer   # or install HMMER 3" >&2
+            echo "  mmseqs missing — last 10% of each ORF is the tail proxy" >&2
+            echo "  conda install -c bioconda mmseqs2" >&2
         fi
     fi
     GEN_ARGS=(--gbff-dir "$GBFF_DIR" --out data/processed/synthetic_lof.parquet)

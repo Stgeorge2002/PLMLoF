@@ -1,4 +1,4 @@
-"""Inference: alignment-free LoF, pairwise MLoF, two GoF ensembles."""
+"""Inference: comparative LoF (ref↔var), pairwise MLoF, two GoF ensembles."""
 
 from __future__ import annotations
 
@@ -57,6 +57,12 @@ def _load_net(ckpt_path: Path, device: torch.device) -> TaskNet:
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     cfg = ckpt["model_config"]
     head_hidden, dropout = _head_hparams(ckpt)
+    sd = ckpt["state_dict"]
+    if ckpt["task"] == "lof" and any(k.startswith("seq_norm.") for k in sd):
+        raise RuntimeError(
+            f"{ckpt_path} is an alignment-free LoF checkpoint. "
+            "Retrain the LoF head (ref↔var ComparisonModule) and point --model at the new ensemble."
+        )
     extra: dict = {}
     if ckpt["task"] == "mlof":
         window, chem = _mlof_arch(ckpt)
@@ -75,7 +81,7 @@ def _load_net(ckpt_path: Path, device: torch.device) -> TaskNet:
     )
     net.ablate_logodds = bool(cfg.get("ablate_logodds", False))
     net.ablate_domain = bool(cfg.get("ablate_domain", False))
-    net.load_state_dict(ckpt["state_dict"])
+    net.load_state_dict(sd)
     net.eval()
     return net.to(device)
 
@@ -346,14 +352,25 @@ class Predictor:
             pooled: dict[str, tuple] = {}
             gof_tasks = [t for t in tasks if t not in {"lof", "mlof"}]
             mlof_pack: dict[str, np.ndarray] | None = None
-            if "lof" in tasks:
-                lof_esm = self.task_esm["lof"]
-                var_mean, var_max = self._embed_seqs(vars_, lof_esm)
-                zeros = torch.zeros(len(batch), 12, device=self.device)
-                pooled["lof"] = (var_mean, var_max, var_mean, var_max, zeros, None, None)
-            if gof_tasks:
-                pair_esm = self.task_esm[gof_tasks[0]]
-                pooled["_pair"] = self._embed_pairs(refs, vars_, pair_esm)
+            # Exact protein identity → LoF score 0 (no delta to score).
+            identical = np.array(
+                [
+                    r.replace("*", "") == v.replace("*", "")
+                    for r, v in zip(refs, vars_)
+                ],
+                dtype=bool,
+            )
+            if "lof" in tasks or gof_tasks:
+                pair_esm = self.task_esm.get("lof") or self.task_esm[gof_tasks[0]]
+                if "lof" in tasks and gof_tasks and self.task_esm.get("lof") != self.task_esm.get(gof_tasks[0]):
+                    pooled["lof"] = self._embed_pairs(refs, vars_, self.task_esm["lof"])
+                    pooled["_pair"] = self._embed_pairs(refs, vars_, self.task_esm[gof_tasks[0]])
+                elif "lof" in tasks:
+                    pooled["lof"] = self._embed_pairs(refs, vars_, self.task_esm["lof"])
+                    if gof_tasks:
+                        pooled["_pair"] = pooled["lof"]
+                else:
+                    pooled["_pair"] = self._embed_pairs(refs, vars_, pair_esm)
             if "mlof" in tasks:
                 mlof_pack = self._mlof_ensemble(refs, vars_, self.task_esm["mlof"])
 
@@ -370,12 +387,19 @@ class Predictor:
                     ref_mean, ref_max, var_mean, var_max, nuc, site_ref, site_var = pooled["lof"]
                 else:
                     ref_mean, ref_max, var_mean, var_max, nuc, site_ref, site_var = pooled["_pair"]
-                measures[task] = self._ensemble_measure(
+                mean, sd = self._ensemble_measure(
                     task, ref_mean, ref_max, var_mean, var_max, nuc,
                     site_ref=site_ref, site_var=site_var,
                 )
+                if task == "lof" and identical.any():
+                    mean = mean.copy()
+                    sd = sd.copy()
+                    mean[identical] = 0.0
+                    sd[identical] = 0.0
+                measures[task] = (mean, sd)
                 if task in self.galleries:
-                    query = var_mean if task == "lof" else ref_mean
+                    # LoF applicability: is the reference in the training family gallery?
+                    query = ref_mean if task == "lof" else ref_mean
                     family[task] = in_family_flags(query.cpu(), self.galleries[task], self.in_family_threshold)
 
             pvals: dict[str, np.ndarray] = {}
@@ -384,6 +408,8 @@ class Predictor:
                     in_fam = family[task][0] if task in family else np.ones(len(batch), dtype=bool)
                     p = empirical_p(mean, self.nulls[task])
                     p = np.where(in_fam, p, np.nan)
+                    if task == "lof" and identical.any():
+                        p = np.where(identical, 1.0, p)
                     pvals[task] = p
                 else:
                     pvals[task] = np.full(len(batch), np.nan)

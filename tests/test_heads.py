@@ -144,7 +144,27 @@ class TestDomainGeometry:
         early, _ = lof_prior("stop", 40, 100, ())
         tail, _ = lof_prior("stop", 96, 100, ())
         assert early == 1.0
-        assert tail == 0.4
+        assert tail < 0.4
+
+    def test_pure_tail_below_domain_hit(self):
+        domains = [(10, 40), (50, 80)]
+        early, _ = lof_prior("stop", 20, 100, domains)
+        tail, _ = lof_prior("stop", 90, 100, domains)
+        assert early == 1.0
+        assert tail < 0.4
+        assert early > tail
+
+    def test_more_domains_dropped_hurts_more(self):
+        domains = [(10, 30), (40, 60), (70, 90)]
+        one, _ = lof_prior(
+            "domain_drop", 10, 100, domains,
+            last_affected=30, n_domains_dropped=1, n_domains_remaining=2,
+        )
+        all_d, _ = lof_prior(
+            "domain_drop", 10, 100, domains,
+            last_affected=90, n_domains_dropped=3, n_domains_remaining=0,
+        )
+        assert all_d > one
 
     def test_sample_events_mix_sure_and_tail(self):
         rng = random.Random(0)
@@ -155,6 +175,7 @@ class TestDomainGeometry:
         assert evs
         assert any(e.lof_score >= 0.8 for e in evs)
         assert any(e.lof_score <= 0.5 for e in evs)
+        assert not any("missense" in e.kind for e in evs)
 
     def test_parse_domtblout(self, tmp_path):
         line = (
@@ -167,6 +188,50 @@ class TestDomainGeometry:
         assert rows[0]["protein_id"] == "abc123"
         assert rows[0]["start"] == 3
         assert rows[0]["end"] == 95
+
+    def test_nonoverlapping_keeps_best_score(self):
+        from plmlof.hmmer import finalize_domain_hits
+
+        hits = [
+            {"protein_id": "p", "hmm_name": "A", "evalue": 1e-10, "score": 50.0, "start": 1, "end": 50},
+            {"protein_id": "p", "hmm_name": "B", "evalue": 1e-8, "score": 80.0, "start": 40, "end": 90},
+            {"protein_id": "p", "hmm_name": "C", "evalue": 1e-3, "score": 100.0, "start": 100, "end": 120},
+            {"protein_id": "p", "hmm_name": "D", "evalue": 1e-12, "score": 40.0, "start": 130, "end": 150},
+        ]
+        out = finalize_domain_hits(hits, max_evalue=1e-5)
+        names = {h["hmm_name"] for h in out}
+        assert "C" not in names  # fails e-value
+        assert "B" in names  # wins overlap with A
+        assert "A" not in names
+        assert "D" in names
+
+    def test_pfam_accession_parse(self):
+        from plmlof.mmseqs_domains import pfam_accession
+
+        assert pfam_accession("A0A060YUX3_9BACT/26-209 PF13671.1;Methyltransf_25;") == "PF13671"
+        assert pfam_accession("PF00001.21") == "PF00001"
+
+    def test_map_span_same_length(self):
+        from plmlof.seqcluster import map_span_to_member
+
+        rep = "M" + "A" * 99
+        mem = "M" + "A" * 98 + "V"
+        assert map_span_to_member(rep, mem, 10, 40) == (10, 40)
+
+    def test_expand_hits_copies_rep(self):
+        from plmlof.seqcluster import expand_hits_to_members
+
+        rep = "rep"
+        mem = "mem"
+        seqs = {rep: "M" + "A" * 99, mem: "M" + "A" * 99}
+        hits = [{
+            "protein_id": rep, "hmm_name": "PF1", "evalue": 1e-20,
+            "score": 100.0, "start": 10, "end": 50,
+        }]
+        out = expand_hits_to_members(hits, {rep: rep, mem: rep}, seqs)
+        by = {h["protein_id"]: h for h in out}
+        assert rep in by and mem in by
+        assert by[mem]["start"] == 10 and by[mem]["end"] == 50
 
 
 class TestEmpiricalP:
@@ -288,18 +353,22 @@ class TestTaskNet:
         assert p.shape == (b,)
         assert torch.all(p >= 0) and torch.all(p <= 1)
 
-    def test_lof_is_alignment_free(self):
+    def test_lof_uses_ref_var_comparison(self):
         net = TaskNet(hidden_size=16, task="lof", pool_strategy="mean_max")
         net.eval()
         torch.manual_seed(0)
         b, d = 2, 16
+        ref_mean, ref_max = torch.randn(b, d), torch.randn(b, d)
         var_mean, var_max = torch.randn(b, d), torch.randn(b, d)
         nuc = torch.zeros(b, 12)
-        nuc[:, 0] = 1.0
         with torch.no_grad():
-            a = net.forward_from_pooled(torch.randn(b, d), torch.randn(b, d), var_mean, var_max, nuc)
-            b_out = net.forward_from_pooled(torch.zeros(b, d), torch.zeros(b, d), var_mean, var_max, torch.zeros_like(nuc))
-        assert torch.allclose(a, b_out, atol=1e-6)
+            delta = net.forward_from_pooled(ref_mean, ref_max, var_mean, var_max, nuc)
+            identity = net.forward_from_pooled(ref_mean, ref_max, ref_mean, ref_max, torch.zeros_like(nuc))
+            other_ref = net.forward_from_pooled(torch.randn(b, d), torch.randn(b, d), var_mean, var_max, nuc)
+        assert delta.shape == (b,)
+        assert not torch.allclose(delta, other_ref, atol=1e-5)
+        # Identity path is a distinct feature regime (zero diff); not equal to random delta.
+        assert not torch.allclose(delta, identity, atol=1e-5)
 
     def test_mlof_uses_sites_not_pool(self):
         net = TaskNet(hidden_size=16, task="mlof", pool_strategy="mean_max")

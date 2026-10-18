@@ -16,14 +16,16 @@ from plmlof.gbff import AA, MAX_AA
 from plmlof.utils.sequence_utils import translate_dna
 
 # 1-based protein coordinates. Priors are labels, not biology.
+# Scores scale with how many domains / how much domain mass is destroyed.
 PRIOR_SURE = 1.00
 PRIOR_INDOMAIN_INDEL = 0.90
 PRIOR_DOMAIN_DROP = 0.70
 PRIOR_INDOMAIN_MISSENSE = 0.70
-PRIOR_TAIL_STOP = 0.40
-PRIOR_NTERM_INDEL = 0.30
-PRIOR_TAIL_WEAK = 0.20
-PRIOR_EXTRA_MISSENSE = 0.15
+PRIOR_TAIL_STOP = 0.35  # max when zero domain residues are hit (long pure tail)
+PRIOR_TAIL_MIN = 0.05   # tiny pure-tail indel
+PRIOR_NTERM_INDEL = 0.25  # indel entirely before first domain (domains intact)
+PRIOR_TAIL_WEAK = 0.15
+PRIOR_EXTRA_MISSENSE = 0.15  # unused in LoF synth; kept for API compat
 SURE_MIN = 0.80
 TAIL_FRACTION = 0.10
 
@@ -114,6 +116,40 @@ def _unknown_geom(pos: int, protein_len: int) -> str:
     return "unknown_tail" if in_c_terminal_tail(pos, protein_len, ()) else "unknown_early"
 
 
+def _domains_fully_covered(start: int, end: int, domains: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
+    return [(s, e) for s, e in domains if start <= s and e <= end]
+
+
+def _domains_overlapping(start: int, end: int, domains: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
+    return [(s, e) for s, e in domains if not (end < s or start > e)]
+
+
+def _domain_residue_count(domains: Sequence[tuple[int, int]]) -> int:
+    return sum(max(0, e - s + 1) for s, e in domains)
+
+
+def _overlap_len(a0: int, a1: int, b0: int, b1: int) -> int:
+    lo = max(a0, b0)
+    hi = min(a1, b1)
+    return max(0, hi - lo + 1)
+
+
+def _affected_domain_residues(
+    start: int,
+    end: int,
+    domains: Sequence[tuple[int, int]],
+) -> int:
+    return sum(_overlap_len(start, end, s, e) for s, e in domains)
+
+
+def _pure_tail_score(affected_len: int, protein_len: int) -> float:
+    """Events that hit zero domain residues stay low; longer tails a bit higher."""
+    if protein_len <= 0 or affected_len <= 0:
+        return PRIOR_TAIL_MIN
+    frac = min(1.0, affected_len / max(protein_len, 1))
+    return PRIOR_TAIL_MIN + (PRIOR_TAIL_STOP - PRIOR_TAIL_MIN) * min(1.0, frac / 0.20)
+
+
 def lof_prior(
     event: str,
     first_affected: int,
@@ -123,65 +159,102 @@ def lof_prior(
     n_domains_dropped: int = 0,
     n_domains_remaining: int | None = None,
 ) -> tuple[float, str]:
-    """Map a wreck onto the synthetic LoF prior.
+    """Map a wreck onto the synthetic LoF prior from domain impact.
 
     event is one of: stop, frameshift, indel, domain_drop, missense.
+
+    Score tracks how many domains are hit / fully removed and what fraction of
+    domain residue mass is destroyed. Pure C-terminal tails that leave every
+    domain intact stay low.
     """
-    geom = classify_position(first_affected, domains) if domains else _unknown_geom(first_affected, protein_len)
     last = last_affected if last_affected is not None else first_affected
-    n_dom = len(domains)
+    if first_affected < 1:
+        first_affected = 1
+    if last < first_affected:
+        last = first_affected
+    if protein_len < 1:
+        return PRIOR_SURE, "unknown"
 
     if event in {"stop", "frameshift"}:
-        if geom in {"tail", "unknown_tail"}:
-            return PRIOR_TAIL_STOP, geom
-        return PRIOR_SURE, geom
+        aff_start, aff_end = first_affected, protein_len
+    else:
+        aff_start, aff_end = first_affected, last
+
+    geom = (
+        classify_position(first_affected, domains)
+        if domains
+        else _unknown_geom(first_affected, protein_len)
+    )
 
     if event == "missense":
+        # Not emitted in LoF synthetic generation; kept for callers/tests.
         if geom == "in_domain":
             return PRIOR_INDOMAIN_MISSENSE, geom
         return PRIOR_EXTRA_MISSENSE, geom if geom != "unknown_early" else "unknown_extra"
 
+    if not domains:
+        if geom in {"tail", "unknown_tail"}:
+            return _pure_tail_score(aff_end - aff_start + 1, protein_len), geom
+        return PRIOR_SURE, geom
+
+    n_dom = len(domains)
+    total_dom_res = max(_domain_residue_count(domains), 1)
+    hit = _domains_overlapping(aff_start, aff_end, domains)
+    full = _domains_fully_covered(aff_start, aff_end, domains)
+    hit_res = _affected_domain_residues(aff_start, aff_end, domains)
+    n_hit = len(hit)
+    n_full = len(full)
+
     if event == "domain_drop":
+        dropped = n_domains_dropped if n_domains_dropped > 0 else max(n_full, 1)
         remaining = n_domains_remaining
         if remaining is None:
-            remaining = max(n_dom - n_domains_dropped, 0)
-        if remaining <= 0 or n_dom <= 1:
+            remaining = max(n_dom - dropped, 0)
+        if remaining <= 0:
             return PRIOR_SURE, "in_domain"
-        return PRIOR_DOMAIN_DROP, "in_domain"
+        frac_n = dropped / max(n_dom, 1)
+        frac_res = hit_res / total_dom_res
+        score = 0.45 + 0.40 * frac_n + 0.15 * frac_res
+        return float(min(PRIOR_SURE, max(PRIOR_DOMAIN_DROP * 0.8, score))), "in_domain"
 
-    if domains:
-        last_end = last_domain_end(domains)
+    if n_hit == 0:
+        aff_len = aff_end - aff_start + 1
         first_start = first_domain_start(domains)
-        fully_after = first_affected > last_end
-        fully_before = last < first_start
-        dropped = _domains_fully_covered(first_affected, last, domains)
-        remaining = n_dom - len(dropped)
-        overlaps = _domains_overlapping(first_affected, last, domains)
-        if fully_after:
-            return PRIOR_TAIL_WEAK, "tail"
-        if dropped and remaining > 0:
-            return PRIOR_DOMAIN_DROP, "in_domain"
-        if overlaps:
-            return PRIOR_INDOMAIN_INDEL, "in_domain"
-        if fully_before:
+        last_end = last_domain_end(domains)
+        if first_start is not None and aff_end < first_start:
+            if event in {"stop", "frameshift"}:
+                return PRIOR_SURE, "pre_domain"
             return PRIOR_NTERM_INDEL, "pre_domain"
-        return PRIOR_INDOMAIN_INDEL, "linker"
+        if last_end is not None and aff_start > last_end:
+            return _pure_tail_score(aff_len, protein_len), "tail"
+        if geom in {"tail", "unknown_tail"}:
+            return _pure_tail_score(aff_len, protein_len), "tail"
+        return PRIOR_TAIL_MIN, "linker"
 
-    if geom in {"tail", "unknown_tail"}:
-        return PRIOR_TAIL_WEAK, geom
-    return PRIOR_SURE, geom
+    frac_res = hit_res / total_dom_res
+    frac_n = n_full / max(n_dom, 1) if n_full else n_hit / max(n_dom, 1)
 
+    if event in {"stop", "frameshift"}:
+        intact_res = _domain_residue_count(
+            [(s, e) for s, e in domains if e < first_affected]
+        )
+        if intact_res == 0:
+            return PRIOR_SURE, geom if geom != "unknown" else "in_domain"
+        destroyed = 1.0 - intact_res / total_dom_res
+        score = 0.55 + 0.45 * destroyed
+        return float(min(PRIOR_SURE, score)), geom
 
-def _domains_fully_covered(start: int, end: int, domains: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
-    return [(s, e) for s, e in domains if start <= s and e <= end]
-
-
-def _domains_overlapping(start: int, end: int, domains: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
-    return [(s, e) for s, e in domains if not (end < s or start > e)]
+    score = 0.40 + 0.45 * frac_res + 0.15 * frac_n
+    if n_full >= n_dom and n_dom > 0:
+        score = PRIOR_SURE
+    return float(min(PRIOR_SURE, max(0.40, score))), geom
 
 
 def load_domain_map(path: Path) -> dict[str, list[tuple[int, int]]]:
-    """protein_id → merged Pfam intervals (1-based inclusive)."""
+    """protein_id → sorted non-overlapping Pfam intervals (1-based inclusive).
+
+    Adjacent domains stay separate so priors can count how many are impacted.
+    """
     import pandas as pd
 
     df = pd.read_parquet(path)
@@ -191,8 +264,12 @@ def load_domain_map(path: Path) -> dict[str, list[tuple[int, int]]]:
         raise ValueError(f"{path} missing columns {missing}")
     out: dict[str, list[tuple[int, int]]] = {}
     for key, sub in df.groupby("protein_id"):
-        spans = list(zip(sub["start"].astype(int).tolist(), sub["end"].astype(int).tolist()))
-        out[str(key)] = merge_intervals(spans)
+        spans = sorted(
+            (int(s), int(e))
+            for s, e in zip(sub["start"].tolist(), sub["end"].tolist())
+            if int(e) >= int(s)
+        )
+        out[str(key)] = spans
     return out
 
 
@@ -239,14 +316,15 @@ class DomainIndex:
             for pid, _ in missing:
                 self._cache.setdefault(pid, [])
             return
-        from plmlof.hmmer import annotate_proteins
+        from plmlof.hmmer import annotate_proteins, finalize_domain_hits
 
-        hits = annotate_proteins(missing, self.hmm, cpus=self.cpus)
+        hits = finalize_domain_hits(annotate_proteins(missing, self.hmm, cpus=self.cpus))
         by: dict[str, list[tuple[int, int]]] = {}
         for hit in hits:
             by.setdefault(str(hit["protein_id"]), []).append((int(hit["start"]), int(hit["end"])))
         for pid, _ in missing:
-            self._cache[pid] = merge_intervals(by.get(pid, []))
+            # Already non-overlapping; keep domains separate (do not merge adjacent).
+            self._cache[pid] = sorted(by.get(pid, []), key=lambda se: se[0])
 
 
 @dataclass(frozen=True)
@@ -495,7 +573,11 @@ def sample_events(
     rng: random.Random,
     n: int = 3,
 ) -> list[WreckEvent]:
-    """Per CDS: at least one sure wreck, a tail event if a tail exists, and a contrast."""
+    """Per CDS: sure wreck, pure-tail wreck if possible, domain-drop contrast.
+
+    Extra-domain / random missense are not emitted — the LoF head is a wreck
+    comparator; missense damage belongs to MLoF.
+    """
     sure = [
         lambda: make_stop_pre_or_in(prot, domains, rng),
         lambda: make_frameshift_pre_or_in(prot, dna, domains, rng),
@@ -508,10 +590,9 @@ def sample_events(
         lambda: make_indel_tail(prot, domains, rng),
     ]
     contrast = [
-        lambda: make_missense_in_domain(prot, domains, rng),
-        lambda: make_missense_extra_domain(prot, domains, rng),
         lambda: make_domain_drop(prot, domains, rng),
-        lambda: make_heavy_missense(prot, rng),
+        lambda: make_indel_in_domain(prot, domains, rng),
+        lambda: make_stop_pre_or_in(prot, domains, rng),
     ]
     buckets = [sure, tail, contrast]
     rng.shuffle(buckets[0])

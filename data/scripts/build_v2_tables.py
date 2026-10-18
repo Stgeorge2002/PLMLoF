@@ -380,7 +380,7 @@ def _score_synthetic(rec) -> tuple[str, float, bool, bool, str]:
 
 
 def build_lof(syn: pd.DataFrame, species_split: dict[str, str], args) -> pd.DataFrame:
-    """Alignment-free wreck head. One protein sequence; no OF missense."""
+    """Comparative wreck head. Ref vs var pairs; no OF missense labels."""
     syn = cap_synthetic(syn, args.synthetic_cap, args.seed) if not syn.empty else syn
     syn_rows = []
     for rec in syn.itertuples(index=False):
@@ -458,7 +458,7 @@ def build_lof(syn: pd.DataFrame, species_split: dict[str, str], args) -> pd.Data
     id_df = pd.DataFrame(id_rows) if id_rows else pd.DataFrame(columns=COLS)
     lof = pd.concat([syn_df, id_df], ignore_index=True) if not syn_df.empty or not id_df.empty else pd.DataFrame(columns=COLS)
     n_wreck = int(lof["is_wreck"].sum()) if not lof.empty else 0
-    logger.info("LoF (alignment-free) rows=%s wrecks=%s", len(lof), n_wreck)
+    logger.info("LoF (comparative) rows=%s wrecks=%s", len(lof), n_wreck)
 
     null_bits = []
     if not lof.empty:
@@ -815,7 +815,7 @@ def main() -> None:
     manifest["tasks_written"] = want
 
     if "lof" in want:
-        logger.info("── LoF (alignment-free synthetic wrecks) ──")
+        logger.info("── LoF (comparative synthetic wrecks) ──")
         lof = build_lof(syn, species_split, args)
         write_task(lof, out / "lof")
         manifest["lof_rows"] = int(len(lof))

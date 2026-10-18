@@ -2,7 +2,7 @@
 
 Bacterial **LoF score** for protein alleles (FASTA in), plus two rare flags (growth-fitness, resistance SNP). Not a 3-class LoF/WT/GoF softmax. Not Snippy. Not genome-wide GoF.
 
-Clear wrecks (stop / frameshift / large indel) are a **rule**. HMMER grades how hard that rule is: early or in-domain = sure LoF (~1.0); a stop/frameshift strictly after the last Pfam hit is a C-terminal tail (~0.4), not a synthetic null. The network scores **missense** (in-domain vs extra-domain is the other contrast). Each head also emits ensemble ± and an empirical p-value vs a WT-like null.
+Clear wrecks (stop / frameshift / large indel) are a **rule**. HMMER (high-confidence, non-overlapping Pfam) grades how hard that rule is by **domain impact** — how many domains and how much domain mass the wreck destroys; pure C-terminal tails that leave domains intact stay low. The LoF head compares **reference vs allele** pooled ESM2 (identity → ~0). Missense damage is MLoF’s job. Each head also emits ensemble ± and an empirical p-value vs a WT-like null.
 
 **Data is downloaded on your laptop. Isambard only embeds, trains, and evaluates.**
 
@@ -23,12 +23,16 @@ This:
 3. Downloads ~150 complete bacterial GBFFs and writes synthetic wrecks → `data/processed/synthetic_lof.parquet`
 4. Writes **residue-held-out** tables (MLoF also writes `protein_test.parquet` for never-trained genes) under `data/processed/{lof,mlof,growth_gof,amr_gof}/`
 
-To grade synthetic wrecks with Pfam coordinates (~1 GB HMM download, needs `pyhmmer` or `hmmscan`):
+To grade synthetic wrecks with domain coordinates (MMseqs2 × Pfam-A seeds — fast approx, enough for LoF priors):
 
 ```bash
-pip install pyhmmer
+conda install -c bioconda mmseqs2
 bash scripts/prepare_local.sh --with-pfam
 ```
+
+Uses `mmseqs easy-search` against Pfam seed FASTA, then keeps high-confidence
+non-overlapping query spans. Exact HMMER/Pfam-GA remains available via
+`annotate_domains.py --backend hmmer` if you ever need it.
 
 Without Pfam, the last 10% of each ORF is the tail proxy so C-terminal nonsense is not labelled `lof_score = 1.0`. Delete `data/processed/synthetic_lof.parquet` to rebuild after adding a domain map.
 
@@ -176,7 +180,7 @@ python scripts/evaluate_dewachter.py \
 
 | Head | Encoder | Target | Call |
 |------|---------|--------|------|
-| LoF | ESM2-35M (pooled allele) | wreck `lof_score` ∈ [0, 1]; checkpoint on wreck AUROC | daily score; `wreck_grade` is the overlay |
+| LoF | ESM2-35M pooled **ref↔var** | wreck `lof_score` ∈ [0, 1] from domain impact; identity ~0 | daily score; `wreck_grade` is the overlay |
 | MLoF | ESM2-650M **at the mutated residue** | continuous damage from DMS z; RankNet within protein | score + `mlof_bin`; not a wreck caller |
 | Growth GoF | ESM2-650M pooled | P(z ≥ +2 on OrganismalFitness growth) | only if p≥0.90 **and** in-family **and** empirical p<0.05, and only if eval is caller-ready |
 | AMR GoF | ESM2-650M pooled | P(CARD-like resistance SNP on a **known** family) | same conservative rule |

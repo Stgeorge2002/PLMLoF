@@ -227,7 +227,8 @@ def main() -> None:
         if not bool(intact.any()):
             intact = torch.ones(len(train_full), dtype=torch.bool)
         idx = intact.nonzero(as_tuple=False).view(-1).tolist()
-        gal_mean = train_full.var_mean[intact]
+        # Comparative LoF: gallery is reference (WT) embeddings.
+        gal_mean = train_full.ref_mean[intact]
     else:
         miss = train_full.is_missense
         if not bool(miss.any()):
