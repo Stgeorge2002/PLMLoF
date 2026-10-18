@@ -148,16 +148,18 @@ def _coord_key(
     )
 
 
-def load_predictions(path: Path) -> dict[str, dict[str, str]]:
+def load_predictions(path: Path) -> tuple[dict[str, dict[str, str]], list[str]]:
     """record_id → prediction row (``gene`` column is the FASTA record_id)."""
     by_id: dict[str, dict[str, str]] = {}
     with open(path, newline="", encoding="utf-8") as fh:
-        for row in csv.DictReader(fh, delimiter="\t"):
+        reader = csv.DictReader(fh, delimiter="\t")
+        fieldnames = list(reader.fieldnames or [])
+        for row in reader:
             rid = (row.get("gene") or "").strip()
             if not rid:
                 continue
             by_id[rid] = row
-    return by_id
+    return by_id, fieldnames
 
 
 def load_manifest_index(
@@ -229,14 +231,18 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     args = parse_args(argv)
 
+    logger.info("Loading predictions from %s", args.predictions)
+    preds, pred_fields = load_predictions(args.predictions)
+    logger.info("Loaded %d prediction rows", len(preds))
+
+    # Auto LoF-only when the predictions TSV has no mlof columns (e.g. --lof-only predict).
+    lof_only = args.lof_only or ("mlof_score" not in pred_fields)
     score_cols = list(LOF_SCORE_COLS)
-    if not args.lof_only:
+    if not lof_only:
         score_cols.extend(MLOF_SCORE_COLS)
     score_out_names = [name for name, _ in score_cols]
-
-    logger.info("Loading predictions from %s", args.predictions)
-    preds = load_predictions(args.predictions)
-    logger.info("Loaded %d prediction rows", len(preds))
+    if lof_only:
+        logger.info("LoF-only join (no mlof_* columns in output)")
 
     logger.info("Loading manifest index from %s", args.manifest)
     by_coord, by_gene_sample = load_manifest_index(args.manifest)
