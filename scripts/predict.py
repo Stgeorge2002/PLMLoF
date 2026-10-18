@@ -34,6 +34,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--hmm", type=str, default=None, help="Pfam-A.hmm for refs missing from --domains")
     parser.add_argument("--hmm-cpus", type=int, default=1)
+    parser.add_argument(
+        "--lof-only",
+        action="store_true",
+        help="Score only the LoF head (skip MLoF / ESM2-650M)",
+    )
     return parser.parse_args()
 
 
@@ -89,6 +94,7 @@ def main() -> None:
     pred = Predictor(
         pred_dir, device=device, batch_size=args.batch_size,
         domains=args.domains, hmm=args.hmm, hmm_cpus=args.hmm_cpus,
+        lof_only=args.lof_only,
     )
     if args.proteins:
         results = pred.predict_proteins(args.proteins)

@@ -36,6 +36,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--domains", type=str, default=None)
     p.add_argument("--hmm", type=str, default=None)
     p.add_argument("--hmm-cpus", type=int, default=1)
+    p.add_argument(
+        "--lof-only",
+        action="store_true",
+        help="Score only the LoF head (skip MLoF / ESM2-650M). Much faster.",
+    )
     return p.parse_args()
 
 
@@ -87,6 +92,7 @@ def main() -> None:
     pred = Predictor(
         Path(args.model), device=device, batch_size=args.batch_size,
         domains=args.domains, hmm=args.hmm, hmm_cpus=args.hmm_cpus,
+        lof_only=args.lof_only,
     )
     results = pred.predict_records(records, pair=True)
 

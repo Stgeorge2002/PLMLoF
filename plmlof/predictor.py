@@ -108,6 +108,8 @@ class Predictor:
         domains: str | Path | None = None,
         hmm: str | Path | None = None,
         hmm_cpus: int = 1,
+        tasks: tuple[str, ...] | list[str] | None = None,
+        lof_only: bool = False,
     ):
         self.model_dir = Path(model_dir)
         self.device = torch.device(device)
@@ -128,8 +130,16 @@ class Predictor:
         self.ensembles: dict[str, list[TaskNet]] = {}
         self.nulls: dict[str, np.ndarray] = {}
         self.galleries: dict[str, dict] = {}
+        if lof_only and tasks is not None:
+            raise ValueError("pass only one of lof_only=True or tasks=...")
+        if lof_only:
+            wanted = ("lof",)
+        elif tasks is not None:
+            wanted = tuple(tasks)
+        else:
+            wanted = TRAIN_TASKS
         # GoF: iterate TASKS instead of TRAIN_TASKS to load growth_gof / amr_gof again.
-        for task in TRAIN_TASKS:
+        for task in wanted:
             tdir = self.model_dir / task
             members = discover_ensemble(tdir) if tdir.exists() else []
             if not members:
