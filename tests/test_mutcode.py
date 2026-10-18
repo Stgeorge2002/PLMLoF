@@ -256,7 +256,8 @@ class TestImport:
             min_samples=1,
         )
         assert stats[0]["n_identical"] == 1
-        assert stats[0]["n_matrix_ref_length_mismatch"] == 1
+        assert stats[0]["n_matrix_ref_length_mismatch_rows"] == 1
+        assert stats[0]["n_matrix_ref_length_mismatch_genes"] == 1
         var = (out / "chromosome" / "thyA" / "var.fasta").read_text().replace("\n", "")
         assert "A" * 795 in var
         assert manifest[0]["ref_length_nt"] == 795

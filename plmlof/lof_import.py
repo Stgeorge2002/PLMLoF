@@ -180,13 +180,15 @@ def build_from_lof_matrix(
     results_dir: Path,
     out_dir: Path,
     strict_sample_length: bool = False,
-    skip_missing_genes: bool = False,
+    skip_missing_genes: bool = True,
     min_samples: int = 1,
 ) -> tuple[list[dict], list[dict]]:
     """Reconstruct alleles from an outbreak LoF matrix (Mutation_Codes column).
 
     Panaroo ``pan_genome_reference.fa`` is the MutCode reference. Matrix
-    ``Reference_Length`` mismatches are logged once per gene and ignored.
+    ``Reference_Length`` is stop-trimmed annotation metadata and is ignored
+    for decode (counted in the final summary only). Missing gene IDs are
+    skipped by default.
     """
     buckets: dict[tuple[str, str, str], GeneBucket] = {}
     ref_cache: dict[str, dict[str, str]] = {}
@@ -199,6 +201,8 @@ def build_from_lof_matrix(
     n_skipped_missing = 0
     n_sample_len_mismatch = 0
     n_matrix_ref_len_mismatch = 0
+    n_matrix_ref_len_mismatch_mutated = 0
+    missing_genes: set[str] = set()
     errors: list[str] = []
 
     with open_text(lof_matrix) as fh:
@@ -249,30 +253,33 @@ def build_from_lof_matrix(
 
             ref_seq = reference_for_row(ref_cache, replicon, gene_id)
             if ref_seq is None:
-                msg = f"gene {gene_id!r} absent from Panaroo reference for {replicon}"
-                if skip_missing_genes:
-                    n_skipped_missing += 1
-                    logger.warning("skip: %s", msg)
-                    continue
-                raise LofImportError(msg)
+                missing_genes.add(f"{replicon}:{gene_id}")
+                n_skipped_missing += 1
+                if not skip_missing_genes:
+                    raise LofImportError(
+                        f"gene {gene_id!r} absent from Panaroo reference for {replicon}. "
+                        f"Re-run with --skip-missing-genes to continue past absent IDs."
+                    )
+                continue
 
-            # MutCode rule: FASTA is the reference. Matrix Reference_Length is
-            # advisory only (often stop-trimmed CDS length).
+            try:
+                edits = parse_codes(codes_raw)
+            except MutCodeError as exc:
+                errors.append(f"{gene_id}/{sample}: {exc}")
+                if len(errors) >= 50:
+                    break
+                continue
+
+            # Matrix Reference_Length is stop-trimmed annotation metadata in N44;
+            # MutCode coordinates are on the Panaroo FASTA. Count, do not spam.
             if matrix_ref_len is not None and len(ref_seq) != matrix_ref_len:
                 n_matrix_ref_len_mismatch += 1
                 if gene_id not in warned_ref_len:
                     warned_ref_len.add(gene_id)
-                    logger.warning(
-                        "%s: Panaroo FASTA length %d != matrix Reference_Length %d; "
-                        "using FASTA (MutCode decode). codes=%s",
-                        gene_id,
-                        len(ref_seq),
-                        matrix_ref_len,
-                        codes_raw if codes_raw == "[]" else "(non-empty)",
-                    )
+                if edits:
+                    n_matrix_ref_len_mismatch_mutated += 1
 
             try:
-                edits = parse_codes(codes_raw)
                 # [] → identity copy of the FASTA reference
                 var_seq = apply_edits(ref_seq, edits)
                 mutcode_len = expected_target_length(len(ref_seq), edits)
@@ -282,14 +289,11 @@ def build_from_lof_matrix(
                     )
                 if sample_len is not None and mutcode_len != sample_len:
                     n_sample_len_mismatch += 1
-                    detail = (
-                        f"{gene_id}/{sample}: MutCode DNA length {mutcode_len} != "
-                        f"Sample_Length {sample_len}"
-                    )
                     if strict_sample_length:
-                        raise MutCodeError(detail)
-                    if n_sample_len_mismatch <= 20:
-                        logger.warning("Sample_Length mismatch: %s", detail)
+                        raise MutCodeError(
+                            f"{gene_id}/{sample}: MutCode DNA length {mutcode_len} != "
+                            f"Sample_Length {sample_len}"
+                        )
             except MutCodeError as exc:
                 errors.append(f"{gene_id}/{sample}: {exc}")
                 if len(errors) >= 50:
@@ -358,15 +362,28 @@ def build_from_lof_matrix(
         "n_records": len(all_manifest),
         "n_identical": n_identical,
         "n_mutated": n_mutated,
-        "n_skipped_missing_genes": n_skipped_missing,
+        "n_skipped_missing_gene_rows": n_skipped_missing,
+        "n_missing_gene_ids": len(missing_genes),
         "n_sample_length_mismatch": n_sample_len_mismatch,
-        "n_matrix_ref_length_mismatch": n_matrix_ref_len_mismatch,
+        "n_matrix_ref_length_mismatch_rows": n_matrix_ref_len_mismatch,
+        "n_matrix_ref_length_mismatch_genes": len(warned_ref_len),
+        "n_matrix_ref_length_mismatch_mutated_rows": n_matrix_ref_len_mismatch_mutated,
         "n_replicons": len(seen_replicons),
     }]
     with open(out_dir / "build_stats.tsv", "w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=list(stats[0].keys()), delimiter="\t")
         writer.writeheader()
         writer.writerows(stats)
+
+    if missing_genes:
+        miss_path = out_dir / "missing_genes.txt"
+        miss_path.write_text("\n".join(sorted(missing_genes)) + "\n")
+        logger.warning(
+            "Skipped %d rows for %d gene IDs absent from Panaroo FASTA → %s",
+            n_skipped_missing,
+            len(missing_genes),
+            miss_path,
+        )
 
     logger.info(
         "Wrote %d gene folders, %d records (%d mutated, %d identical) → %s",
@@ -377,14 +394,16 @@ def build_from_lof_matrix(
         out_dir,
     )
     if n_matrix_ref_len_mismatch:
+        # Almost always FASTA = matrix + 3 (terminal stop in Panaroo, not in matrix).
         logger.info(
-            "%d rows had matrix Reference_Length ≠ Panaroo FASTA length "
-            "(%d genes); decode used the FASTA (MutCode rule)",
-            n_matrix_ref_len_mismatch,
+            "Matrix Reference_Length ≠ FASTA for %d genes / %d rows "
+            "(%d of those rows had non-empty codes); decode used Panaroo FASTA",
             len(warned_ref_len),
+            n_matrix_ref_len_mismatch,
+            n_matrix_ref_len_mismatch_mutated,
         )
     if n_sample_len_mismatch:
-        logger.warning(
+        logger.info(
             "%d rows had Sample_Length ≠ MutCode DNA length; sequences follow MutCode",
             n_sample_len_mismatch,
         )

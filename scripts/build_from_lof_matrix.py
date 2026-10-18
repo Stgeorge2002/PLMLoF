@@ -91,9 +91,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="fail when LoF-matrix Sample_Length ≠ MutCode DNA length",
     )
     p.add_argument(
-        "--skip-missing-genes",
+        "--fail-on-missing-genes",
         action="store_true",
-        help="skip rows whose Gene is absent from pan_genome_reference.fa",
+        help="abort if a Gene ID is absent from pan_genome_reference.fa "
+             "(default: skip those rows and list them in missing_genes.txt)",
     )
     p.add_argument(
         "--no-verify-hashes",
@@ -124,7 +125,7 @@ def main(argv: list[str] | None = None) -> None:
                 results_dir=args.results_dir,
                 out_dir=out_dir,
                 strict_sample_length=args.strict_sample_length,
-                skip_missing_genes=args.skip_missing_genes,
+                skip_missing_genes=not args.fail_on_missing_genes,
                 min_samples=args.min_samples,
             )
         else:
