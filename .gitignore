@@ -22,6 +22,14 @@ outputs/
 # Outbreak source data, generated FASTA pairs, and predictions (rsync, not git)
 /N44_ST258/
 /N44_ST258_results/
+/PRJNA*/
+/*_results/
+/macs_*/
+/plmlof_input/
+*_plmlof_input/
+*_predictions.tsv
+*_lof_matrix.tsv
+*_lof_matrix_plmlof.tsv
 
 # Frozen model bundles, including metadata (rsync the complete directory)
 /best-models/
@@ -31,6 +39,9 @@ plmlof_input.tar
 plmlof_input.tar.*
 best-models.tar
 best-models.tar.*
+*.tar
+*.tar.gz
+*.tgz
 
 # Generated example assets; keep the analysis scripts trackable
 /examples/blaOXA1/*

@@ -162,18 +162,26 @@ or use `lof_8m_prod` as `--model` for batch predict.
 
 ## 3. Predict (compute node)
 
-### Import (MutCode + Panaroo → FASTA pairs)
+### Import (MutCode + Panaroo or Rustaroo → FASTA pairs)
 
-Main outbreak import decodes MutCode ``Mutation_Codes`` against Panaroo
-``pan_genome_reference.fa`` (``[]`` = exact FASTA copy). LoF-matrix
+Main outbreak import decodes MutCode ``Mutation_Codes`` against the
+pan-genome reference (``[]`` = exact FASTA copy). Panaroo writes
+``panaroo/.../pan_genome_reference.fa``. Rustaroo writes
+``rustaroo/.../rustroo/genes.fa``. A results directory may contain either
+tree or both; matrix ``Gene`` ids select the tree. LoF-matrix
 ``Reference_Length`` is annotation metadata only and is not used as the
 MutCode reference length.
 
 ```bash
 python scripts/build_from_lof_matrix.py \
-  --lof-matrix N44_ST258/lof_matrix/lof_matrix.tsv \
-  --results-dir N44_ST258 \
-  --out-dir N44_ST258/plmlof_input
+  --lof-matrix PRJNA1078342_results/rustaroo_lof_matrix.tsv \
+  --results-dir PRJNA1078342_results \
+  --out-dir PRJNA1078342_results/rustaroo_plmlof_input
+
+python scripts/build_from_lof_matrix.py \
+  --lof-matrix PRJNA1078342_results/panaroo_lof_matrix.tsv \
+  --results-dir PRJNA1078342_results \
+  --out-dir PRJNA1078342_results/panaroo_plmlof_input
 ```
 
 Native MutCode tables (with SHA-256 columns) are also accepted:

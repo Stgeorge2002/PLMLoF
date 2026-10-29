@@ -15,6 +15,7 @@ from plmlof.mutcode import (
     parse_codes,
     reconstruct,
     resolve_panaroo_dir,
+    resolve_reference_fasta,
     write_fasta,
 )
 
@@ -273,3 +274,199 @@ class TestImport:
         flat.mkdir(parents=True)
         (flat / "pan_genome_reference.fa").write_text(">g\nACGT\n")
         assert resolve_panaroo_dir(tmp_path / "b", "chromosome") == flat
+
+    def test_resolve_rustaroo_nested_flat_and_plasmid(self, tmp_path: Path):
+        nested = tmp_path / "a" / "rustaroo" / "chromosome" / "rustroo"
+        flat_chrom = tmp_path / "a" / "rustaroo" / "chromosome"
+        nested.mkdir(parents=True)
+        (nested / "genes.fa").write_text(">g\nACGT\n")
+        (flat_chrom / "genes.fa").write_text(">flat\nTTTT\n")
+        assert (
+            resolve_reference_fasta(tmp_path / "a", "chromosome", style="rustaroo")
+            == nested / "genes.fa"
+        )
+
+        plasmid = tmp_path / "b" / "rustaroo" / "plasmids" / "mge_0"
+        plasmid.mkdir(parents=True)
+        (plasmid / "genes.fa").write_text(">g\nACGT\n")
+        assert (
+            resolve_reference_fasta(
+                tmp_path / "b", "mge_0__SRR1__plasmid", style="rustaroo"
+            )
+            == plasmid / "genes.fa"
+        )
+
+
+_MATRIX_FIELDS = [
+    "Replicon", "Gene", "Sample", "Description",
+    "Reference_Length", "Sample_Length", "Mutation_Codes",
+]
+
+
+def _write_matrix(path: Path, rows: list[dict[str, str]]) -> None:
+    with open(path, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=_MATRIX_FIELDS, delimiter="\t")
+        writer.writeheader()
+        for row in rows:
+            full = {key: "" for key in _MATRIX_FIELDS}
+            full.update(row)
+            writer.writerow(full)
+
+
+class TestReferenceStyles:
+    def test_rustaroo_product_header_and_unique_suffix(self, tmp_path: Path):
+        from plmlof.lof_import import build_from_lof_matrix
+
+        rust = tmp_path / "rustaroo" / "chromosome" / "rustroo"
+        rust.mkdir(parents=True)
+        write_fasta(
+            rust / "genes.fa",
+            [
+                ("ATP-NAD_kinase", "AAAA"),
+                ("Gluconate_2-dehydrogenase__subunit_3", "ACGT"),
+                ("fabY_2", "CCCC"),
+                ("iron_ABC_transporter_permease", "GGGG"),
+                ("iron-containing_redox_enzyme_family_protein", "TTTT"),
+            ],
+        )
+        matrix = tmp_path / "rustaroo_lof_matrix.tsv"
+        _write_matrix(matrix, [
+            {
+                "Replicon": "chromosome", "Gene": "ATP", "Sample": "s1",
+                "Description": "ATP-NAD kinase", "Mutation_Codes": "[]",
+                "Reference_Length": "4", "Sample_Length": "4",
+            },
+            {
+                "Replicon": "chromosome", "Gene": "Gluconate", "Sample": "s1",
+                "Description": "Gluconate 2-dehydrogenase, subunit 3",
+                "Mutation_Codes": "[]",
+                "Reference_Length": "4", "Sample_Length": "4",
+            },
+            {
+                "Replicon": "chromosome", "Gene": "fabY", "Sample": "s1",
+                "Description": "fatty acid biosynthesis protein FabY",
+                "Mutation_Codes": "[]",
+                "Reference_Length": "4", "Sample_Length": "4",
+            },
+            {
+                "Replicon": "chromosome", "Gene": "iron", "Sample": "s1",
+                "Description": "hypothetical protein", "Mutation_Codes": "[]",
+                "Reference_Length": "4", "Sample_Length": "4",
+            },
+        ])
+        _manifest, stats = build_from_lof_matrix(
+            lof_matrix=matrix,
+            results_dir=tmp_path,
+            out_dir=tmp_path / "plmlof_input",
+            skip_missing_genes=True,
+        )
+        assert stats[0]["reference_style"] == "rustaroo"
+        assert stats[0]["n_records"] == 3
+        assert stats[0]["n_skipped_missing_gene_rows"] == 1
+        out = tmp_path / "plmlof_input" / "chromosome"
+
+        def seq(gene: str) -> str:
+            return (out / gene / "var.fasta").read_text().replace("\n", "")
+
+        assert "AAAA" in seq("ATP")
+        assert "ACGT" in seq("Gluconate")
+        assert "CCCC" in seq("fabY")
+        assert not (out / "iron").exists()
+
+    def test_both_trees_follow_matrix_gene_ids(self, tmp_path: Path):
+        from plmlof.lof_import import build_from_lof_matrix
+
+        pan = tmp_path / "panaroo" / "chromosome" / "panaroo_output"
+        rust = tmp_path / "rustaroo" / "chromosome" / "rustroo"
+        pan.mkdir(parents=True)
+        rust.mkdir(parents=True)
+        write_fasta(pan / "pan_genome_reference.fa", [("group_1", "AAAA")])
+        write_fasta(rust / "genes.fa", [("tssE", "CCCC")])
+
+        pan_matrix = tmp_path / "panaroo_lof_matrix.tsv"
+        rust_matrix = tmp_path / "rustaroo_lof_matrix.tsv"
+        _write_matrix(pan_matrix, [{
+            "Replicon": "chromosome", "Gene": "group_1", "Sample": "s1",
+            "Description": "demo", "Mutation_Codes": "[]",
+            "Reference_Length": "4", "Sample_Length": "4",
+        }])
+        _write_matrix(rust_matrix, [{
+            "Replicon": "chromosome", "Gene": "tssE", "Sample": "s1",
+            "Description": "Type VI secretion system baseplate subunit TssE",
+            "Mutation_Codes": "[]",
+            "Reference_Length": "4", "Sample_Length": "4",
+        }])
+
+        _, pan_stats = build_from_lof_matrix(
+            lof_matrix=pan_matrix,
+            results_dir=tmp_path,
+            out_dir=tmp_path / "pan_out",
+        )
+        _, rust_stats = build_from_lof_matrix(
+            lof_matrix=rust_matrix,
+            results_dir=tmp_path,
+            out_dir=tmp_path / "rust_out",
+        )
+        assert pan_stats[0]["reference_style"] == "panaroo"
+        assert rust_stats[0]["reference_style"] == "rustaroo"
+        pan_seq = (tmp_path / "pan_out" / "chromosome" / "group_1" / "var.fasta").read_text()
+        rust_seq = (tmp_path / "rust_out" / "chromosome" / "tssE" / "var.fasta").read_text()
+        assert "AAAA" in pan_seq.replace("\n", "")
+        assert "CCCC" in rust_seq.replace("\n", "")
+
+    def test_explicit_style_breaks_an_id_tie(self, tmp_path: Path):
+        from plmlof.lof_import import LofImportError, build_from_lof_matrix
+
+        pan = tmp_path / "panaroo" / "chromosome" / "panaroo_output"
+        rust = tmp_path / "rustaroo" / "chromosome" / "rustroo"
+        pan.mkdir(parents=True)
+        rust.mkdir(parents=True)
+        write_fasta(pan / "pan_genome_reference.fa", [("geneA", "AAAA")])
+        write_fasta(rust / "genes.fa", [("geneA", "CCCC")])
+        matrix = tmp_path / "lof_matrix.tsv"
+        _write_matrix(matrix, [{
+            "Replicon": "chromosome", "Gene": "geneA", "Sample": "s1",
+            "Description": "demo", "Mutation_Codes": "[]",
+            "Reference_Length": "4", "Sample_Length": "4",
+        }])
+        with pytest.raises(LofImportError, match="equally"):
+            build_from_lof_matrix(
+                lof_matrix=matrix,
+                results_dir=tmp_path,
+                out_dir=tmp_path / "auto_out",
+            )
+        _manifest, stats = build_from_lof_matrix(
+            lof_matrix=matrix,
+            results_dir=tmp_path,
+            out_dir=tmp_path / "rust_out",
+            reference_style="rustaroo",
+        )
+        assert stats[0]["reference_style"] == "rustaroo"
+        text = (tmp_path / "rust_out" / "chromosome" / "geneA" / "var.fasta").read_text()
+        assert "CCCC" in text.replace("\n", "")
+        assert "AAAA" not in text.replace("\n", "")
+
+    def test_filename_hint_selects_rustaroo_when_ids_are_aliases(self, tmp_path: Path):
+        from plmlof.lof_import import build_from_lof_matrix
+
+        pan = tmp_path / "panaroo" / "chromosome" / "panaroo_output"
+        rust = tmp_path / "rustaroo" / "chromosome" / "rustroo"
+        pan.mkdir(parents=True)
+        rust.mkdir(parents=True)
+        write_fasta(pan / "pan_genome_reference.fa", [("group_1", "AAAA")])
+        write_fasta(rust / "genes.fa", [("ATP-NAD_kinase", "CCCC")])
+        matrix = tmp_path / "rustaroo_lof_matrix.tsv"
+        _write_matrix(matrix, [{
+            "Replicon": "chromosome", "Gene": "ATP", "Sample": "s1",
+            "Description": "ATP-NAD kinase", "Mutation_Codes": "[]",
+            "Reference_Length": "4", "Sample_Length": "4",
+        }])
+        _manifest, stats = build_from_lof_matrix(
+            lof_matrix=matrix,
+            results_dir=tmp_path,
+            out_dir=tmp_path / "out",
+        )
+        assert stats[0]["reference_style"] == "rustaroo"
+        text = (tmp_path / "out" / "chromosome" / "ATP" / "var.fasta").read_text()
+        assert "CCCC" in text.replace("\n", "")
+        assert "AAAA" not in text.replace("\n", "")

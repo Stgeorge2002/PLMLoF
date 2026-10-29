@@ -1,7 +1,8 @@
 """MutCode called-consensus reconstruction for PLMLoF.
 
 Applies lossless gene-reference edit codes (MutCode / LoF-matrix
-``Mutation_Codes``) to Panaroo ``pan_genome_reference.fa`` sequences.
+``Mutation_Codes``) to a pan-genome reference FASTA. Panaroo writes that
+file as ``pan_genome_reference.fa``; Rustaroo writes it as ``genes.fa``.
 
 Reconstruction policy (mutcode-v1):
 
@@ -206,6 +207,28 @@ def reconstruct(
     return out
 
 
+def fasta_header_from_description(description: str) -> str:
+    """Rustaroo ``genes.fa`` id for a product string.
+
+    Every character outside ``[A-Za-z0-9-]`` becomes an underscore, so
+    ``Gluconate 2-dehydrogenase, subunit 3`` is
+    ``Gluconate_2-dehydrogenase__subunit_3``. Hyphens are kept.
+    """
+    return re.sub(r"[^A-Za-z0-9-]", "_", description.strip())
+
+
+def read_fasta_ids(path: Path | str) -> set[str]:
+    """FASTA header first tokens, without reading the sequences."""
+    ids: set[str] = set()
+    with open(path) as fh:
+        for line in fh:
+            if line.startswith(">"):
+                token = line[1:].split()[0]
+                if token:
+                    ids.add(token)
+    return ids
+
+
 def read_fasta(path: Path | str) -> dict[str, str]:
     """FASTA header first token → sequence (case preserved; no whitespace)."""
     seqs: dict[str, str] = {}
@@ -249,31 +272,97 @@ def mge_group_from_replicon(replicon: str) -> str:
     raise MutCodeError(f"unrecognised Replicon value: {replicon!r}")
 
 
-def resolve_panaroo_dir(results_dir: Path | str, replicon: str) -> Path:
-    """Locate a Panaroo output directory for a LoF-matrix Replicon value.
+# (style, relative parts after the results dir, filename). Nested layouts
+# come before flat ones so an extracted panaroo_output/ or rustroo/ wins.
+_REFERENCE_LAYOUTS: tuple[tuple[str, tuple[str, ...], str], ...] = (
+    ("panaroo", ("panaroo", "chromosome", "panaroo_output"), "pan_genome_reference.fa"),
+    ("panaroo", ("panaroo", "chromosome"), "pan_genome_reference.fa"),
+    ("rustaroo", ("rustaroo", "chromosome", "rustroo"), "genes.fa"),
+    ("rustaroo", ("rustaroo", "chromosome"), "genes.fa"),
+)
 
-    Accepts both nested ``.../panaroo_output/`` layouts (N44_ST258) and flat
-    ``panaroo/chromosome/`` layouts expected by older helpers.
-    """
-    results_dir = Path(results_dir)
+
+def _reference_candidates(results_dir: Path, replicon: str) -> tuple[tuple[str, Path], ...]:
+    """``(style, fasta path)`` for this replicon, preferred layout first."""
     if replicon == "chromosome":
-        candidates = (
-            results_dir / "panaroo" / "chromosome" / "panaroo_output",
-            results_dir / "panaroo" / "chromosome",
-        )
+        layouts = _REFERENCE_LAYOUTS
     else:
         mge = mge_group_from_replicon(replicon)
-        candidates = (
-            results_dir / "panaroo" / "plasmids" / mge / "panaroo_output",
-            results_dir / "panaroo" / "plasmids" / mge,
+        layouts = (
+            ("panaroo", ("panaroo", "plasmids", mge, "panaroo_output"), "pan_genome_reference.fa"),
+            ("panaroo", ("panaroo", "plasmids", mge), "pan_genome_reference.fa"),
+            ("rustaroo", ("rustaroo", "plasmids", mge, "rustroo"), "genes.fa"),
+            ("rustaroo", ("rustaroo", "plasmids", mge), "genes.fa"),
         )
-    for cand in candidates:
-        if (cand / "pan_genome_reference.fa").is_file():
-            return cand
-    checked = ", ".join(str(c) for c in candidates)
-    raise FileNotFoundError(
-        f"no pan_genome_reference.fa for replicon {replicon!r}; tried: {checked}"
+    return tuple(
+        (style, results_dir.joinpath(*parts, filename))
+        for style, parts, filename in layouts
     )
+
+
+def resolve_reference_fasta(
+    results_dir: Path | str,
+    replicon: str,
+    *,
+    style: str,
+) -> Path:
+    """Locate the reference FASTA for one LoF-matrix replicon.
+
+    ``style`` is ``panaroo`` (``pan_genome_reference.fa``) or ``rustaroo``
+    (``genes.fa``). Nested ``panaroo_output/`` and ``rustroo/`` directories
+    are preferred over a FASTA sitting directly in the replicon directory.
+    """
+    if style not in ("panaroo", "rustaroo"):
+        raise ValueError(f"reference style must be panaroo or rustaroo, got {style!r}")
+    results_dir = Path(results_dir)
+    tried: list[Path] = []
+    for cand_style, path in _reference_candidates(results_dir, replicon):
+        if cand_style != style:
+            continue
+        tried.append(path)
+        if path.is_file():
+            return path
+    checked = ", ".join(str(path) for path in tried)
+    raise FileNotFoundError(
+        f"no {style} reference FASTA for replicon {replicon!r}; tried: {checked}"
+    )
+
+
+def resolve_panaroo_dir(results_dir: Path | str, replicon: str) -> Path:
+    """Directory containing Panaroo ``pan_genome_reference.fa`` for this replicon."""
+    return resolve_reference_fasta(results_dir, replicon, style="panaroo").parent
+
+
+def iter_reference_fastas(results_dir: Path | str, style: str) -> list[Path]:
+    """Every reference FASTA of ``style`` under a results directory."""
+    results_dir = Path(results_dir)
+    found: list[Path] = []
+    try:
+        found.append(resolve_reference_fasta(results_dir, "chromosome", style=style))
+    except FileNotFoundError:
+        pass
+    plasmid_root = results_dir / style / "plasmids"
+    if plasmid_root.is_dir():
+        for child in sorted(plasmid_root.iterdir()):
+            if not child.is_dir() or not child.name.startswith("mge_"):
+                continue
+            try:
+                found.append(resolve_reference_fasta(results_dir, child.name, style=style))
+            except FileNotFoundError:
+                continue
+    return found
+
+
+def reference_style_hint(matrix_name: str) -> str | None:
+    """``rustaroo`` / ``panaroo`` when the matrix filename names one tree."""
+    low = Path(matrix_name).name.lower()
+    rust = "rustaroo" in low or "rustroo" in low
+    pan = "panaroo" in low
+    if rust and not pan:
+        return "rustaroo"
+    if pan and not rust:
+        return "panaroo"
+    return None
 
 
 def category_from_replicon(replicon: str) -> tuple[str, str]:

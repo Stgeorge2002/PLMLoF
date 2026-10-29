@@ -1,10 +1,14 @@
-"""Build PLMLoF FASTA pairs from MutCode codes + Panaroo references.
+"""Build PLMLoF FASTA pairs from MutCode codes plus a pan-genome reference.
 
 Decode policy matches MutCode mutcode-v1:
 
-    start from pan_genome_reference.fa[gene]
+    start from the reference FASTA entry for the gene
     apply each [start, delete_length, inserted] on original coordinates
     unlisted bases stay as the FASTA (``[]`` ⇒ allele == reference)
+
+Panaroo stores that FASTA as ``pan_genome_reference.fa``. Rustaroo stores it
+as ``genes.fa``. When both trees sit in one results directory, the matrix
+gene ids select which tree to decode against.
 
 The outbreak LoF matrix's ``Reference_Length`` / ``Sample_Length`` columns are
 annotation metadata and are **not** used as the MutCode reference length.
@@ -27,11 +31,15 @@ from plmlof.mutcode import (
     apply_edits,
     category_from_replicon,
     expected_target_length,
+    fasta_header_from_description,
+    iter_reference_fastas,
     mge_group_from_replicon,
     parse_codes,
     read_fasta,
+    read_fasta_ids,
     reconstruct,
-    resolve_panaroo_dir,
+    reference_style_hint,
+    resolve_reference_fasta,
     sha256_seq,
     write_fasta,
 )
@@ -66,12 +74,68 @@ def open_text(path: Path):
     return open(path, newline="", encoding="utf-8")
 
 
-def reference_for_row(
-    cache: dict[str, dict[str, str]], replicon: str, gene: str
+def match_reference(
+    seqs: dict[str, str], gene: str, description: str
 ) -> str | None:
-    if replicon == "chromosome":
-        return cache.get("chromosome", {}).get(gene)
-    return cache.get(mge_group_from_replicon(replicon), {}).get(gene)
+    """Sequence for a matrix gene, including Rustaroo header aliases.
+
+    Order:
+
+    1. Exact FASTA id (Panaroo ``group_N`` and Rustaroo ids that already match).
+    2. The product string rendered as a Rustaroo header, when that header is
+       an extension of the matrix gene (``ATP`` + ``ATP-NAD kinase`` →
+       ``ATP-NAD_kinase``). This also picks the full product id when a
+       truncated gene id prefixes both that header and a ``_2`` paralog.
+    3. The single FASTA id that extends the gene with ``_`` or ``-``
+       (``fabY`` → ``fabY_2``). Several extensions and no product hit is
+       ambiguous, so the row is left unmatched.
+    """
+    if gene in seqs:
+        return seqs[gene]
+    if not gene:
+        return None
+    slug = fasta_header_from_description(description)
+    hits = [
+        header
+        for header in seqs
+        if len(header) > len(gene)
+        and header.startswith(gene)
+        and header[len(gene)] in "_-"
+    ]
+    if slug in hits:
+        return seqs[slug]
+    if len(hits) == 1:
+        return seqs[hits[0]]
+    return None
+
+
+class ReferenceIndex:
+    """One replicon's reference FASTA and its gene-id lookup cache."""
+
+    def __init__(self, seqs: dict[str, str], *, style: str, path: Path):
+        self.seqs = seqs
+        self.style = style
+        self.path = path
+        self._cache: dict[tuple[str, str], str | None] = {}
+
+    def get(self, gene: str, description: str) -> str | None:
+        key = (gene, description)
+        if key not in self._cache:
+            self._cache[key] = match_reference(self.seqs, gene, description)
+        return self._cache[key]
+
+
+def reference_for_row(
+    cache: dict[str, ReferenceIndex],
+    replicon: str,
+    gene: str,
+    description: str,
+) -> str | None:
+    key = "chromosome" if replicon == "chromosome" else mge_group_from_replicon(replicon)
+    index = cache.get(key)
+    if index is None:
+        return None
+    return index.get(gene, description)
 
 
 def record_id(gene_id: str, sample: str, paralog_index: int) -> str:
@@ -81,15 +145,16 @@ def record_id(gene_id: str, sample: str, paralog_index: int) -> str:
 
 
 def _ensure_ref_cache(
-    ref_cache: dict[str, dict[str, str]],
+    ref_cache: dict[str, ReferenceIndex],
     results_dir: Path,
     replicon: str,
     *,
+    style: str,
     missing_replicons: set[str],
 ) -> bool:
-    """Load Panaroo FASTA for this replicon. Return False if no reference exists.
+    """Load this replicon's reference FASTA. Return False when it is absent.
 
-    ``mge_unclustered__...`` singleton plasmids have no panaroo_output tree.
+    ``mge_unclustered__...`` singleton plasmids have no reference tree.
     """
     key = "chromosome" if replicon == "chromosome" else mge_group_from_replicon(replicon)
     if key in ref_cache:
@@ -97,17 +162,85 @@ def _ensure_ref_cache(
     if key in missing_replicons:
         return False
     try:
-        pan_dir = resolve_panaroo_dir(results_dir, replicon)
+        fasta = resolve_reference_fasta(results_dir, replicon, style=style)
     except FileNotFoundError:
         missing_replicons.add(key)
         logger.info(
-            "No Panaroo pan_genome_reference.fa for %s — skipping those matrix rows",
+            "No %s reference FASTA for %s — skipping those matrix rows",
+            style,
             key,
         )
         return False
-    ref_cache[key] = read_fasta(pan_dir / "pan_genome_reference.fa")
-    logger.info("Loaded %d genes from %s (%s)", len(ref_cache[key]), pan_dir, key)
+    seqs = read_fasta(fasta)
+    ref_cache[key] = ReferenceIndex(seqs, style=style, path=fasta)
+    logger.info("Loaded %d genes from %s (%s)", len(seqs), fasta, key)
     return True
+
+
+def _matrix_gene_ids(lof_matrix: Path) -> set[str]:
+    """Unique ``Gene`` values, used to choose between reference trees."""
+    with open_text(lof_matrix) as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        fields = list(reader.fieldnames or [])
+        missing = [column for column in REQUIRED_LOF_COLUMNS if column not in fields]
+        if missing:
+            raise LofImportError(
+                f"LoF matrix missing columns {missing}; have {fields}"
+            )
+        return {
+            (row.get("Gene") or "").strip()
+            for row in reader
+            if (row.get("Gene") or "").strip()
+        }
+
+
+def choose_reference_style(results_dir: Path, lof_matrix: Path) -> str:
+    """Pick ``panaroo`` or ``rustaroo`` for this matrix.
+
+    A results directory that contains only one tree uses that tree. When both
+    are present, the tree with more exact ``Gene`` id hits wins. A tie uses
+    the matrix filename (``rustaroo_lof_matrix.tsv`` / ``panaroo_lof_matrix.tsv``).
+    """
+    present = {
+        style: iter_reference_fastas(results_dir, style)
+        for style in ("panaroo", "rustaroo")
+    }
+    present = {style: paths for style, paths in present.items() if paths}
+    if not present:
+        raise LofImportError(
+            f"no Panaroo or Rustaroo reference FASTA under {results_dir}"
+        )
+    if len(present) == 1:
+        style = next(iter(present))
+        logger.info("Reference style %s (only reference tree present)", style)
+        return style
+
+    gene_ids = _matrix_gene_ids(lof_matrix)
+    scores: dict[str, int] = {}
+    for style, paths in present.items():
+        headers: set[str] = set()
+        for path in paths:
+            headers.update(read_fasta_ids(path))
+        scores[style] = sum(gene in headers for gene in gene_ids)
+    ranked = sorted(present, key=lambda style: scores[style], reverse=True)
+    best, second = ranked[0], ranked[1]
+    summary = ", ".join(f"{style}={scores[style]}" for style in ranked)
+    if scores[best] > scores[second]:
+        logger.info("Reference style %s (exact gene-id hits %s)", best, summary)
+        return best
+    hint = reference_style_hint(lof_matrix.name)
+    if hint in present:
+        logger.info(
+            "Reference style %s (exact gene-id hits tied %s; filename)",
+            hint,
+            summary,
+        )
+        return hint
+    raise LofImportError(
+        "both Panaroo and Rustaroo references are present and match the "
+        f"matrix gene ids equally ({summary}). Pass --reference-style "
+        "panaroo or --reference-style rustaroo."
+    )
 
 
 def _write_buckets(
@@ -199,16 +332,32 @@ def build_from_lof_matrix(
     strict_sample_length: bool = False,
     skip_missing_genes: bool = True,
     min_samples: int = 1,
+    reference_style: str | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Reconstruct alleles from an outbreak LoF matrix (Mutation_Codes column).
 
-    Panaroo ``pan_genome_reference.fa`` is the MutCode reference. Matrix
-    ``Reference_Length`` is stop-trimmed annotation metadata and is ignored
-    for decode (counted in the final summary only). Missing gene IDs are
-    skipped by default.
+    The MutCode reference is Panaroo ``pan_genome_reference.fa`` or Rustaroo
+    ``genes.fa``. ``reference_style`` ``None`` selects the tree automatically.
+    Matrix ``Reference_Length`` is stop-trimmed annotation metadata and is
+    ignored for decode (counted in the final summary only). Missing gene IDs
+    are skipped by default.
     """
+    if reference_style is None:
+        style = choose_reference_style(results_dir, lof_matrix)
+    elif reference_style in ("panaroo", "rustaroo"):
+        if not iter_reference_fastas(results_dir, reference_style):
+            raise LofImportError(
+                f"no {reference_style} reference FASTA under {results_dir}"
+            )
+        style = reference_style
+        logger.info("Reference style %s (--reference-style)", style)
+    else:
+        raise LofImportError(
+            f"reference_style must be panaroo, rustaroo, or omitted; got {reference_style!r}"
+        )
+
     buckets: dict[tuple[str, str, str], GeneBucket] = {}
-    ref_cache: dict[str, dict[str, str]] = {}
+    ref_cache: dict[str, ReferenceIndex] = {}
     seen_replicons: set[str] = set()
     warned_ref_len: set[str] = set()
 
@@ -269,18 +418,22 @@ def build_from_lof_matrix(
             if replicon not in seen_replicons:
                 seen_replicons.add(replicon)
             if not _ensure_ref_cache(
-                ref_cache, results_dir, replicon, missing_replicons=missing_replicons
+                ref_cache,
+                results_dir,
+                replicon,
+                style=style,
+                missing_replicons=missing_replicons,
             ):
                 n_skipped_no_replicon_ref += 1
                 continue
 
-            ref_seq = reference_for_row(ref_cache, replicon, gene_id)
+            ref_seq = reference_for_row(ref_cache, replicon, gene_id, description)
             if ref_seq is None:
                 missing_genes.add(f"{replicon}:{gene_id}")
                 n_skipped_missing += 1
                 if not skip_missing_genes:
                     raise LofImportError(
-                        f"gene {gene_id!r} absent from Panaroo reference for {replicon}. "
+                        f"gene {gene_id!r} absent from the {style} reference for {replicon}. "
                         f"Re-run with --skip-missing-genes to continue past absent IDs."
                     )
                 continue
@@ -358,7 +511,11 @@ def build_from_lof_matrix(
                 "matrix_reference_length": matrix_ref_len if matrix_ref_len is not None else "",
                 "sample_length_matrix": sample_len if sample_len is not None else "",
                 "n_edits": len(edits),
-                "ref_source": "pan_genome_reference+mutcode",
+                "ref_source": (
+                    "pan_genome_reference+mutcode"
+                    if style == "panaroo"
+                    else "genes.fa+mutcode"
+                ),
                 "genome_contig": (row.get("Genome_Contig") or "").strip(),
                 "genome_start": (row.get("Genome_Start") or "").strip(),
                 "genome_end": (row.get("Genome_End") or "").strip(),
@@ -380,6 +537,7 @@ def build_from_lof_matrix(
     all_manifest, _index_rows, n_dirs = _write_buckets(buckets, out_dir, min_samples)
 
     stats = [{
+        "reference_style": style,
         "n_matrix_rows": n_rows,
         "n_gene_dirs": n_dirs,
         "n_records": len(all_manifest),
@@ -404,18 +562,20 @@ def build_from_lof_matrix(
         path = out_dir / "missing_replicon_refs.txt"
         path.write_text("\n".join(sorted(missing_replicons)) + "\n")
         logger.info(
-            "Skipped %d rows for %d replicons with no Panaroo reference → %s",
+            "Skipped %d rows for %d replicons with no %s reference → %s",
             n_skipped_no_replicon_ref,
             len(missing_replicons),
+            style,
             path,
         )
     if missing_genes:
         miss_path = out_dir / "missing_genes.txt"
         miss_path.write_text("\n".join(sorted(missing_genes)) + "\n")
         logger.warning(
-            "Skipped %d rows for %d gene IDs absent from Panaroo FASTA → %s",
+            "Skipped %d rows for %d gene IDs absent from the %s reference → %s",
             n_skipped_missing,
             len(missing_genes),
+            style,
             miss_path,
         )
 
@@ -431,7 +591,7 @@ def build_from_lof_matrix(
         # Almost always FASTA = matrix + 3 (terminal stop in Panaroo, not in matrix).
         logger.info(
             "Matrix Reference_Length ≠ FASTA for %d genes / %d rows "
-            "(%d of those rows had non-empty codes); decode used Panaroo FASTA",
+            "(%d of those rows had non-empty codes); decode used the reference FASTA",
             len(warned_ref_len),
             n_matrix_ref_len_mismatch,
             n_matrix_ref_len_mismatch_mutated,

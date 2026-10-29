@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Main PLMLoF import: MutCode codes + Panaroo → per-gene ref/var CDS FASTA pairs.
+"""Main PLMLoF import: MutCode codes + pan-genome reference → FASTA pairs.
 
-Decode follows MutCode mutcode-v1 against ``pan_genome_reference.fa``:
+Decode follows MutCode mutcode-v1 against the reference FASTA:
 
     []              → allele is exactly the FASTA reference
     [[start,d,ins]] → apply edits on original reference coordinates
+
+Panaroo writes ``panaroo/.../pan_genome_reference.fa``. Rustaroo writes
+``rustaroo/.../rustroo/genes.fa``. One results directory may contain either
+tree or both; the matrix ``Gene`` ids select the tree (override with
+``--reference-style``).
 
 Outbreak LoF-matrix ``Reference_Length`` is annotation metadata only and is
 not checked against the FASTA (it can omit a terminal stop). Native MutCode
@@ -13,9 +18,9 @@ not checked against the FASTA (it can omit a terminal stop). Native MutCode
 Usage (outbreak LoF matrix):
 
     python scripts/build_from_lof_matrix.py \\
-        --lof-matrix N44_ST258/lof_matrix/lof_matrix.tsv \\
-        --results-dir N44_ST258 \\
-        --out-dir N44_ST258/plmlof_input
+        --lof-matrix PRJNA1078342_results/rustaroo_lof_matrix.tsv \\
+        --results-dir PRJNA1078342_results \\
+        --out-dir PRJNA1078342_results/rustaroo_plmlof_input
 
 Usage (native MutCode table + one reference FASTA):
 
@@ -59,7 +64,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--results-dir",
         type=Path,
         default=None,
-        help="Outbreak root with panaroo/{chromosome,plasmids}/... (LoF matrix mode)",
+        help="Outbreak root with panaroo/ and/or rustaroo/ reference trees",
+    )
+    p.add_argument(
+        "--reference-style",
+        choices=("auto", "panaroo", "rustaroo"),
+        default="auto",
+        help="Reference tree to decode against. auto uses the only tree "
+             "present, otherwise the tree whose FASTA ids match Gene",
     )
     p.add_argument(
         "--reference",
@@ -93,7 +105,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--fail-on-missing-genes",
         action="store_true",
-        help="abort if a Gene ID is absent from pan_genome_reference.fa "
+        help="abort if a Gene ID is absent from the reference FASTA "
              "(default: skip those rows and list them in missing_genes.txt)",
     )
     p.add_argument(
@@ -127,6 +139,9 @@ def main(argv: list[str] | None = None) -> None:
                 strict_sample_length=args.strict_sample_length,
                 skip_missing_genes=not args.fail_on_missing_genes,
                 min_samples=args.min_samples,
+                reference_style=(
+                    None if args.reference_style == "auto" else args.reference_style
+                ),
             )
         else:
             if args.reference is None:
