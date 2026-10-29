@@ -113,6 +113,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="native mode: skip reference/target SHA-256 checks",
     )
+    p.add_argument(
+        "--fail-on-decode-errors",
+        action="store_true",
+        help="abort when MutCode cannot be applied (default: skip those rows "
+             "into failed_rows.txt)",
+    )
     return p.parse_args(argv)
 
 
@@ -142,6 +148,7 @@ def main(argv: list[str] | None = None) -> None:
                 reference_style=(
                     None if args.reference_style == "auto" else args.reference_style
                 ),
+                fail_on_decode_errors=args.fail_on_decode_errors,
             )
         else:
             if args.reference is None:

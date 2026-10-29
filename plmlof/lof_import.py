@@ -74,39 +74,88 @@ def open_text(path: Path):
     return open(path, newline="", encoding="utf-8")
 
 
-def match_reference(
+# Matrix Reference_Length often omits a terminal stop present in the FASTA.
+_REF_LEN_SLOP = 3
+
+
+def _reference_candidates(
     seqs: dict[str, str], gene: str, description: str
-) -> str | None:
-    """Sequence for a matrix gene, including Rustaroo header aliases.
+) -> list[str]:
+    """FASTA headers that could belong to this matrix gene."""
+    out: list[str] = []
+    seen: set[str] = set()
 
-    Order:
+    def add(header: str) -> None:
+        if header in seqs and header not in seen:
+            seen.add(header)
+            out.append(header)
 
-    1. Exact FASTA id (Panaroo ``group_N`` and Rustaroo ids that already match).
-    2. The product string rendered as a Rustaroo header, when that header is
-       an extension of the matrix gene (``ATP`` + ``ATP-NAD kinase`` →
-       ``ATP-NAD_kinase``). This also picks the full product id when a
-       truncated gene id prefixes both that header and a ``_2`` paralog.
-    3. The single FASTA id that extends the gene with ``_`` or ``-``
-       (``fabY`` → ``fabY_2``). Several extensions and no product hit is
-       ambiguous, so the row is left unmatched.
-    """
-    if gene in seqs:
-        return seqs[gene]
-    if not gene:
-        return None
+    if gene:
+        add(gene)
     slug = fasta_header_from_description(description)
-    hits = [
-        header
-        for header in seqs
-        if len(header) > len(gene)
-        and header.startswith(gene)
-        and header[len(gene)] in "_-"
-    ]
-    if slug in hits:
-        return seqs[slug]
-    if len(hits) == 1:
-        return seqs[hits[0]]
-    return None
+    if slug:
+        add(slug)
+    if gene:
+        for header in seqs:
+            if (
+                len(header) > len(gene)
+                and header.startswith(gene)
+                and header[len(gene)] in "_-"
+            ):
+                add(header)
+    return out
+
+
+def match_reference(
+    seqs: dict[str, str],
+    gene: str,
+    description: str,
+    *,
+    matrix_ref_len: int | None = None,
+    min_end: int = 0,
+) -> tuple[str, str] | None:
+    """``(fasta_header, sequence)`` for a matrix gene, or ``None``.
+
+    Rustaroo matrices often truncate product names (``Beta``, ``tenA``) while
+    ``genes.fa`` keeps full ids and ``_2`` paralogs. Prefer:
+
+    1. Candidates whose length matches ``matrix_ref_len`` (± stop codon).
+    2. Candidates long enough for MutCode coordinates (``min_end``).
+    3. Exact gene id, then the product-string slug, then other extensions.
+    """
+    candidates = _reference_candidates(seqs, gene, description)
+    if not candidates:
+        return None
+
+    long_enough = [header for header in candidates if len(seqs[header]) >= min_end]
+    pool = long_enough or candidates
+
+    if matrix_ref_len is not None:
+        length_ok = [
+            header
+            for header in pool
+            if abs(len(seqs[header]) - matrix_ref_len) <= _REF_LEN_SLOP
+        ]
+        if length_ok:
+            pool = length_ok
+        elif long_enough:
+            # No allele near the annotated length — do not guess a wrong cluster.
+            return None
+
+    slug = fasta_header_from_description(description)
+    if gene not in pool and slug not in pool and len(pool) > 1:
+        # Truncated name with several same-length extensions (e.g. iron_*).
+        return None
+
+    def rank(header: str) -> tuple[int, int, str]:
+        if header == gene:
+            return (0, len(seqs[header]), header)
+        if header == slug:
+            return (1, len(seqs[header]), header)
+        return (2, len(seqs[header]), header)
+
+    header = sorted(pool, key=rank)[0]
+    return header, seqs[header]
 
 
 class ReferenceIndex:
@@ -116,12 +165,25 @@ class ReferenceIndex:
         self.seqs = seqs
         self.style = style
         self.path = path
-        self._cache: dict[tuple[str, str], str | None] = {}
+        self._cache: dict[tuple[str, str, int | None, int], tuple[str, str] | None] = {}
 
-    def get(self, gene: str, description: str) -> str | None:
-        key = (gene, description)
+    def get(
+        self,
+        gene: str,
+        description: str,
+        *,
+        matrix_ref_len: int | None = None,
+        min_end: int = 0,
+    ) -> tuple[str, str] | None:
+        key = (gene, description, matrix_ref_len, min_end)
         if key not in self._cache:
-            self._cache[key] = match_reference(self.seqs, gene, description)
+            self._cache[key] = match_reference(
+                self.seqs,
+                gene,
+                description,
+                matrix_ref_len=matrix_ref_len,
+                min_end=min_end,
+            )
         return self._cache[key]
 
 
@@ -130,12 +192,20 @@ def reference_for_row(
     replicon: str,
     gene: str,
     description: str,
-) -> str | None:
+    *,
+    matrix_ref_len: int | None = None,
+    min_end: int = 0,
+) -> tuple[str, str] | None:
     key = "chromosome" if replicon == "chromosome" else mge_group_from_replicon(replicon)
     index = cache.get(key)
     if index is None:
         return None
-    return index.get(gene, description)
+    return index.get(
+        gene,
+        description,
+        matrix_ref_len=matrix_ref_len,
+        min_end=min_end,
+    )
 
 
 def record_id(gene_id: str, sample: str, paralog_index: int) -> str:
@@ -333,14 +403,15 @@ def build_from_lof_matrix(
     skip_missing_genes: bool = True,
     min_samples: int = 1,
     reference_style: str | None = None,
+    fail_on_decode_errors: bool = False,
 ) -> tuple[list[dict], list[dict]]:
     """Reconstruct alleles from an outbreak LoF matrix (Mutation_Codes column).
 
     The MutCode reference is Panaroo ``pan_genome_reference.fa`` or Rustaroo
     ``genes.fa``. ``reference_style`` ``None`` selects the tree automatically.
-    Matrix ``Reference_Length`` is stop-trimmed annotation metadata and is
-    ignored for decode (counted in the final summary only). Missing gene IDs
-    are skipped by default.
+    Matrix ``Reference_Length`` selects among paralogs (``tenA`` vs ``tenA_2``)
+    when present; stop-codon ±3 mismatches are still counted only. Missing
+    gene IDs and undecodable rows are skipped by default.
     """
     if reference_style is None:
         style = choose_reference_style(results_dir, lof_matrix)
@@ -372,6 +443,7 @@ def build_from_lof_matrix(
     missing_genes: set[str] = set()
     missing_replicons: set[str] = set()
     errors: list[str] = []
+    n_skipped_decode = 0
 
     with open_text(lof_matrix) as fh:
         reader = csv.DictReader(fh, delimiter="\t")
@@ -427,8 +499,23 @@ def build_from_lof_matrix(
                 n_skipped_no_replicon_ref += 1
                 continue
 
-            ref_seq = reference_for_row(ref_cache, replicon, gene_id, description)
-            if ref_seq is None:
+            try:
+                edits = parse_codes(codes_raw)
+            except MutCodeError as exc:
+                errors.append(f"{gene_id}/{sample}: {exc}")
+                n_skipped_decode += 1
+                continue
+
+            min_end = max((edit.start + edit.delete_length for edit in edits), default=0)
+            matched = reference_for_row(
+                ref_cache,
+                replicon,
+                gene_id,
+                description,
+                matrix_ref_len=matrix_ref_len,
+                min_end=min_end,
+            )
+            if matched is None:
                 missing_genes.add(f"{replicon}:{gene_id}")
                 n_skipped_missing += 1
                 if not skip_missing_genes:
@@ -437,17 +524,10 @@ def build_from_lof_matrix(
                         f"Re-run with --skip-missing-genes to continue past absent IDs."
                     )
                 continue
-
-            try:
-                edits = parse_codes(codes_raw)
-            except MutCodeError as exc:
-                errors.append(f"{gene_id}/{sample}: {exc}")
-                if len(errors) >= 50:
-                    break
-                continue
+            ref_header, ref_seq = matched
 
             # Matrix Reference_Length is stop-trimmed annotation metadata in N44;
-            # MutCode coordinates are on the Panaroo FASTA. Count, do not spam.
+            # MutCode coordinates are on the reference FASTA. Count, do not spam.
             if matrix_ref_len is not None and len(ref_seq) != matrix_ref_len:
                 n_matrix_ref_len_mismatch += 1
                 if gene_id not in warned_ref_len:
@@ -472,16 +552,17 @@ def build_from_lof_matrix(
                         )
             except MutCodeError as exc:
                 errors.append(f"{gene_id}/{sample}: {exc}")
-                if len(errors) >= 50:
-                    break
+                n_skipped_decode += 1
                 continue
 
             category, mge_group = category_from_replicon(replicon)
-            bkey = (category, mge_group, gene_id)
+            # Folder by resolved FASTA id so truncated names (Beta, Helix) that
+            # map to different products do not share one conflicting bucket.
+            bkey = (category, mge_group, ref_header)
             bucket = buckets.get(bkey)
             if bucket is None:
                 bucket = GeneBucket(
-                    gene_id=gene_id,
+                    gene_id=ref_header,
                     category=category,
                     mge_group=mge_group,
                     description=description,
@@ -489,17 +570,24 @@ def build_from_lof_matrix(
                 )
                 buckets[bkey] = bucket
             elif bucket.ref_seq != ref_seq:
-                errors.append(f"{gene_id}: conflicting reference sequences across rows")
+                errors.append(
+                    f"{gene_id}/{sample}: conflicting reference sequences for "
+                    f"FASTA id {ref_header!r}"
+                )
+                n_skipped_decode += 1
                 continue
 
             p_idx = bucket.sample_counts.get(sample, 0)
             bucket.sample_counts[sample] = p_idx + 1
+            # Keep matrix Gene in record_id / gene_id so join_lof_predictions
+            # can match the original LoF matrix rows.
             rid = record_id(gene_id, sample, p_idx)
             bucket.ref_records.append((rid, ref_seq))
             bucket.var_records.append((rid, var_seq))
             bucket.manifest.append({
                 "record_id": rid,
                 "gene_id": gene_id,
+                "ref_fasta_id": ref_header,
                 "category": category,
                 "mge_group": mge_group,
                 "sample": sample,
@@ -526,7 +614,7 @@ def build_from_lof_matrix(
             else:
                 n_identical += 1
 
-    if errors:
+    if errors and fail_on_decode_errors:
         for err in errors[:20]:
             logger.error("%s", err)
         raise LofImportError(
@@ -547,6 +635,7 @@ def build_from_lof_matrix(
         "n_missing_gene_ids": len(missing_genes),
         "n_skipped_no_replicon_ref_rows": n_skipped_no_replicon_ref,
         "n_missing_replicon_refs": len(missing_replicons),
+        "n_skipped_decode_rows": n_skipped_decode,
         "n_sample_length_mismatch": n_sample_len_mismatch,
         "n_matrix_ref_length_mismatch_rows": n_matrix_ref_len_mismatch,
         "n_matrix_ref_length_mismatch_genes": len(warned_ref_len),
@@ -577,6 +666,14 @@ def build_from_lof_matrix(
             len(missing_genes),
             style,
             miss_path,
+        )
+    if errors:
+        fail_path = out_dir / "failed_rows.txt"
+        fail_path.write_text("\n".join(errors) + "\n")
+        logger.warning(
+            "Skipped %d undecodable row(s) → %s",
+            n_skipped_decode,
+            fail_path,
         )
 
     logger.info(

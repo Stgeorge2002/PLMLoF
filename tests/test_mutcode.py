@@ -365,13 +365,15 @@ class TestReferenceStyles:
         assert stats[0]["n_skipped_missing_gene_rows"] == 1
         out = tmp_path / "plmlof_input" / "chromosome"
 
-        def seq(gene: str) -> str:
-            return (out / gene / "var.fasta").read_text().replace("\n", "")
+        def seq(folder: str) -> str:
+            return (out / folder / "var.fasta").read_text().replace("\n", "")
 
-        assert "AAAA" in seq("ATP")
-        assert "ACGT" in seq("Gluconate")
-        assert "CCCC" in seq("fabY")
+        # Folders use the resolved FASTA id, not the truncated matrix Gene.
+        assert "AAAA" in seq("ATP-NAD_kinase")
+        assert "ACGT" in seq("Gluconate_2-dehydrogenase__subunit_3")
+        assert "CCCC" in seq("fabY_2")
         assert not (out / "iron").exists()
+        assert not (out / "ATP").exists()
 
     def test_both_trees_follow_matrix_gene_ids(self, tmp_path: Path):
         from plmlof.lof_import import build_from_lof_matrix
@@ -467,6 +469,64 @@ class TestReferenceStyles:
             out_dir=tmp_path / "out",
         )
         assert stats[0]["reference_style"] == "rustaroo"
-        text = (tmp_path / "out" / "chromosome" / "ATP" / "var.fasta").read_text()
+        text = (
+            tmp_path / "out" / "chromosome" / "ATP-NAD_kinase" / "var.fasta"
+        ).read_text()
         assert "CCCC" in text.replace("\n", "")
         assert "AAAA" not in text.replace("\n", "")
+
+    def test_length_picks_paralog_and_splits_truncated_names(self, tmp_path: Path):
+        from plmlof.lof_import import build_from_lof_matrix
+
+        rust = tmp_path / "rustaroo" / "chromosome" / "rustroo"
+        rust.mkdir(parents=True)
+        write_fasta(
+            rust / "genes.fa",
+            [
+                ("tenA", "A" * 645),
+                ("tenA_2", "C" * 696),
+                ("Beta-lactamase", "G" * 837),
+                ("Beta-glucosidase", "T" * 2445),
+            ],
+        )
+        matrix = tmp_path / "rustaroo_lof_matrix.tsv"
+        _write_matrix(matrix, [
+            {
+                "Replicon": "chromosome", "Gene": "tenA", "Sample": "s1",
+                "Description": "thiaminase II", "Mutation_Codes": "[]",
+                "Reference_Length": "693", "Sample_Length": "693",
+            },
+            {
+                "Replicon": "chromosome", "Gene": "tenA", "Sample": "s2",
+                "Description": "Aminopyrimidine aminohydrolase TenA",
+                "Mutation_Codes": "[]",
+                "Reference_Length": "642", "Sample_Length": "642",
+            },
+            {
+                "Replicon": "chromosome", "Gene": "Beta", "Sample": "s1",
+                "Description": "Beta-lactamase", "Mutation_Codes": "[]",
+                "Reference_Length": "834", "Sample_Length": "834",
+            },
+            {
+                "Replicon": "chromosome", "Gene": "Beta", "Sample": "s2",
+                "Description": "Beta-glucosidase", "Mutation_Codes": "[]",
+                "Reference_Length": "2442", "Sample_Length": "2442",
+            },
+        ])
+        manifest, stats = build_from_lof_matrix(
+            lof_matrix=matrix,
+            results_dir=tmp_path,
+            out_dir=tmp_path / "out",
+        )
+        assert stats[0]["n_records"] == 4
+        assert stats[0]["n_skipped_decode_rows"] == 0
+        out = tmp_path / "out" / "chromosome"
+        assert "C" * 696 in (out / "tenA_2" / "var.fasta").read_text().replace("\n", "")
+        assert "A" * 645 in (out / "tenA" / "var.fasta").read_text().replace("\n", "")
+        assert (out / "Beta-lactamase").is_dir()
+        assert (out / "Beta-glucosidase").is_dir()
+        by_key = {(row["gene_id"], row["sample"]): row for row in manifest}
+        assert by_key[("tenA", "s1")]["ref_fasta_id"] == "tenA_2"
+        assert by_key[("tenA", "s2")]["ref_fasta_id"] == "tenA"
+        assert by_key[("Beta", "s1")]["ref_fasta_id"] == "Beta-lactamase"
+        assert by_key[("Beta", "s2")]["ref_fasta_id"] == "Beta-glucosidase"
